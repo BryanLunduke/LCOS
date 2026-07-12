@@ -6,6 +6,7 @@ All people are welcome to use and enjoy The Lunduke Computer Operating System, r
 - Gender
 - Nationality
 - Religion
+- Sexuality
 - Political Leanings
 - Taste in Music
 
