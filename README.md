@@ -1,36 +1,22 @@
-# The Lunduke Computer Operating System
+# The Nyanduke Computer Operating System
 
-A Linux system built by Lunduke, for Lunduke.
+A Linux system built by Nyanduke, for Nyanduke. nya. ![](screenshots/lcos-01-shot2.png)
 
-![](screenshots/lcos-01-shot2.png)
+The Nyanduke Computer Operating System (NCOS) adheres to a core set of ideas:
 
-The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
+- No Age or ID Verification. nyaa! - No Online Accounts Needed. (nya) - No AI. nya - No Weird Politics. nyaa! - No Systemd. (nya)! - No Forced Rust Clones. nyaa!! - Modern Tech. 90s UI. NYA!! NCOS is built on top of Devuan (a high quality fork of Debian, which removes Systemd), and includes carefully selected software to adhere to those core ideals (including the stripped-down Brave Origin as the default web browser). 
 
-- No Age or ID Verification.
-- No Online Accounts Needed.
-- No AI.
-- No Weird Politics.
-- No Systemd.
-- No Forced Rust Clones.
-- Modern Tech.  90s UI.
+## The Nyanduke Computer Operating System is a Monarchy. NYA! 
 
-LCOS is built on top of Devuan (a high quality fork of Debian, which removes Systemd), and includes carefully selected software to adhere to those core ideals (including the stripped-down Brave Origin as the default web browser).
-
-## The Lunduke Computer Operating System is a Monarchy.
-
-LCOS is not a community project.  The King has total control, both technologically and organizationally.  This prevents Political Activists from seizing control, as has happened with so many other Open Source projects and organizations.
+NCOS is not a community project. The King has total control, both technologically and organizationally, Nya!! This prevents Political Activists from seizing control, as has happened with so many other Open Source projects and organizations. Nyaa. 
 
 ## Upstream First
 
-LCOS tries to avoid LCOS-only code changes whenever possible, perfering to ship "vanilla" versions of upstream projects.  When changes or fixes are required for LCOS, in upstream projects, the preference is to hire developers of that upstream project to implement those changes in upstream itself.  That way everyone can benefit from the work being done while, simultaneously, supporting the work of engineeers who make all of this possible.
-
-As such, source code deviations, from upstream projects, is kept to an absolute minimum in LCOS.  All modified source code, primarily in the form of [LCOS-specific packages](https://github.com/BryanLunduke/LCOS-Branding), are published and made available.
+NCOS tries to avoid NCOS-only code changes whenever possible, perfering to ship "vanilla" versions of upstream projects. nya!! When changes or fixes are required for NCOS, in upstream projects, the preference is to hire developers of that upstream project to implement those changes in upstream itself. nya~ That way everyone can benefit from the work being done while, simultaneously, supporting the work of engineeers who make all of this possible. (Nya). As such, source code deviations, from upstream projects, is kept to an absolute minimum in NCOS. Nya All modified source code, primarily in the form of [NCOS-specific packages](https://github.com/BryanNyanduke/LCOS-Branding), are published and made available. NYAA 
 
 ## Early Development
 
-LCOS is in early development.  Expect bugs.
-
-[The Lunduke Journal Forum](https://forum.lunduke.com/) is the exclusive place to ask questions, provide suggestions, report issues, or talk with other LCOS users.  To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Lunduke Journal subscribers](https://lunduke.com/).
+NCOS is in early development. Nya!! Expect bugs. Nya~. [The Nyanduke Journal Forum](https://forum.lunduke.com/) is the exclusive place to ask questions, provide suggestions, report issues, or talk with other NCOS users. Nyaa. To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Nyanduke Journal subscribers](https://lunduke.com/) (I'm broke give me money, nya!).
 
 ## Screenshots
 
