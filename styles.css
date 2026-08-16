@@ -196,7 +196,7 @@ button.primary:hover { background: #252421; }
   .panel-title, .panel-status > span, .taskbar-joke { display: none; }
   .panel-status { margin-left: auto; }
   .desktop-icons { grid-template-columns: repeat(2, 82px); }
-  .window { left: 8px !important; top: 50px !important; width: calc(100vw - 16px) !important; height: calc(100vh - 108px) !important; resize: none; }
+  .window { left: 8px !important; top: 50px !important; width: calc(100vw - 16px) !important; height: calc(100vh - 108px) !important; min-width: 0; resize: none; }
   .spec-grid, .issue-columns, .gallery-grid { grid-template-columns: 1fr; }
   .hero-card { grid-template-columns: 80px 1fr; }
   .hero-logo { width: 76px; height: 76px; font-size: 24px; }
