@@ -24,6 +24,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Validate JavaScript syntax
+        run: node --check app.js
+
+      - name: Validate static assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f index.html
+          test -f styles.css
+          test -f app.js
+          test -f screenshots/lcos-01-shot-boot.png
+          test -f screenshots/lcos-01-shot-refractainstaller.png
+          test -f screenshots/lcos-01-shot1.png
+          test -f screenshots/lcos-01-shot2.png
+          test -f screenshots/lcos-01-shot3.png
+          test -f screenshots/lcos-01-shot4.png
+          grep -q 'styles.css' index.html
+          grep -q 'app.js' index.html
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
