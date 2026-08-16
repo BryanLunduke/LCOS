@@ -1,0 +1,43 @@
+name: LCOS Static Checks
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate JavaScript syntax
+        run: node --check app.js
+
+      - name: Validate required files and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f index.html
+          test -f styles.css
+          test -f app.js
+          test -f README.md
+          test -f .nojekyll
+          for image in \
+            screenshots/lcos-01-shot-boot.png \
+            screenshots/lcos-01-shot-refractainstaller.png \
+            screenshots/lcos-01-shot1.png \
+            screenshots/lcos-01-shot2.png \
+            screenshots/lcos-01-shot3.png \
+            screenshots/lcos-01-shot4.png; do
+            test -f "$image"
+            grep -q "$image" index.html
+          done
+          grep -q 'href="styles.css"' index.html
+          grep -q 'src="app.js"' index.html
+          grep -q 'This site is satire' index.html
