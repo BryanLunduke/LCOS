@@ -1,0 +1,8 @@
+@import url("styles-base.css");
+
+/* Author styles may override the browser's default [hidden] rule.
+   LCOS uses the hidden attribute for boot overlays, windows, menus and toasts,
+   so make that contract explicit and non-negotiable. */
+[hidden] {
+  display: none !important;
+}

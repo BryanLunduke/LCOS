@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#171717">
+  <meta name="description" content="LCOS: a completely unserious browser mock-up of the Lunduke Computer Operating System. Not a distro. Not even slightly.">
+  <title>LCOS — The Operating System We Absolutely Did Not Build</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <noscript>
+    <div class="noscript">LCOS requires JavaScript because apparently even satire has dependencies now.</div>
+  </noscript>
+
+  <section id="boot" class="boot-screen" aria-live="polite">
+    <div class="boot-terminal">
+      <div class="boot-logo" aria-hidden="true">LCOS</div>
+      <pre id="bootLog"></pre>
+      <button id="skipBoot" class="boot-skip" type="button">skip ceremonial boot</button>
+    </div>
+  </section>
+
+  <main id="desktop" class="desktop" aria-label="LCOS browser desktop" hidden>
+    <div class="wallpaper-noise" aria-hidden="true"></div>
+
+    <header class="top-panel">
+      <button id="applicationsButton" class="panel-button brand-button" type="button" aria-expanded="false">
+        <span class="brand-mark">L</span>
+        <span>Applications</span>
+      </button>
+      <div class="panel-title">LCOS 0.1-ish — Browser Visualization Edition</div>
+      <div class="panel-status">
+        <span title="Network status">NET: probably</span>
+        <span title="Meritocracy daemon">MERIT: 100%</span>
+        <button id="clock" class="clock" type="button" title="Click for an extremely useful clock"></button>
+      </div>
+    </header>
+
+    <section id="applicationsMenu" class="applications-menu" hidden>
+      <div class="menu-heading">LCOS Applications</div>
+      <button class="menu-item" data-open="aboutWindow" type="button"><span>🖥️</span> About This "OS"</button>
+      <button class="menu-item" data-open="terminalWindow" type="button"><span>⌨️</span> Lunduke Terminal</button>
+      <button class="menu-item" data-open="updatesWindow" type="button"><span>📦</span> Package Manager</button>
+      <button class="menu-item" data-open="issuesWindow" type="button"><span>🔥</span> Issue Control Center</button>
+      <button class="menu-item" data-open="ethicsWindow" type="button"><span>📜</span> Ethics Daemon</button>
+      <button class="menu-item" data-open="galleryWindow" type="button"><span>🖼️</span> Historical Evidence</button>
+      <button class="menu-item danger" data-action="panic" type="button"><span>☢️</span> Install systemd anyway</button>
+    </section>
+
+    <section class="desktop-icons" aria-label="Desktop shortcuts">
+      <button class="desktop-icon" data-open="aboutWindow" type="button"><span class="icon-glyph">🖥️</span><span>About LCOS</span></button>
+      <button class="desktop-icon" data-open="terminalWindow" type="button"><span class="icon-glyph">⌨️</span><span>Terminal</span></button>
+      <button class="desktop-icon" data-open="updatesWindow" type="button"><span class="icon-glyph">📦</span><span>Updates</span></button>
+      <button class="desktop-icon" data-open="issuesWindow" type="button"><span class="icon-glyph">🔥</span><span>Issues</span></button>
+      <button class="desktop-icon" data-open="galleryWindow" type="button"><span class="icon-glyph">🖼️</span><span>Screenshots</span></button>
+      <button class="desktop-icon" data-open="ethicsWindow" type="button"><span class="icon-glyph">📜</span><span>Ethics</span></button>
+    </section>
+
+    <section id="aboutWindow" class="window active-window" style="--x: 15vw; --y: 12vh; --w: 680px; --h: 500px;" aria-label="About LCOS window">
+      <div class="window-titlebar">
+        <span class="window-title">About LCOS</span>
+        <div class="window-controls">
+          <button type="button" data-minimize aria-label="Minimize">—</button>
+          <button type="button" data-maximize aria-label="Maximize">□</button>
+          <button type="button" data-close aria-label="Close">×</button>
+        </div>
+      </div>
+      <div class="window-body about-body">
+        <div class="hero-card">
+          <div class="hero-logo">LCOS</div>
+          <div>
+            <h1>The Lunduke Computer Operating System*</h1>
+            <p class="asterisk">*This site is satire. It is a browser visualization. It is not a Linux distribution and will not repartition your toaster.</p>
+          </div>
+        </div>
+        <div class="spec-grid">
+          <div><strong>Kernel</strong><span>Vibes 6.9.420-lcos</span></div>
+          <div><strong>Init</strong><span>Argument Pending</span></div>
+          <div><strong>Desktop</strong><span>LCDE (Lunduke Computer Desktop Environment)</span></div>
+          <div><strong>Package format</strong><span>.debate</span></div>
+          <div><strong>Release model</strong><span>Rolling Commentary</span></div>
+          <div><strong>Support window</strong><span>Until the next video</span></div>
+        </div>
+        <div class="callout">
+          <strong>Mission statement:</strong> visualize what LCOS could look like if a README, six screenshots, a GitHub issue tracker and approximately eleven gallons of Linux discourse achieved sentience.
+        </div>
+        <div class="button-row">
+          <button class="primary" data-open="terminalWindow" type="button">Launch Terminal</button>
+          <button data-open="issuesWindow" type="button">Inspect Governance Fire</button>
+          <a class="button-link" href="https://github.com/QSOLKCB/LCOS" target="_blank" rel="noopener">View source</a>
+        </div>
+      </div>
+    </section>
+
+    <section id="terminalWindow" class="window" style="--x: 24vw; --y: 18vh; --w: 700px; --h: 430px;" hidden aria-label="LCOS terminal window">
+      <div class="window-titlebar">
+        <span class="window-title">trent@lcos: ~</span>
+        <div class="window-controls">
+          <button type="button" data-minimize aria-label="Minimize">—</button><button type="button" data-maximize aria-label="Maximize">□</button><button type="button" data-close aria-label="Close">×</button>
+        </div>
+      </div>
+      <div class="window-body terminal-body">
+        <div id="terminalOutput" class="terminal-output" aria-live="polite"></div>
+        <form id="terminalForm" class="terminal-line">
+          <span class="prompt">trent@lcos:~$</span>
+          <input id="terminalInput" autocomplete="off" spellcheck="false" aria-label="Terminal command">
+        </form>
+      </div>
+    </section>
+
+    <section id="updatesWindow" class="window" style="--x: 12vw; --y: 20vh; --w: 760px; --h: 470px;" hidden aria-label="Package manager window">
+      <div class="window-titlebar">
+        <span class="window-title">LCOS Package Manager — Definitely Stable</span>
+        <div class="window-controls"><button type="button" data-minimize aria-label="Minimize">—</button><button type="button" data-maximize aria-label="Maximize">□</button><button type="button" data-close aria-label="Close">×</button></div>
+      </div>
+      <div class="window-body package-body">
+        <div class="toolbar"><button id="checkUpdates" class="primary" type="button">Check for Updates</button><button id="applyUpdates" type="button">Apply Everything Recklessly</button><span id="updateSummary" class="toolbar-note">Package database last emotionally refreshed: recently</span></div>
+        <div class="package-list">
+          <article class="package"><div><strong>lcos-base</strong><small>Core philosophical dependencies</small></div><span class="version">0.1 → 0.1.1</span><span class="badge recommended">RECOMMENDED</span></article>
+          <article class="package"><div><strong>meritocracy-daemon</strong><small>Ranks packages entirely by how confidently they compile</small></div><span class="version">3.0 → 3.0</span><span class="badge">CURRENT</span></article>
+          <article class="package"><div><strong>no-cursin-filter</strong><small>Kernel-space swear jar</small></div><span class="version">1.4 → 1.5</span><span class="badge recommended">SECURITY</span></article>
+          <article class="package"><div><strong>systemd-opinion-generator</strong><small>Generates a 47-minute response before PID 1 starts</small></div><span class="version">∞ → ∞+1</span><span class="badge danger-badge">HELD</span></article>
+          <article class="package"><div><strong>x11-forever</strong><small>Because changing display servers is how civilization ends</small></div><span class="version">1984 → 1984</span><span class="badge">PINNED</span></article>
+        </div>
+        <pre id="updateLog" class="mini-log">Ready. No package manager was harmed in the making of this page.</pre>
+      </div>
+    </section>
+
+    <section id="issuesWindow" class="window" style="--x: 20vw; --y: 10vh; --w: 820px; --h: 560px;" hidden aria-label="Issue control center">
+      <div class="window-titlebar">
+        <span class="window-title">Issue Control Center</span>
+        <div class="window-controls"><button type="button" data-minimize aria-label="Minimize">—</button><button type="button" data-maximize aria-label="Maximize">□</button><button type="button" data-close aria-label="Close">×</button></div>
+      </div>
+      <div class="window-body issues-body">
+        <div class="issue-banner"><strong>Project health:</strong> 97% opinions, 3% shell scripts. Everything is proceeding according to somebody's plan.</div>
+        <div class="issue-columns">
+          <div class="issue-column"><h3>OPEN</h3>
+            <article class="issue-card"><span>#001</span><strong>Should the installer ask which decade your desktop belongs to?</strong><p>Consensus blocked by somebody mentioning Wayland.</p></article>
+            <article class="issue-card"><span>#002</span><strong>Feature request: package manager should audibly sigh</strong><p>Accepted pending an ALSA/PulseAudio/PipeWire argument.</p></article>
+            <article class="issue-card"><span>#003</span><strong>Bug: user attempted to enjoy computing</strong><p>Cannot reproduce. Please provide logs and political alignment.</p></article>
+          </div>
+          <div class="issue-column"><h3>IN REVIEW</h3>
+            <article class="issue-card amber"><span>PR #004</span><strong>Replace splash screen with 640×480 BMP</strong><p>Reviewer requested less modern typography.</p></article>
+            <article class="issue-card amber"><span>PR #005</span><strong>Add “Be Excellent” system call</strong><p>API bikeshedding currently at 84 comments.</p></article>
+          </div>
+          <div class="issue-column"><h3>WONTFIX</h3>
+            <article class="issue-card red"><span>#006</span><strong>Add telemetry</strong><p>Reporter has been escorted to /dev/null.</p></article>
+            <article class="issue-card red"><span>#007</span><strong>Make it an actual distro</strong><p>Absolutely not. That would ruin the joke.</p></article>
+          </div>
+        </div>
+        <p class="source-note">This panel is parody, not a mirror of real GitHub issues. The actual upstream project and discussion remain available on GitHub.</p>
+      </div>
+    </section>
+
+    <section id="ethicsWindow" class="window" style="--x: 28vw; --y: 16vh; --w: 650px; --h: 500px;" hidden aria-label="Ethics daemon window">
+      <div class="window-titlebar"><span class="window-title">Ethics Daemon</span><div class="window-controls"><button type="button" data-minimize aria-label="Minimize">—</button><button type="button" data-maximize aria-label="Maximize">□</button><button type="button" data-close aria-label="Close">×</button></div></div>
+      <div class="window-body ethics-body">
+        <h2>System-wide behavioral policy</h2>
+        <p>The fork inherits a wonderfully compact social contract from <code>CodeOfEthics.md</code>:</p>
+        <div class="ethics-rules"><div>✓ Be Excellent to Each Other.</div><div>✓ No Cursin' or Swearin'.</div><div>✓ Meritocracy Rules.</div></div>
+        <div class="ethics-console">
+          <label for="ethicsInput">Test the no-cursin' filter:</label>
+          <div class="ethics-test"><input id="ethicsInput" placeholder="Type something scandalous"><button id="ethicsCheck" type="button">Inspect</button></div>
+          <p id="ethicsResult">Daemon idle. Morality load average: 0.03.</p>
+        </div>
+        <p class="asterisk">This page is comedic UI around text already present in the repository; it is not a statement of QSOL policy.</p>
+      </div>
+    </section>
+
+    <section id="galleryWindow" class="window" style="--x: 10vw; --y: 8vh; --w: 900px; --h: 600px;" hidden aria-label="Screenshot gallery window">
+      <div class="window-titlebar"><span class="window-title">Historical Evidence — Existing LCOS Screenshots</span><div class="window-controls"><button type="button" data-minimize aria-label="Minimize">—</button><button type="button" data-maximize aria-label="Maximize">□</button><button type="button" data-close aria-label="Close">×</button></div></div>
+      <div class="window-body gallery-body">
+        <div class="gallery-grid">
+          <figure><img src="screenshots/lcos-01-shot-boot.png" alt="LCOS boot screenshot" loading="lazy"><figcaption>Boot: where confidence begins.</figcaption></figure>
+          <figure><img src="screenshots/lcos-01-shot-refractainstaller.png" alt="LCOS installer screenshot" loading="lazy"><figcaption>Installer: choices were made.</figcaption></figure>
+          <figure><img src="screenshots/lcos-01-shot1.png" alt="LCOS desktop screenshot 1" loading="lazy"><figcaption>Desktop specimen #1</figcaption></figure>
+          <figure><img src="screenshots/lcos-01-shot2.png" alt="LCOS desktop screenshot 2" loading="lazy"><figcaption>Desktop specimen #2</figcaption></figure>
+          <figure><img src="screenshots/lcos-01-shot3.png" alt="LCOS desktop screenshot 3" loading="lazy"><figcaption>Desktop specimen #3</figcaption></figure>
+          <figure><img src="screenshots/lcos-01-shot4.png" alt="LCOS desktop screenshot 4" loading="lazy"><figcaption>Desktop specimen #4</figcaption></figure>
+        </div>
+      </div>
+    </section>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <footer class="taskbar">
+      <button id="showDesktop" class="start-button" type="button"><span class="brand-mark small">L</span> LCOS</button>
+      <div id="taskButtons" class="task-buttons"></div>
+      <div class="taskbar-joke">GNU/Linux, but with more editorial commentary</div>
+    </footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

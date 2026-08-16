@@ -1,41 +1,28 @@
-# The Lunduke Computer Operating System
+# LCOS — The Operating System We Absolutely Did Not Build
 
-A Linux system built by Lunduke, for Lunduke.
+> **Satire fork / browser visualization. This is not a Linux distribution. There is no ISO.**
 
-![](screenshots/lcos-01-shot2.png)
+LCOS is an interactive GitHub Pages mock desktop imagining what the Lunduke Computer Operating System could look like if screenshots, Linux discourse, and far too much confidence achieved sentience.
 
-The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
+## Live site
 
-- No Age or ID Verification.
-- No Online Accounts Needed.
-- No AI.
-- No Weird Politics.
-- No Systemd.
-- No Forced Rust Clones.
-- Modern Tech.  90s UI.
+https://qsolkcb.github.io/LCOS/
 
-LCOS is built on top of Devuan (a high quality fork of Debian, which removes Systemd), and includes carefully selected software to adhere to those core ideals (including the stripped-down Brave Origin as the default web browser).
+## Included
 
-## The Lunduke Computer Operating System is a Monarchy.
+- fake boot sequence and LCDE browser desktop
+- draggable, minimizable and maximizable windows
+- interactive terminal and `.debate` package manager
+- parody Issue Control Center
+- Ethics Daemon based on `CodeOfEthics.md`
+- gallery preserving the existing screenshots
+- GitHub Pages deployment and static-site CI
+- absolutely no actual distro
 
-LCOS is not a community project.  The King has total control, both technologically and organizationally.  This prevents Political Activists from seizing control, as has happened with so many other Open Source projects and organizations.
+## Run locally
 
-## Upstream First
+```bash
+python3 -m http.server 8000
+```
 
-LCOS tries to avoid LCOS-only code changes whenever possible, perfering to ship "vanilla" versions of upstream projects.  When changes or fixes are required for LCOS, in upstream projects, the preference is to hire developers of that upstream project to implement those changes in upstream itself.  That way everyone can benefit from the work being done while, simultaneously, supporting the work of engineeers who make all of this possible.
-
-As such, source code deviations, from upstream projects, is kept to an absolute minimum in LCOS.  All modified source code, primarily in the form of [LCOS-specific packages](https://github.com/BryanLunduke/LCOS-Branding), are published and made available.
-
-## Early Development
-
-LCOS is in early development.  Expect bugs.
-
-[The Lunduke Journal Forum](https://forum.lunduke.com/) is the exclusive place to ask questions, provide suggestions, report issues, or talk with other LCOS users.  To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Lunduke Journal subscribers](https://lunduke.com/).
-
-## Screenshots
-
-![](screenshots/lcos-01-shot3.png)
-
-![](screenshots/lcos-01-shot1.png)
-
-![](screenshots/lcos-01-shot4.png)
+**This repository and website are satire.**
