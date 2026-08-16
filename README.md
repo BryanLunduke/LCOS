@@ -1,41 +1,7 @@
-# The Lunduke Computer Operating System
+Satire Fork Designed to Visualize What LCOS Could Actually Look Like via Github Pages. Satire Fork 
 
-A Linux system built by Lunduke, for Lunduke.
 
-![](screenshots/lcos-01-shot2.png)
 
-The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
-
-- No Age or ID Verification.
-- No Online Accounts Needed.
-- No AI.
-- No Weird Politics.
-- No Systemd.
-- No Forced Rust Clones.
-- Modern Tech.  90s UI.
-
-LCOS is built on top of Devuan (a high quality fork of Debian, which removes Systemd), and includes carefully selected software to adhere to those core ideals (including the stripped-down Brave Origin as the default web browser).
-
-## The Lunduke Computer Operating System is a Monarchy.
-
-LCOS is not a community project.  The King has total control, both technologically and organizationally.  This prevents Political Activists from seizing control, as has happened with so many other Open Source projects and organizations.
-
-## Upstream First
-
-LCOS tries to avoid LCOS-only code changes whenever possible, perfering to ship "vanilla" versions of upstream projects.  When changes or fixes are required for LCOS, in upstream projects, the preference is to hire developers of that upstream project to implement those changes in upstream itself.  That way everyone can benefit from the work being done while, simultaneously, supporting the work of engineeers who make all of this possible.
-
-As such, source code deviations, from upstream projects, is kept to an absolute minimum in LCOS.  All modified source code, primarily in the form of [LCOS-specific packages](https://github.com/BryanLunduke/LCOS-Branding), are published and made available.
-
-## Early Development
-
-LCOS is in early development.  Expect bugs.
-
-[The Lunduke Journal Forum](https://forum.lunduke.com/) is the exclusive place to ask questions, provide suggestions, report issues, or talk with other LCOS users.  To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Lunduke Journal subscribers](https://lunduke.com/).
-
-## Screenshots
-
-![](screenshots/lcos-01-shot3.png)
-
-![](screenshots/lcos-01-shot1.png)
-
-![](screenshots/lcos-01-shot4.png)
+Real Fork >> BryanLunduke/LCOS We need to heavily mock these. 
+https://github.com/BryanLunduke/LCOS/issues 
+https://github.com/BryanLunduke/LCOS/pulls This is a total joke. We are not building a distro. We are just imagining. Search up on Brian Lunduke and his humor to make it funnier.
