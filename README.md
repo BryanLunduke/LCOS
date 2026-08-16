@@ -1,6 +1,4 @@
-Satire Fork Designed to Visualize What LCOS Could Actually Look Like via Github Pages. Satire Fork 
-
-
+Satire Fork Designed to Visualize What LCOS Could Actually Look Like via Github Pages. 
 
 Real Fork >> BryanLunduke/LCOS We need to heavily mock these. 
 https://github.com/BryanLunduke/LCOS/issues 
