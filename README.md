@@ -1,5 +1,28 @@
-Satire Fork Designed to Visualize What LCOS Could Actually Look Like via Github Pages. 
+# LCOS — The Operating System We Absolutely Did Not Build
 
-Real Fork >> BryanLunduke/LCOS We need to heavily mock these. 
-https://github.com/BryanLunduke/LCOS/issues 
-https://github.com/BryanLunduke/LCOS/pulls This is a total joke. We are not building a distro. We are just imagining. Search up on Brian Lunduke and his humor to make it funnier.
+> **Satire fork / browser visualization. This is not a Linux distribution. There is no ISO.**
+
+LCOS is an interactive GitHub Pages mock desktop imagining what the Lunduke Computer Operating System could look like if screenshots, Linux discourse, and far too much confidence achieved sentience.
+
+## Live site
+
+https://qsolkcb.github.io/LCOS/
+
+## Included
+
+- fake boot sequence and LCDE browser desktop
+- draggable, minimizable and maximizable windows
+- interactive terminal and `.debate` package manager
+- parody Issue Control Center
+- Ethics Daemon based on `CodeOfEthics.md`
+- gallery preserving the existing screenshots
+- GitHub Pages deployment and static-site CI
+- absolutely no actual distro
+
+## Run locally
+
+```bash
+python3 -m http.server 8000
+```
+
+**This repository and website are satire.**
