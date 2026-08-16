@@ -16,6 +16,7 @@
 
   let zCounter = 500;
   let toastTimer;
+  let updateCheckTimer;
   let bootFinished = false;
 
   const bootLines = [
@@ -114,6 +115,14 @@
     syncTaskButtons();
   }
 
+  function focusOpenedWindow(win) {
+    if (!win.hasAttribute('tabindex')) win.tabIndex = -1;
+    const target = win.id === 'terminalWindow'
+      ? $('#terminalInput', win)
+      : $('.window-body input, .window-body button, .window-body a[href]', win) || win;
+    setTimeout(() => target?.focus(), 0);
+  }
+
   function openWindow(id) {
     const win = document.getElementById(id);
     if (!win) return;
@@ -122,10 +131,7 @@
     focusWindow(win);
     appsMenu.hidden = true;
     appsButton.setAttribute('aria-expanded', 'false');
-
-    if (id === 'terminalWindow') {
-      setTimeout(() => $('#terminalInput')?.focus(), 0);
-    }
+    focusOpenedWindow(win);
   }
 
   function closeWindow(win) {
@@ -308,15 +314,19 @@
     const summary = $('#updateSummary');
 
     $('#checkUpdates').addEventListener('click', () => {
+      clearTimeout(updateCheckTimer);
       summary.textContent = 'Checking mirrors and prevailing sentiment…';
       log.textContent = 'Contacting mirror.invalid...\nReading package lists...\nCross-referencing comments...\nIgnoring one guy who suggested Electron...\n\n3 updates found; 1 package held due to ideological conflict.';
-      setTimeout(() => {
+      updateCheckTimer = setTimeout(() => {
+        updateCheckTimer = null;
         summary.textContent = '3 updates available; 1 eternal argument held back';
         showToast('Updates checked. Your computer is now 12% more aware of discourse.');
       }, 650);
     });
 
     $('#applyUpdates').addEventListener('click', () => {
+      clearTimeout(updateCheckTimer);
+      updateCheckTimer = null;
       log.textContent = 'Preparing upgrade...\nInstalling no-cursin-filter 1.5... OK\nInstalling lcos-base 0.1.1... OK\nRestarting meritocracy-daemon... OK\nHolding systemd-opinion-generator... obviously\n\nDone. Reboot strongly discouraged because this is a webpage.';
       summary.textContent = 'System is completely up to date, spiritually';
       showToast('Upgrade complete. Zero real packages were modified.');
@@ -365,9 +375,18 @@
   $$('.window').forEach(win => {
     makeDraggable(win);
     win.addEventListener('pointerdown', () => focusWindow(win));
-    $('[data-close]', win)?.addEventListener('click', () => closeWindow(win));
-    $('[data-minimize]', win)?.addEventListener('click', () => minimizeWindow(win));
-    $('[data-maximize]', win)?.addEventListener('click', () => toggleMaximize(win));
+
+    const closeButton = $('[data-close]', win);
+    const minimizeButton = $('[data-minimize]', win);
+    const maximizeButton = $('[data-maximize]', win);
+
+    closeButton?.setAttribute('aria-label', 'Close');
+    minimizeButton?.setAttribute('aria-label', 'Minimize');
+    maximizeButton?.setAttribute('aria-label', 'Maximize');
+
+    closeButton?.addEventListener('click', () => closeWindow(win));
+    minimizeButton?.addEventListener('click', () => minimizeWindow(win));
+    maximizeButton?.addEventListener('click', () => toggleMaximize(win));
   });
 
   $('#showDesktop').addEventListener('click', () => {
