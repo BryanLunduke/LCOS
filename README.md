@@ -1,8 +1,8 @@
 # LCOS — The Operating System We Absolutely Did Not Build
 
-> **Satire fork / browser visualization. This is not a Linux distribution. There is no ISO. Please do not flash `index.html` to a USB stick.**
+> **Satire fork / browser visualization. This is not a Linux distribution. There is no ISO.**
 
-LCOS is an interactive GitHub Pages mock desktop imagining what the Lunduke Computer Operating System could look like if a README, some screenshots, Linux discourse, and far too much confidence achieved sentience.
+LCOS is an interactive GitHub Pages mock desktop imagining what the Lunduke Computer Operating System could look like if some screenshots, Linux discourse, and far too much confidence achieved sentience.
 
 ## Live site
 
@@ -10,15 +10,14 @@ https://qsolkcb.github.io/LCOS/
 
 ## Included
 
-- ceremonial fake boot sequence
-- LCDE browser desktop with draggable, minimizable and maximizable windows
-- fake terminal with `neofetch`, `uname -a`, `apt update`, `systemctl`, `x11`, `wayland`, `ethics`, and more
-- `.debate` package manager
+- fake boot sequence and LCDE browser desktop
+- draggable, minimizable and maximizable windows
+- interactive terminal and `.debate` package manager
 - parody Issue Control Center
-- Ethics Daemon based on the existing `CodeOfEthics.md`
-- gallery preserving all existing LCOS screenshots
+- Ethics Daemon based on `CodeOfEthics.md`
+- gallery preserving the existing screenshots
 - GitHub Pages deployment and static-site CI
-- no frameworks, telemetry, installer, kernel, init system, or actual distro
+- absolutely no actual distro
 
 ## Run locally
 
@@ -26,6 +25,4 @@ https://qsolkcb.github.io/LCOS/
 python3 -m http.server 8000
 ```
 
-Then open `http://localhost:8000`.
-
-## Upstream and satire note
+This repository is a satire fork of BryanL
