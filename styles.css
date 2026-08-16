@@ -96,7 +96,7 @@ a { color: inherit; }
 .window {
   position: absolute; z-index: 100; left: var(--x); top: var(--y); width: min(var(--w), calc(100vw - 30px)); height: min(var(--h), calc(100vh - 100px));
   border: 1px solid #5d5d5d; background: var(--window); color: var(--window-text); box-shadow: var(--shadow); overflow: hidden; resize: both;
-  min-width: 340px; min-height: 240px;
+  min-width: min(340px, calc(100vw - 16px)); min-height: 240px;
 }
 .window.maximized { left: 0 !important; top: 42px !important; width: 100vw !important; height: calc(100vh - 90px) !important; resize: none; }
 .window.active-window { z-index: 500; }
