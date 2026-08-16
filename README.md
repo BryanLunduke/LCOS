@@ -2,7 +2,7 @@
 
 > **Satire fork / browser visualization. This is not a Linux distribution. There is no ISO.**
 
-LCOS is an interactive GitHub Pages mock desktop imagining what the Lunduke Computer Operating System could look like if some screenshots, Linux discourse, and far too much confidence achieved sentience.
+LCOS is an interactive GitHub Pages mock desktop imagining what the Lunduke Computer Operating System could look like if screenshots, Linux discourse, and far too much confidence achieved sentience.
 
 ## Live site
 
@@ -25,4 +25,4 @@ https://qsolkcb.github.io/LCOS/
 python3 -m http.server 8000
 ```
 
-This repository is a satire fork of BryanL
+**This repository and website are satire.**
