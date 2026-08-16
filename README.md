@@ -8,7 +8,7 @@ This fork turns the idea of **The Lunduke Computer Operating System** into an in
 
 **https://qsolkcb.github.io/LCOS/**
 
-If GitHub Pages has just been enabled, allow GitHub to publish the latest branch before assuming the kernel has panicked.
+If GitHub Pages has just been enabled, allow GitHub to publish the latest `master` build before assuming the kernel has panicked.
 
 ## What is here
 
@@ -34,6 +34,4 @@ Then visit `http://localhost:8000`.
 
 ## Upstream
 
-The actual project this satire fork descends from is:
-
--
+The actual project this satire fork descends from is **Bryan
