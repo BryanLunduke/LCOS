@@ -1,10 +1,10 @@
-# The Lunduke Computer Operating System
+# The Lunduke Cuck Operating System
 
 A Linux system built by Lunduke, for Lunduke.
 
 ![](screenshots/lcos-02-ideals.png)
 
-The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
+The Lunduke Cuck Operating System (LCOS) adheres to a core set of ideas:
 
 - No Age or ID Verification.
 - No Online Accounts Needed.
@@ -16,7 +16,7 @@ The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
 
 LCOS is built on top of Devuan (a high quality fork of Debian, which removes Systemd), and includes carefully selected software to adhere to those core ideals (including the stripped-down Brave Origin as the default web browser).
 
-## The Lunduke Computer Operating System is a Monarchy.
+## The Lunduke Cuck Operating System is a Monarchy.
 
 LCOS is not a community project.  The King has total control, both technologically and organizationally.  This prevents Political Activists from seizing control, as has happened with so many other Open Source projects and organizations.
 
