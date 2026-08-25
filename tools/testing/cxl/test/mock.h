@@ -1,0 +1,45 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+
+#include <linux/list.h>
+#include <linux/acpi.h>
+#include <linux/dax.h>
+#include <cxl.h>
+
+extern bool hmem_test;
+
+struct cxl_mock_ops {
+	struct list_head list;
+	bool (*is_mock_adev)(struct acpi_device *dev);
+	int (*acpi_table_parse_cedt)(enum acpi_cedt_type id,
+				     acpi_tbl_entry_handler_arg handler_arg,
+				     void *arg);
+	bool (*is_mock_bridge)(struct device *dev);
+	acpi_status (*acpi_evaluate_integer)(acpi_handle handle,
+					     acpi_string pathname,
+					     struct acpi_object_list *arguments,
+					     unsigned long long *data);
+	struct acpi_pci_root *(*acpi_pci_find_root)(acpi_handle handle);
+	bool (*is_mock_bus)(struct pci_bus *bus);
+	bool (*is_mock_port)(struct device *dev);
+	bool (*is_mock_dev)(struct device *dev);
+	int (*devm_cxl_switch_port_decoders_setup)(struct cxl_port *port);
+	int (*devm_cxl_endpoint_decoders_setup)(struct cxl_port *port);
+	void (*cxl_endpoint_parse_cdat)(struct cxl_port *port);
+	struct cxl_dport *(*devm_cxl_add_dport_by_dev)(struct cxl_port *port,
+						       struct device *dport_dev);
+	int (*hmat_get_extended_linear_cache_size)(struct resource *backing_res,
+						   int nid,
+						   resource_size_t *cache_size);
+	int (*walk_hmem_resources)(struct device *host, walk_hmem_fn fn);
+	int (*region_intersects)(resource_size_t start, size_t size,
+				 unsigned long flags, unsigned long desc);
+	int (*region_intersects_soft_reserve)(resource_size_t start,
+					      size_t size);
+};
+
+int hmem_test_init(void);
+void hmem_test_exit(void);
+void register_cxl_mock_ops(struct cxl_mock_ops *ops);
+void unregister_cxl_mock_ops(struct cxl_mock_ops *ops);
+struct cxl_mock_ops *get_cxl_mock_ops(int *index);
+void put_cxl_mock_ops(int index);

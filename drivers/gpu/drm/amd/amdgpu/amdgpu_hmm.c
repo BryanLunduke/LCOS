@@ -1,0 +1,288 @@
+/*
+ * Copyright 2014 Advanced Micro Devices, Inc.
+ * All Rights Reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the
+ * "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sub license, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDERS, AUTHORS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
+ * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+ * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+ * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * The above copyright notice and this permission notice (including the
+ * next paragraph) shall be included in all copies or substantial portions
+ * of the Software.
+ *
+ */
+/*
+ * Authors:
+ *    Christian König <christian.koenig@amd.com>
+ */
+
+/**
+ * DOC: MMU Notifier
+ *
+ * For coherent userptr handling registers an MMU notifier to inform the driver
+ * about updates on the page tables of a process.
+ *
+ * When somebody tries to invalidate the page tables we block the update until
+ * all operations on the pages in question are completed, then those pages are
+ * marked as accessed and also dirty if it wasn't a read only access.
+ *
+ * New command submissions using the userptrs in question are delayed until all
+ * page table invalidation are completed and we once more see a coherent process
+ * address space.
+ */
+
+#include <linux/firmware.h>
+#include <linux/module.h>
+#include <drm/drm.h>
+
+#include "amdgpu.h"
+#include "amdgpu_amdkfd.h"
+#include "amdgpu_hmm.h"
+
+/**
+ * amdgpu_hmm_invalidate_gfx - callback to notify about mm change
+ *
+ * @mni: the range (mm) is about to update
+ * @range: details on the invalidation
+ * @cur_seq: Value to pass to mmu_interval_set_seq()
+ *
+ * Block for operations on BOs to finish and mark pages as accessed and
+ * potentially dirty.
+ */
+static bool amdgpu_hmm_invalidate_gfx(struct mmu_interval_notifier *mni,
+				      const struct mmu_notifier_range *range,
+				      unsigned long cur_seq)
+{
+	struct amdgpu_bo *bo = container_of(mni, struct amdgpu_bo, notifier);
+	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
+	long r;
+
+	if (!mmu_notifier_range_blockable(range))
+		return false;
+
+	mutex_lock(&adev->notifier_lock);
+
+	mmu_interval_set_seq(mni, cur_seq);
+
+	amdgpu_vm_bo_invalidate(bo, false);
+	r = dma_resv_wait_timeout(bo->parent->tbo.base.resv,
+				  DMA_RESV_USAGE_BOOKKEEP, false,
+				  MAX_SCHEDULE_TIMEOUT);
+	mutex_unlock(&adev->notifier_lock);
+	if (r <= 0)
+		DRM_ERROR("(%ld) failed to wait for user bo\n", r);
+	return true;
+}
+
+static const struct mmu_interval_notifier_ops amdgpu_hmm_gfx_ops = {
+	.invalidate = amdgpu_hmm_invalidate_gfx,
+};
+
+/**
+ * amdgpu_hmm_invalidate_hsa - callback to notify about mm change
+ *
+ * @mni: the range (mm) is about to update
+ * @range: details on the invalidation
+ * @cur_seq: Value to pass to mmu_interval_set_seq()
+ *
+ * We temporarily evict the BO attached to this range. This necessitates
+ * evicting all user-mode queues of the process.
+ */
+static bool amdgpu_hmm_invalidate_hsa(struct mmu_interval_notifier *mni,
+				      const struct mmu_notifier_range *range,
+				      unsigned long cur_seq)
+{
+	struct amdgpu_bo *bo = container_of(mni, struct amdgpu_bo, notifier);
+
+	if (!mmu_notifier_range_blockable(range))
+		return false;
+
+	amdgpu_amdkfd_evict_userptr(mni, cur_seq, bo->kfd_bo);
+
+	return true;
+}
+
+static const struct mmu_interval_notifier_ops amdgpu_hmm_hsa_ops = {
+	.invalidate = amdgpu_hmm_invalidate_hsa,
+};
+
+/**
+ * amdgpu_hmm_register - register a BO for notifier updates
+ *
+ * @bo: amdgpu buffer object
+ * @addr: userptr addr we should monitor
+ *
+ * Registers a mmu_notifier for the given BO at the specified address.
+ * Returns 0 on success, -ERRNO if anything goes wrong.
+ */
+int amdgpu_hmm_register(struct amdgpu_bo *bo, unsigned long addr)
+{
+	int r;
+
+	if (bo->kfd_bo)
+		r = mmu_interval_notifier_insert(&bo->notifier, current->mm,
+						    addr, amdgpu_bo_size(bo),
+						    &amdgpu_hmm_hsa_ops);
+	else
+		r = mmu_interval_notifier_insert(&bo->notifier, current->mm, addr,
+							amdgpu_bo_size(bo),
+							&amdgpu_hmm_gfx_ops);
+	if (r)
+		/*
+		 * Make sure amdgpu_hmm_unregister() doesn't call
+		 * mmu_interval_notifier_remove() when the notifier isn't properly
+		 * initialized.
+		 */
+		bo->notifier.mm = NULL;
+
+	return r;
+}
+
+/**
+ * amdgpu_hmm_unregister - unregister a BO for notifier updates
+ *
+ * @bo: amdgpu buffer object
+ *
+ * Remove any registration of mmu notifier updates from the buffer object.
+ */
+void amdgpu_hmm_unregister(struct amdgpu_bo *bo)
+{
+	if (!bo->notifier.mm)
+		return;
+	mmu_interval_notifier_remove(&bo->notifier);
+	bo->notifier.mm = NULL;
+}
+
+int amdgpu_hmm_range_get_pages(struct mmu_interval_notifier *notifier,
+			       uint64_t start, uint64_t npages, bool readonly,
+			       void *owner,
+			       struct amdgpu_hmm_range *range)
+{
+	const u64 max_bytes = SZ_2G;
+
+	struct hmm_range *hmm_range = &range->hmm_range;
+	unsigned long *pfns;
+	unsigned long end;
+	int r;
+
+	pfns = kvmalloc_array(npages, sizeof(*pfns), GFP_KERNEL);
+	if (unlikely(!pfns)) {
+		r = -ENOMEM;
+		goto out_free_range;
+	}
+
+	hmm_range->notifier = notifier;
+	hmm_range->default_flags = HMM_PFN_REQ_FAULT;
+	if (!readonly)
+		hmm_range->default_flags |= HMM_PFN_REQ_WRITE;
+	hmm_range->hmm_pfns = pfns;
+	hmm_range->start = start;
+	end = start + npages * PAGE_SIZE;
+	hmm_range->dev_private_owner = owner;
+
+	hmm_range->notifier_seq = mmu_interval_read_begin(notifier);
+	do {
+		hmm_range->end = min(hmm_range->start + max_bytes, end);
+
+		pr_debug("hmm range: start = 0x%lx, end = 0x%lx",
+			hmm_range->start, hmm_range->end);
+
+		r = hmm_range_fault(hmm_range);
+		if (unlikely(r))
+			goto out_free_pfns;
+
+		if (hmm_range->end == end)
+			break;
+		hmm_range->hmm_pfns += max_bytes >> PAGE_SHIFT;
+		hmm_range->start = hmm_range->end;
+	} while (hmm_range->end < end);
+
+	hmm_range->start = start;
+	hmm_range->hmm_pfns = pfns;
+
+	return 0;
+
+out_free_pfns:
+	kvfree(pfns);
+	hmm_range->hmm_pfns = NULL;
+out_free_range:
+	if (r == -EBUSY)
+		r = -EAGAIN;
+	return r;
+}
+
+/**
+ * amdgpu_hmm_range_valid - check if an HMM range is still valid
+ * @range: pointer to the &struct amdgpu_hmm_range to validate
+ *
+ * Determines whether the given HMM range @range is still valid by
+ * checking for invalidations via the MMU notifier sequence. This is
+ * typically used to verify that the range has not been invalidated
+ * by concurrent address space updates before it is accessed.
+ *
+ * Return:
+ * * true if @range is valid and can be used safely
+ * * false if @range is NULL or has been invalidated
+ */
+bool amdgpu_hmm_range_valid(struct amdgpu_hmm_range *range)
+{
+	if (!range)
+		return false;
+
+	return !mmu_interval_read_retry(range->hmm_range.notifier,
+					range->hmm_range.notifier_seq);
+}
+
+/**
+ * amdgpu_hmm_range_alloc - allocate and initialize an AMDGPU HMM range
+ * @bo: optional buffer object to associate with this HMM range
+ *
+ * Allocates memory for amdgpu_hmm_range and associates it with the @bo passed.
+ * The reference count of the @bo is incremented.
+ *
+ * Return:
+ * Pointer to a newly allocated struct amdgpu_hmm_range on success,
+ * or NULL if memory allocation fails.
+ */
+struct amdgpu_hmm_range *amdgpu_hmm_range_alloc(struct amdgpu_bo *bo)
+{
+	struct amdgpu_hmm_range *range;
+
+	range = kzalloc_obj(*range);
+	if (!range)
+		return NULL;
+
+	range->bo = amdgpu_bo_ref(bo);
+	return range;
+}
+
+/**
+ * amdgpu_hmm_range_free - release an AMDGPU HMM range
+ * @range: pointer to the range object to free
+ *
+ * Releases all resources held by @range, including the associated
+ * hmm_pfns and the dropping reference of associated bo if any.
+ *
+ * Return: void
+ */
+void amdgpu_hmm_range_free(struct amdgpu_hmm_range *range)
+{
+	if (!range)
+		return;
+
+	kvfree(range->hmm_range.hmm_pfns);
+	amdgpu_bo_unref(&range->bo);
+	kfree(range);
+}

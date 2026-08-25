@@ -1,0 +1,1305 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Renesas RZ/T2H Pin Control and GPIO driver core
+ *
+ * Based on drivers/pinctrl/renesas/pinctrl-rzg2l.c
+ *
+ * Copyright (C) 2025 Renesas Electronics Corporation.
+ */
+
+#include <linux/array_size.h>
+#include <linux/bitfield.h>
+#include <linux/bitops.h>
+#include <linux/bits.h>
+#include <linux/cleanup.h>
+#include <linux/clk.h>
+#include <linux/gpio/driver.h>
+#include <linux/io.h>
+#include <linux/ioport.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of_device.h>
+#include <linux/of_irq.h>
+#include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
+#include <linux/spinlock.h>
+#include <linux/types.h>
+
+#include <linux/pinctrl/consumer.h>
+#include <linux/pinctrl/pinconf-generic.h>
+#include <linux/pinctrl/pinconf.h>
+#include <linux/pinctrl/pinctrl.h>
+#include <linux/pinctrl/pinmux.h>
+
+#include <dt-bindings/pinctrl/renesas,r9a09g077-pinctrl.h>
+
+#include "../core.h"
+#include "../pinconf.h"
+#include "../pinmux.h"
+
+#define DRV_NAME	"pinctrl-rzt2h"
+
+#define P(m)		(0x001 * (m))
+#define PM(m)		(0x200 + 2 * (m))
+#define PMC(m)		(0x400 + (m))
+#define PFC(m)		(0x600 + 8 * (m))
+#define PIN(m)		(0x800 + (m))
+#define DRCTL(n)	(0xa00 + 8 * (n))
+#define RSELP(m)	(0xc00 + (m))
+
+#define PM_MASK			GENMASK(1, 0)
+#define PM_PIN_MASK(pin)	(PM_MASK << ((pin) * 2))
+#define PM_INPUT		BIT(0)
+#define PM_OUTPUT		BIT(1)
+
+#define PFC_MASK		GENMASK_ULL(5, 0)
+#define PFC_PIN_MASK(pin)	(PFC_MASK << ((pin) * 8))
+#define PFC_FUNC_INTERRUPT	0
+
+#define DRCTL_DRV_PIN_MASK(pin)	(GENMASK_ULL(1, 0) << ((pin) * 8))
+#define DRCTL_PUD_PIN_MASK(pin)	(GENMASK_ULL(3, 2) << ((pin) * 8))
+#define DRCTL_SMT_PIN_MASK(pin)	(BIT_ULL(4) << ((pin) * 8))
+#define DRCTL_SR_PIN_MASK(pin)	(BIT_ULL(5) << ((pin) * 8))
+
+#define DRCTL_PUD_NONE		0
+#define DRCTL_PUD_PULL_UP	1
+#define DRCTL_PUD_PULL_DOWN	2
+
+/*
+ * Use 16 lower bits [15:0] for pin identifier
+ * Use 8 higher bits [23:16] for pin mux function
+ */
+#define MUX_PIN_ID_MASK		GENMASK(15, 0)
+#define MUX_FUNC_MASK		GENMASK(23, 16)
+
+#define RZT2H_PIN_ID_TO_PORT(id)	((id) / RZT2H_PINS_PER_PORT)
+#define RZT2H_PIN_ID_TO_PIN(id)		((id) % RZT2H_PINS_PER_PORT)
+
+#define RZT2H_MAX_SAFETY_PORTS		12
+
+#define RZT2H_INTERRUPTS_START		16
+#define RZT2H_INTERRUPTS_NUM		17
+
+struct rzt2h_pinctrl_data {
+	unsigned int n_port_pins;
+	const u8 *port_pin_configs;
+	unsigned int n_ports;
+};
+
+struct rzt2h_pinctrl {
+	struct pinctrl_dev		*pctl;
+	struct pinctrl_desc		desc;
+	struct pinctrl_pin_desc		*pins;
+	const struct rzt2h_pinctrl_data	*data;
+	void __iomem			*base0, *base1;
+	struct device			*dev;
+	struct gpio_chip		gpio_chip;
+	struct pinctrl_gpio_range	gpio_range;
+	DECLARE_BITMAP(used_irqs, RZT2H_INTERRUPTS_NUM);
+	raw_spinlock_t			lock; /* lock read/write registers */
+	struct mutex			mutex; /* serialize adding groups and functions */
+	bool				safety_port_enabled;
+	atomic_t			wakeup_path;
+};
+
+static const unsigned int rzt2h_drive_strength_ua[] = { 2500, 5000, 9000, 11800 };
+
+#define RZT2H_GET_BASE(pctrl, port) \
+	((port) > RZT2H_MAX_SAFETY_PORTS ? (pctrl)->base0 : (pctrl)->base1)
+
+#define RZT2H_PINCTRL_REG_ACCESS(size, type)						\
+static inline void rzt2h_pinctrl_write##size(struct rzt2h_pinctrl *pctrl, u8 port,	\
+					     type val, unsigned int offset)		\
+{											\
+	write##size(val, RZT2H_GET_BASE(pctrl, port) + offset);				\
+}											\
+static inline type rzt2h_pinctrl_read##size(struct rzt2h_pinctrl *pctrl, u8 port,	\
+					    unsigned int offset)			\
+{											\
+	return read##size(RZT2H_GET_BASE(pctrl, port) + offset);			\
+}
+
+RZT2H_PINCTRL_REG_ACCESS(b, u8)
+RZT2H_PINCTRL_REG_ACCESS(w, u16)
+RZT2H_PINCTRL_REG_ACCESS(q, u64)
+
+static int rzt2h_drive_strength_ua_to_idx(unsigned int ua)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(rzt2h_drive_strength_ua); i++) {
+		if (rzt2h_drive_strength_ua[i] == ua)
+			return i;
+	}
+
+	return -EINVAL;
+}
+
+static int rzt2h_drive_strength_idx_to_ua(unsigned int idx)
+{
+	if (idx >= ARRAY_SIZE(rzt2h_drive_strength_ua))
+		return -EINVAL;
+
+	return rzt2h_drive_strength_ua[idx];
+}
+
+static void rzt2h_pinctrl_drctl_rmwq(struct rzt2h_pinctrl *pctrl,
+				     u32 port, u64 mask, u64 val)
+{
+	u32 offset = DRCTL(port);
+	u64 drctl;
+
+	guard(raw_spinlock_irqsave)(&pctrl->lock);
+	drctl = rzt2h_pinctrl_readq(pctrl, port, offset) & ~mask;
+	rzt2h_pinctrl_writeq(pctrl, port, drctl | val, offset);
+}
+
+static int rzt2h_validate_pin(struct rzt2h_pinctrl *pctrl, unsigned int offset)
+{
+	u8 port = RZT2H_PIN_ID_TO_PORT(offset);
+	u8 pin = RZT2H_PIN_ID_TO_PIN(offset);
+	u8 pincfg;
+
+	if (offset >= pctrl->data->n_port_pins || port >= pctrl->data->n_ports)
+		return -EINVAL;
+
+	if (!pctrl->safety_port_enabled && port <= RZT2H_MAX_SAFETY_PORTS)
+		return -EINVAL;
+
+	pincfg = pctrl->data->port_pin_configs[port];
+	return (pincfg & BIT(pin)) ? 0 : -EINVAL;
+}
+
+static void rzt2h_pinctrl_set_gpio_en(struct rzt2h_pinctrl *pctrl,
+				      u8 port, u8 pin, bool en)
+{
+	u8 reg = rzt2h_pinctrl_readb(pctrl, port, PMC(port));
+
+	if (en)
+		reg &= ~BIT(pin);
+	else
+		reg |= BIT(pin);
+
+	rzt2h_pinctrl_writeb(pctrl, port, reg, PMC(port));
+}
+
+static void rzt2h_pinctrl_set_pfc_mode(struct rzt2h_pinctrl *pctrl,
+				       u8 port, u8 pin, u8 func)
+{
+	u64 reg64;
+	u16 reg16;
+
+	guard(raw_spinlock_irqsave)(&pctrl->lock);
+
+	reg64 = rzt2h_pinctrl_readq(pctrl, port, PFC(port));
+	/* Check if pin is already configured to the desired function */
+	if ((rzt2h_pinctrl_readb(pctrl, port, PMC(port)) & BIT(pin)) &&
+	    field_get(PFC_PIN_MASK(pin), reg64) == func)
+		return;
+
+	/* Set pin to 'Non-use (Hi-Z input protection)'  */
+	reg16 = rzt2h_pinctrl_readw(pctrl, port, PM(port));
+	reg16 &= ~PM_PIN_MASK(pin);
+	rzt2h_pinctrl_writew(pctrl, port, reg16, PM(port));
+
+	/* Temporarily switch to GPIO mode with PMC register */
+	rzt2h_pinctrl_set_gpio_en(pctrl, port, pin, true);
+
+	/* Select Pin function mode with PFC register */
+	reg64 &= ~PFC_PIN_MASK(pin);
+	rzt2h_pinctrl_writeq(pctrl, port, reg64 | ((u64)func << (pin * 8)), PFC(port));
+
+	/* Switch to Peripheral pin function with PMC register */
+	rzt2h_pinctrl_set_gpio_en(pctrl, port, pin, false);
+}
+
+static int rzt2h_pinctrl_set_mux(struct pinctrl_dev *pctldev,
+				 unsigned int func_selector,
+				 unsigned int group_selector)
+{
+	struct rzt2h_pinctrl *pctrl = pinctrl_dev_get_drvdata(pctldev);
+	const struct function_desc *func;
+	struct group_desc *group;
+	const unsigned int *pins;
+	unsigned int i;
+	u8 *psel_val;
+	int ret;
+
+	func = pinmux_generic_get_function(pctldev, func_selector);
+	if (!func)
+		return -EINVAL;
+
+	group = pinctrl_generic_get_group(pctldev, group_selector);
+	if (!group)
+		return -EINVAL;
+
+	psel_val = func->data;
+	pins = group->grp.pins;
+
+	for (i = 0; i < group->grp.npins; i++) {
+		dev_dbg(pctrl->dev, "port:%u pin:%u PSEL:%u\n",
+			RZT2H_PIN_ID_TO_PORT(pins[i]), RZT2H_PIN_ID_TO_PIN(pins[i]),
+			psel_val[i]);
+		ret = rzt2h_validate_pin(pctrl, pins[i]);
+		if (ret)
+			return ret;
+
+		rzt2h_pinctrl_set_pfc_mode(pctrl, RZT2H_PIN_ID_TO_PORT(pins[i]),
+					   RZT2H_PIN_ID_TO_PIN(pins[i]), psel_val[i]);
+	}
+
+	return 0;
+}
+
+static int rzt2h_map_add_config(struct pinctrl_map *map,
+				const char *group_or_pin,
+				enum pinctrl_map_type type,
+				unsigned long *configs,
+				unsigned int num_configs)
+{
+	unsigned long *cfgs;
+
+	cfgs = kmemdup_array(configs, num_configs, sizeof(*cfgs), GFP_KERNEL);
+	if (!cfgs)
+		return -ENOMEM;
+
+	map->type = type;
+	map->data.configs.group_or_pin = group_or_pin;
+	map->data.configs.configs = cfgs;
+	map->data.configs.num_configs = num_configs;
+
+	return 0;
+}
+
+static int rzt2h_dt_subnode_to_map(struct pinctrl_dev *pctldev,
+				   struct device_node *np,
+				   struct device_node *parent,
+				   struct pinctrl_map **map,
+				   unsigned int *num_maps,
+				   unsigned int *index)
+{
+	struct rzt2h_pinctrl *pctrl = pinctrl_dev_get_drvdata(pctldev);
+	struct pinctrl_map *maps = *map;
+	unsigned int nmaps = *num_maps;
+	unsigned long *configs = NULL;
+	unsigned int num_pinmux = 0;
+	unsigned int idx = *index;
+	unsigned int num_pins, i;
+	unsigned int num_configs;
+	struct property *pinmux;
+	struct property *prop;
+	int ret, gsel, fsel;
+	const char **pin_fn;
+	unsigned int *pins;
+	const char *name;
+	const char *pin;
+	u8 *psel_val;
+
+	pinmux = of_find_property(np, "pinmux", NULL);
+	if (pinmux)
+		num_pinmux = pinmux->length / sizeof(u32);
+
+	ret = of_property_count_strings(np, "pins");
+	if (ret == -EINVAL) {
+		num_pins = 0;
+	} else if (ret < 0) {
+		dev_err(pctrl->dev, "Invalid pins list in DT\n");
+		return ret;
+	} else {
+		num_pins = ret;
+	}
+
+	if (!num_pinmux && !num_pins)
+		return 0;
+
+	if (num_pinmux && num_pins) {
+		dev_err(pctrl->dev,
+			"DT node must contain either a pinmux or pins and not both\n");
+		return -EINVAL;
+	}
+
+	ret = pinconf_generic_parse_dt_config(np, pctldev, &configs, &num_configs);
+	if (ret < 0)
+		return ret;
+
+	if (num_pins && !num_configs) {
+		dev_err(pctrl->dev, "DT node must contain a config\n");
+		ret = -ENODEV;
+		goto done;
+	}
+
+	if (num_pinmux) {
+		nmaps += 1;
+		if (num_configs)
+			nmaps += 1;
+	}
+
+	if (num_pins)
+		nmaps += num_pins;
+
+	maps = krealloc_array(maps, nmaps, sizeof(*maps), GFP_KERNEL);
+	if (!maps) {
+		ret = -ENOMEM;
+		goto done;
+	}
+
+	*map = maps;
+	*num_maps = nmaps;
+	if (num_pins) {
+		of_property_for_each_string(np, "pins", prop, pin) {
+			ret = rzt2h_map_add_config(&maps[idx], pin,
+						   PIN_MAP_TYPE_CONFIGS_PIN,
+						   configs, num_configs);
+			if (ret < 0)
+				goto done;
+
+			idx++;
+		}
+		ret = 0;
+		goto done;
+	}
+
+	pins = devm_kcalloc(pctrl->dev, num_pinmux, sizeof(*pins), GFP_KERNEL);
+	psel_val = devm_kcalloc(pctrl->dev, num_pinmux, sizeof(*psel_val),
+				GFP_KERNEL);
+	pin_fn = devm_kzalloc(pctrl->dev, sizeof(*pin_fn), GFP_KERNEL);
+	if (!pins || !psel_val || !pin_fn) {
+		ret = -ENOMEM;
+		goto done;
+	}
+
+	/* Collect pin locations and mux settings from DT properties */
+	for (i = 0; i < num_pinmux; ++i) {
+		u32 value;
+
+		ret = of_property_read_u32_index(np, "pinmux", i, &value);
+		if (ret)
+			goto done;
+		pins[i] = FIELD_GET(MUX_PIN_ID_MASK, value);
+		psel_val[i] = FIELD_GET(MUX_FUNC_MASK, value);
+	}
+
+	if (parent) {
+		name = devm_kasprintf(pctrl->dev, GFP_KERNEL, "%pOFn.%pOFn",
+				      parent, np);
+		if (!name) {
+			ret = -ENOMEM;
+			goto done;
+		}
+	} else {
+		name = np->name;
+	}
+
+	if (num_configs) {
+		ret = rzt2h_map_add_config(&maps[idx], name,
+					   PIN_MAP_TYPE_CONFIGS_GROUP,
+					   configs, num_configs);
+		if (ret < 0)
+			goto done;
+
+		idx++;
+	}
+
+	scoped_guard(mutex, &pctrl->mutex) {
+		/* Register a single pin group listing all the pins we read from DT */
+		gsel = pinctrl_generic_add_group(pctldev, name, pins, num_pinmux, NULL);
+		if (gsel < 0) {
+			ret = gsel;
+			goto done;
+		}
+
+		/*
+		 * Register a single group function where the 'data' is an array PSEL
+		 * register values read from DT.
+		 */
+		pin_fn[0] = name;
+		fsel = pinmux_generic_add_function(pctldev, name, pin_fn, 1, psel_val);
+		if (fsel < 0) {
+			ret = fsel;
+			goto remove_group;
+		}
+	}
+
+	maps[idx].type = PIN_MAP_TYPE_MUX_GROUP;
+	maps[idx].data.mux.group = name;
+	maps[idx].data.mux.function = name;
+	idx++;
+
+	dev_dbg(pctrl->dev, "Parsed %pOF with %d pins\n", np, num_pinmux);
+	ret = 0;
+	goto done;
+
+remove_group:
+	pinctrl_generic_remove_group(pctldev, gsel);
+done:
+	*index = idx;
+	kfree(configs);
+	return ret;
+}
+
+static void rzt2h_dt_free_map(struct pinctrl_dev *pctldev,
+			      struct pinctrl_map *map,
+			      unsigned int num_maps)
+{
+	unsigned int i;
+
+	if (!map)
+		return;
+
+	for (i = 0; i < num_maps; ++i) {
+		if (map[i].type == PIN_MAP_TYPE_CONFIGS_GROUP ||
+		    map[i].type == PIN_MAP_TYPE_CONFIGS_PIN)
+			kfree(map[i].data.configs.configs);
+	}
+	kfree(map);
+}
+
+static int rzt2h_dt_node_to_map(struct pinctrl_dev *pctldev,
+				struct device_node *np,
+				struct pinctrl_map **map,
+				unsigned int *num_maps)
+{
+	struct rzt2h_pinctrl *pctrl = pinctrl_dev_get_drvdata(pctldev);
+	unsigned int index;
+	int ret;
+
+	*map = NULL;
+	*num_maps = 0;
+	index = 0;
+
+	for_each_child_of_node_scoped(np, child) {
+		ret = rzt2h_dt_subnode_to_map(pctldev, child, np, map,
+					      num_maps, &index);
+		if (ret < 0)
+			goto done;
+	}
+
+	if (*num_maps == 0) {
+		ret = rzt2h_dt_subnode_to_map(pctldev, np, NULL, map,
+					      num_maps, &index);
+		if (ret < 0)
+			goto done;
+	}
+
+	if (*num_maps)
+		return 0;
+
+	dev_err(pctrl->dev, "no mapping found in node %pOF\n", np);
+	ret = -EINVAL;
+
+done:
+	rzt2h_dt_free_map(pctldev, *map, *num_maps);
+	return ret;
+}
+
+static int rzt2h_pinctrl_pinconf_get(struct pinctrl_dev *pctldev,
+				     unsigned int pin,
+				     unsigned long *config)
+{
+	struct rzt2h_pinctrl *pctrl = pinctrl_dev_get_drvdata(pctldev);
+	u32 port, param = pinconf_to_config_param(*config);
+	unsigned int arg;
+	u8 port_pin;
+	u64 drctl;
+	int ret;
+
+	ret = rzt2h_validate_pin(pctrl, pin);
+	if (ret)
+		return ret;
+
+	port = RZT2H_PIN_ID_TO_PORT(pin);
+	port_pin = RZT2H_PIN_ID_TO_PIN(pin);
+
+	switch (param) {
+	case PIN_CONFIG_SLEW_RATE:
+		drctl = rzt2h_pinctrl_readq(pctrl, port, DRCTL(port));
+		arg = field_get(DRCTL_SR_PIN_MASK(port_pin), drctl);
+		break;
+
+	case PIN_CONFIG_BIAS_DISABLE:
+	case PIN_CONFIG_BIAS_PULL_UP:
+	case PIN_CONFIG_BIAS_PULL_DOWN:
+		drctl = rzt2h_pinctrl_readq(pctrl, port, DRCTL(port));
+		arg = field_get(DRCTL_PUD_PIN_MASK(port_pin), drctl);
+		/* for PIN_CONFIG_BIAS_PULL_UP/DOWN when enabled we just return 1 */
+		switch (arg) {
+		case DRCTL_PUD_NONE:
+			if (param != PIN_CONFIG_BIAS_DISABLE)
+				return -EINVAL;
+			break;
+		case DRCTL_PUD_PULL_UP:
+			if (param != PIN_CONFIG_BIAS_PULL_UP)
+				return -EINVAL;
+			arg = 1;
+			break;
+		case DRCTL_PUD_PULL_DOWN:
+			if (param != PIN_CONFIG_BIAS_PULL_DOWN)
+				return -EINVAL;
+			arg = 1;
+			break;
+		default:
+			return -EINVAL;
+		}
+		break;
+
+	case PIN_CONFIG_INPUT_SCHMITT_ENABLE:
+		drctl = rzt2h_pinctrl_readq(pctrl, port, DRCTL(port));
+		arg = field_get(DRCTL_SMT_PIN_MASK(port_pin), drctl);
+		if (!arg)
+			return -EINVAL;
+		break;
+
+	case PIN_CONFIG_DRIVE_STRENGTH_UA: {
+		int idx_drv;
+
+		drctl = rzt2h_pinctrl_readq(pctrl, port, DRCTL(port));
+		arg = field_get(DRCTL_DRV_PIN_MASK(port_pin), drctl);
+		idx_drv = rzt2h_drive_strength_idx_to_ua(arg);
+		if (idx_drv < 0)
+			return idx_drv;
+		arg = idx_drv;
+		break;
+	}
+
+	default:
+		return -ENOTSUPP;
+	}
+
+	*config = pinconf_to_config_packed(param, arg);
+	return 0;
+}
+
+static int rzt2h_pinctrl_pinconf_set(struct pinctrl_dev *pctldev,
+				     unsigned int pin,
+				     unsigned long *configs,
+				     unsigned int num_configs)
+{
+	struct rzt2h_pinctrl *pctrl = pinctrl_dev_get_drvdata(pctldev);
+	unsigned int i;
+	u8 port_pin;
+	int ret;
+
+	ret = rzt2h_validate_pin(pctrl, pin);
+	if (ret)
+		return ret;
+
+	port_pin = RZT2H_PIN_ID_TO_PIN(pin);
+
+	for (i = 0; i < num_configs; i++) {
+		u32 arg = pinconf_to_config_argument(configs[i]);
+		u32 param = pinconf_to_config_param(configs[i]);
+		u64 mask, val;
+
+		switch (param) {
+		case PIN_CONFIG_SLEW_RATE:
+			mask = DRCTL_SR_PIN_MASK(port_pin);
+			val = field_prep(mask, !!arg);
+			break;
+
+		case PIN_CONFIG_BIAS_DISABLE:
+		case PIN_CONFIG_BIAS_PULL_UP:
+		case PIN_CONFIG_BIAS_PULL_DOWN: {
+			u32 bias;
+
+			switch (param) {
+			case PIN_CONFIG_BIAS_DISABLE:
+				bias = DRCTL_PUD_NONE;
+				break;
+			case PIN_CONFIG_BIAS_PULL_UP:
+				bias = DRCTL_PUD_PULL_UP;
+				break;
+			case PIN_CONFIG_BIAS_PULL_DOWN:
+				bias = DRCTL_PUD_PULL_DOWN;
+				break;
+			}
+
+			mask = DRCTL_PUD_PIN_MASK(port_pin);
+			val = field_prep(mask, bias);
+			break;
+		}
+
+		case PIN_CONFIG_INPUT_SCHMITT_ENABLE:
+			mask = DRCTL_SMT_PIN_MASK(port_pin);
+			val = field_prep(mask, !!arg);
+			break;
+
+		case PIN_CONFIG_DRIVE_STRENGTH_UA: {
+			int drv_idx;
+
+			drv_idx = rzt2h_drive_strength_ua_to_idx(arg);
+			if (drv_idx < 0)
+				return drv_idx;
+
+			mask = DRCTL_DRV_PIN_MASK(port_pin);
+			val = field_prep(mask, drv_idx);
+			break;
+		}
+
+		default:
+			return -ENOTSUPP;
+		}
+
+		rzt2h_pinctrl_drctl_rmwq(pctrl, RZT2H_PIN_ID_TO_PORT(pin), mask, val);
+	}
+
+	return 0;
+}
+
+static int rzt2h_pinctrl_pinconf_group_get(struct pinctrl_dev *pctldev,
+					   unsigned int group,
+					   unsigned long *config)
+{
+	unsigned long prev_config = 0;
+	const unsigned int *pins;
+	unsigned int i, npins;
+	int ret;
+
+	ret = pinctrl_generic_get_group_pins(pctldev, group, &pins, &npins);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < npins; i++) {
+		ret = rzt2h_pinctrl_pinconf_get(pctldev, pins[i], config);
+		if (ret)
+			return ret;
+
+		/* Check config matches previous pins */
+		if (i && prev_config != *config)
+			return -ENOTSUPP;
+
+		prev_config = *config;
+	}
+
+	return 0;
+}
+
+static int rzt2h_pinctrl_pinconf_group_set(struct pinctrl_dev *pctldev,
+					   unsigned int group,
+					   unsigned long *configs,
+					   unsigned int num_configs)
+{
+	const unsigned int *pins;
+	unsigned int i, npins;
+	int ret;
+
+	ret = pinctrl_generic_get_group_pins(pctldev, group, &pins, &npins);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < npins; i++) {
+		ret = rzt2h_pinctrl_pinconf_set(pctldev, pins[i], configs,
+						num_configs);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static const struct pinctrl_ops rzt2h_pinctrl_pctlops = {
+	.get_groups_count = pinctrl_generic_get_group_count,
+	.get_group_name = pinctrl_generic_get_group_name,
+	.get_group_pins = pinctrl_generic_get_group_pins,
+	.dt_node_to_map = rzt2h_dt_node_to_map,
+	.dt_free_map = rzt2h_dt_free_map,
+};
+
+static const struct pinmux_ops rzt2h_pinctrl_pmxops = {
+	.get_functions_count = pinmux_generic_get_function_count,
+	.get_function_name = pinmux_generic_get_function_name,
+	.get_function_groups = pinmux_generic_get_function_groups,
+	.set_mux = rzt2h_pinctrl_set_mux,
+	.strict = true,
+};
+
+static const struct pinconf_ops rzt2h_pinctrl_confops = {
+	.is_generic = true,
+	.pin_config_get = rzt2h_pinctrl_pinconf_get,
+	.pin_config_set = rzt2h_pinctrl_pinconf_set,
+	.pin_config_group_set = rzt2h_pinctrl_pinconf_group_set,
+	.pin_config_group_get = rzt2h_pinctrl_pinconf_group_get,
+	.pin_config_config_dbg_show = pinconf_generic_dump_config,
+};
+
+static int rzt2h_gpio_request(struct gpio_chip *chip, unsigned int offset)
+{
+	struct rzt2h_pinctrl *pctrl = gpiochip_get_data(chip);
+	u8 port = RZT2H_PIN_ID_TO_PORT(offset);
+	u8 bit = RZT2H_PIN_ID_TO_PIN(offset);
+	int ret;
+
+	ret = rzt2h_validate_pin(pctrl, offset);
+	if (ret)
+		return ret;
+
+	ret = pinctrl_gpio_request(chip, offset);
+	if (ret)
+		return ret;
+
+	guard(raw_spinlock_irqsave)(&pctrl->lock);
+
+	/* Select GPIO mode in PMC Register */
+	rzt2h_pinctrl_set_gpio_en(pctrl, port, bit, true);
+
+	return 0;
+}
+
+static void rzt2h_gpio_set_direction(struct rzt2h_pinctrl *pctrl, u32 port,
+				     u8 bit, bool output)
+{
+	u16 reg;
+
+	guard(raw_spinlock_irqsave)(&pctrl->lock);
+
+	reg = rzt2h_pinctrl_readw(pctrl, port, PM(port));
+	reg &= ~PM_PIN_MASK(bit);
+
+	reg |= (output ? PM_OUTPUT : PM_INPUT) << (bit * 2);
+	rzt2h_pinctrl_writew(pctrl, port, reg, PM(port));
+}
+
+static int rzt2h_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
+{
+	struct rzt2h_pinctrl *pctrl = gpiochip_get_data(chip);
+	u8 port = RZT2H_PIN_ID_TO_PORT(offset);
+	u8 bit = RZT2H_PIN_ID_TO_PIN(offset);
+	u64 reg64;
+	u16 reg;
+	int ret;
+
+	ret = rzt2h_validate_pin(pctrl, offset);
+	if (ret)
+		return ret;
+
+	guard(raw_spinlock_irqsave)(&pctrl->lock);
+
+	if (rzt2h_pinctrl_readb(pctrl, port, PMC(port)) & BIT(bit)) {
+		/*
+		 * When a GPIO is being requested as an IRQ, the pinctrl
+		 * framework expects to be able to read the GPIO's direction.
+		 * IRQ function is separate from GPIO, and enabling it takes the
+		 * pin out of GPIO mode.
+		 * At this point, .child_to_parent_hwirq() has already been
+		 * called to enable the IRQ function.
+		 * Default to input direction for IRQ function.
+		 */
+		reg64 = rzt2h_pinctrl_readq(pctrl, port, PFC(port));
+		reg64 = (reg64 >> (bit * 8)) & PFC_MASK;
+		if (reg64 == PFC_FUNC_INTERRUPT)
+			return GPIO_LINE_DIRECTION_IN;
+
+		return -EINVAL;
+	}
+
+	reg = rzt2h_pinctrl_readw(pctrl, port, PM(port));
+	reg = (reg >> (bit * 2)) & PM_MASK;
+	if (reg & PM_OUTPUT)
+		return GPIO_LINE_DIRECTION_OUT;
+	if (reg & PM_INPUT)
+		return GPIO_LINE_DIRECTION_IN;
+
+	return -EINVAL;
+}
+
+static int rzt2h_gpio_set(struct gpio_chip *chip, unsigned int offset,
+			  int value)
+{
+	struct rzt2h_pinctrl *pctrl = gpiochip_get_data(chip);
+	u8 port = RZT2H_PIN_ID_TO_PORT(offset);
+	u8 bit = RZT2H_PIN_ID_TO_PIN(offset);
+	u8 reg;
+
+	guard(raw_spinlock_irqsave)(&pctrl->lock);
+
+	reg = rzt2h_pinctrl_readb(pctrl, port, P(port));
+	if (value)
+		rzt2h_pinctrl_writeb(pctrl, port, reg | BIT(bit), P(port));
+	else
+		rzt2h_pinctrl_writeb(pctrl, port, reg & ~BIT(bit), P(port));
+
+	return 0;
+}
+
+static int rzt2h_gpio_get(struct gpio_chip *chip, unsigned int offset)
+{
+	struct rzt2h_pinctrl *pctrl = gpiochip_get_data(chip);
+	u8 port = RZT2H_PIN_ID_TO_PORT(offset);
+	u8 bit = RZT2H_PIN_ID_TO_PIN(offset);
+	u16 reg;
+
+	reg = rzt2h_pinctrl_readw(pctrl, port, PM(port));
+	reg = (reg >> (bit * 2)) & PM_MASK;
+	if (reg & PM_INPUT)
+		return !!(rzt2h_pinctrl_readb(pctrl, port, PIN(port)) & BIT(bit));
+	if (reg & PM_OUTPUT)
+		return !!(rzt2h_pinctrl_readb(pctrl, port, P(port)) & BIT(bit));
+
+	return -EINVAL;
+}
+
+static int rzt2h_gpio_direction_input(struct gpio_chip *chip,
+				      unsigned int offset)
+{
+	struct rzt2h_pinctrl *pctrl = gpiochip_get_data(chip);
+	u8 port = RZT2H_PIN_ID_TO_PORT(offset);
+	u8 bit = RZT2H_PIN_ID_TO_PIN(offset);
+
+	rzt2h_gpio_set_direction(pctrl, port, bit, false);
+
+	return 0;
+}
+
+static int rzt2h_gpio_direction_output(struct gpio_chip *chip,
+				       unsigned int offset, int value)
+{
+	struct rzt2h_pinctrl *pctrl = gpiochip_get_data(chip);
+	u8 port = RZT2H_PIN_ID_TO_PORT(offset);
+	u8 bit = RZT2H_PIN_ID_TO_PIN(offset);
+
+	rzt2h_gpio_set(chip, offset, value);
+	rzt2h_gpio_set_direction(pctrl, port, bit, true);
+
+	return 0;
+}
+
+static void rzt2h_gpio_free(struct gpio_chip *chip, unsigned int offset)
+{
+	pinctrl_gpio_free(chip, offset);
+
+	/*
+	 * Set the GPIO as an input to ensure that the next GPIO request won't
+	 * drive the GPIO pin as an output.
+	 */
+	rzt2h_gpio_direction_input(chip, offset);
+}
+
+static const char * const rzt2h_gpio_names[] = {
+	"P00_0", "P00_1", "P00_2", "P00_3", "P00_4", "P00_5", "P00_6", "P00_7",
+	"P01_0", "P01_1", "P01_2", "P01_3", "P01_4", "P01_5", "P01_6", "P01_7",
+	"P02_0", "P02_1", "P02_2", "P02_3", "P02_4", "P02_5", "P02_6", "P02_7",
+	"P03_0", "P03_1", "P03_2", "P03_3", "P03_4", "P03_5", "P03_6", "P03_7",
+	"P04_0", "P04_1", "P04_2", "P04_3", "P04_4", "P04_5", "P04_6", "P04_7",
+	"P05_0", "P05_1", "P05_2", "P05_3", "P05_4", "P05_5", "P05_6", "P05_7",
+	"P06_0", "P06_1", "P06_2", "P06_3", "P06_4", "P06_5", "P06_6", "P06_7",
+	"P07_0", "P07_1", "P07_2", "P07_3", "P07_4", "P07_5", "P07_6", "P07_7",
+	"P08_0", "P08_1", "P08_2", "P08_3", "P08_4", "P08_5", "P08_6", "P08_7",
+	"P09_0", "P09_1", "P09_2", "P09_3", "P09_4", "P09_5", "P09_6", "P09_7",
+	"P10_0", "P10_1", "P10_2", "P10_3", "P10_4", "P10_5", "P10_6", "P10_7",
+	"P11_0", "P11_1", "P11_2", "P11_3", "P11_4", "P11_5", "P11_6", "P11_7",
+	"P12_0", "P12_1", "P12_2", "P12_3", "P12_4", "P12_5", "P12_6", "P12_7",
+	"P13_0", "P13_1", "P13_2", "P13_3", "P13_4", "P13_5", "P13_6", "P13_7",
+	"P14_0", "P14_1", "P14_2", "P14_3", "P14_4", "P14_5", "P14_6", "P14_7",
+	"P15_0", "P15_1", "P15_2", "P15_3", "P15_4", "P15_5", "P15_6", "P15_7",
+	"P16_0", "P16_1", "P16_2", "P16_3", "P16_4", "P16_5", "P16_6", "P16_7",
+	"P17_0", "P17_1", "P17_2", "P17_3", "P17_4", "P17_5", "P17_6", "P17_7",
+	"P18_0", "P18_1", "P18_2", "P18_3", "P18_4", "P18_5", "P18_6", "P18_7",
+	"P19_0", "P19_1", "P19_2", "P19_3", "P19_4", "P19_5", "P19_6", "P19_7",
+	"P20_0", "P20_1", "P20_2", "P20_3", "P20_4", "P20_5", "P20_6", "P20_7",
+	"P21_0", "P21_1", "P21_2", "P21_3", "P21_4", "P21_5", "P21_6", "P21_7",
+	"P22_0", "P22_1", "P22_2", "P22_3", "P22_4", "P22_5", "P22_6", "P22_7",
+	"P23_0", "P23_1", "P23_2", "P23_3", "P23_4", "P23_5", "P23_6", "P23_7",
+	"P24_0", "P24_1", "P24_2", "P24_3", "P24_4", "P24_5", "P24_6", "P24_7",
+	"P25_0", "P25_1", "P25_2", "P25_3", "P25_4", "P25_5", "P25_6", "P25_7",
+	"P26_0", "P26_1", "P26_2", "P26_3", "P26_4", "P26_5", "P26_6", "P26_7",
+	"P27_0", "P27_1", "P27_2", "P27_3", "P27_4", "P27_5", "P27_6", "P27_7",
+	"P28_0", "P28_1", "P28_2", "P28_3", "P28_4", "P28_5", "P28_6", "P28_7",
+	"P29_0", "P29_1", "P29_2", "P29_3", "P29_4", "P29_5", "P29_6", "P29_7",
+	"P30_0", "P30_1", "P30_2", "P30_3", "P30_4", "P30_5", "P30_6", "P30_7",
+	"P31_0", "P31_1", "P31_2", "P31_3", "P31_4", "P31_5", "P31_6", "P31_7",
+	"P32_0", "P32_1", "P32_2", "P32_3", "P32_4", "P32_5", "P32_6", "P32_7",
+	"P33_0", "P33_1", "P33_2", "P33_3", "P33_4", "P33_5", "P33_6", "P33_7",
+	"P34_0", "P34_1", "P34_2", "P34_3", "P34_4", "P34_5", "P34_6", "P34_7",
+	"P35_0", "P35_1", "P35_2", "P35_3", "P35_4", "P35_5", "P35_6", "P35_7",
+};
+
+/*
+ * Interrupts 0-15 are for INTCPUn, which are not exposed externally.
+ * Interrupts 16-31 are for IRQn. SEI is 32.
+ * This table matches the information found in User Manual's Section
+ * 17.5, Multiplexed Pin Configurations, Tables 17.5 to 17.40, on the
+ * Interrupt rows.
+ * RZ/N2H has the same GPIO to IRQ mapping, except for the pins which
+ * are not present.
+ */
+static const u8 rzt2h_gpio_irq_map[] = {
+	32, 16, 17, 18, 19,  0, 20, 21,
+	22,  0,  0,  0,  0,  0,  0,  0,
+	23, 24, 25, 26, 27,  0,  0,  0,
+	 0,  0, 28, 29, 30, 31,  0,  0,
+	 0,  0,  0,  0,  0, 32, 16, 17,
+	18, 19, 20, 21, 22,  0,  0,  0,
+	 0,  0, 24, 25, 26, 27,  0, 28,
+	29, 30, 31,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0, 24, 32, 16,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	20, 23, 17, 18, 19,  0, 16, 25,
+	29, 20, 21, 22, 23,  0,  0,  0,
+	 0,  0,  0,  0, 17,  0,  0, 18,
+	 0,  0, 19,  0,  0, 20,  0, 30,
+	21,  0,  0, 22,  0,  0, 24, 25,
+	 0,  0,  0,  0,  0, 16, 17,  0,
+	18,  0,  0, 26, 27,  0,  0,  0,
+	28, 29, 30, 31,  0,  0,  0,  0,
+	23, 31, 32, 16, 17, 18, 19, 20,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	27,  0,  0, 21, 22, 23, 24, 25,
+	26,  0,  0,  0,  0,  0,  0,  0,
+	27, 28, 29, 30, 31,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0, 28, 32, 16,
+	17, 18, 19,  0,  0,  0,  0, 20,
+	21, 22, 23,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0, 24, 25,  0,  0,
+	 0,  0, 26, 27,  0,  0,  0, 30,
+	 0, 29,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+	 0,  0,  0, 28, 29, 30, 31,  0,
+	 0,  0,  0,  0,  0,  0,  0, 30,
+	 0,  0,  0,  0,  0,  0,  0,  0,
+};
+
+static void rzt2h_gpio_irq_disable(struct irq_data *d)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	unsigned int hwirq = irqd_to_hwirq(d);
+
+	irq_chip_disable_parent(d);
+	gpiochip_disable_irq(gc, hwirq);
+}
+
+static void rzt2h_gpio_irq_enable(struct irq_data *d)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	unsigned int hwirq = irqd_to_hwirq(d);
+
+	gpiochip_enable_irq(gc, hwirq);
+	irq_chip_enable_parent(d);
+}
+
+static int rzt2h_gpio_irq_set_wake(struct irq_data *d, unsigned int on)
+{
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct rzt2h_pinctrl *pctrl = container_of(gc, struct rzt2h_pinctrl, gpio_chip);
+	int ret;
+
+	ret = irq_chip_set_wake_parent(d, on);
+	if (ret)
+		return ret;
+
+	/*
+	 * If any of the IRQs are in use, put the entire pin controller on the
+	 * device wakeup path.
+	 */
+	if (on)
+		atomic_inc(&pctrl->wakeup_path);
+	else
+		atomic_dec(&pctrl->wakeup_path);
+
+	return 0;
+}
+
+static const struct irq_chip rzt2h_gpio_irqchip = {
+	.name = "rzt2h-gpio",
+	.irq_disable = rzt2h_gpio_irq_disable,
+	.irq_enable = rzt2h_gpio_irq_enable,
+	.irq_mask = irq_chip_mask_parent,
+	.irq_unmask = irq_chip_unmask_parent,
+	.irq_set_type = irq_chip_set_type_parent,
+	.irq_set_wake = rzt2h_gpio_irq_set_wake,
+	.irq_eoi = irq_chip_eoi_parent,
+	.irq_set_affinity = irq_chip_set_affinity_parent,
+	.flags = IRQCHIP_IMMUTABLE,
+	GPIOCHIP_IRQ_RESOURCE_HELPERS,
+};
+
+static int rzt2h_gpio_child_to_parent_hwirq(struct gpio_chip *gc,
+					    unsigned int child,
+					    unsigned int child_type,
+					    unsigned int *parent,
+					    unsigned int *parent_type)
+{
+	struct rzt2h_pinctrl *pctrl = gpiochip_get_data(gc);
+	u8 port = RZT2H_PIN_ID_TO_PORT(child);
+	u8 pin = RZT2H_PIN_ID_TO_PIN(child);
+	u8 parent_irq;
+
+	parent_irq = rzt2h_gpio_irq_map[child];
+	if (parent_irq < RZT2H_INTERRUPTS_START)
+		return -EINVAL;
+
+	if (test_and_set_bit(parent_irq - RZT2H_INTERRUPTS_START,
+			     pctrl->used_irqs))
+		return -EBUSY;
+
+	rzt2h_pinctrl_set_pfc_mode(pctrl, port, pin, PFC_FUNC_INTERRUPT);
+
+	*parent = parent_irq;
+	*parent_type = child_type;
+
+	return 0;
+}
+
+static void rzt2h_gpio_irq_domain_free(struct irq_domain *domain, unsigned int virq,
+				       unsigned int nr_irqs)
+{
+	struct irq_data *d = irq_domain_get_irq_data(domain, virq);
+	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+	struct rzt2h_pinctrl *pctrl = container_of(gc, struct rzt2h_pinctrl, gpio_chip);
+	irq_hw_number_t hwirq = irqd_to_hwirq(d);
+	u8 port = RZT2H_PIN_ID_TO_PORT(hwirq);
+	u8 pin = RZT2H_PIN_ID_TO_PIN(hwirq);
+
+	if (test_and_clear_bit(hwirq - RZT2H_INTERRUPTS_START, pctrl->used_irqs))
+		rzt2h_pinctrl_set_gpio_en(pctrl, port, pin, false);
+
+	irq_domain_free_irqs_common(domain, virq, nr_irqs);
+}
+
+static void rzt2h_gpio_init_irq_valid_mask(struct gpio_chip *gc,
+					   unsigned long *valid_mask,
+					   unsigned int ngpios)
+{
+	struct rzt2h_pinctrl *pctrl = gpiochip_get_data(gc);
+	unsigned int offset;
+
+	for (offset = 0; offset < ngpios; offset++) {
+		if (!rzt2h_gpio_irq_map[offset] || rzt2h_validate_pin(pctrl, offset))
+			clear_bit(offset, valid_mask);
+	}
+}
+
+static int rzt2h_gpio_register(struct rzt2h_pinctrl *pctrl)
+{
+	struct pinctrl_gpio_range *range = &pctrl->gpio_range;
+	struct gpio_chip *chip = &pctrl->gpio_chip;
+	struct device_node *np = pctrl->dev->of_node;
+	struct irq_domain *parent_domain;
+	struct device *dev = pctrl->dev;
+	struct of_phandle_args of_args;
+	struct device_node *parent_np;
+	struct gpio_irq_chip *girq;
+	int ret;
+
+	parent_np = of_irq_find_parent(np);
+	if (!parent_np)
+		return -ENXIO;
+
+	parent_domain = irq_find_host(parent_np);
+	of_node_put(parent_np);
+	if (!parent_domain)
+		return -EPROBE_DEFER;
+
+	ret = of_parse_phandle_with_fixed_args(dev->of_node, "gpio-ranges", 3, 0, &of_args);
+	if (ret)
+		return dev_err_probe(dev, ret, "Unable to parse gpio-ranges\n");
+
+	of_node_put(of_args.np);
+	if (of_args.args[0] != 0 || of_args.args[1] != 0 ||
+	    of_args.args[2] != pctrl->data->n_port_pins)
+		return dev_err_probe(dev, -EINVAL,
+				     "gpio-ranges does not match selected SOC\n");
+
+	chip->base = -1;
+	chip->parent = dev;
+	chip->owner = THIS_MODULE;
+	chip->ngpio = of_args.args[2];
+	chip->names = rzt2h_gpio_names;
+	chip->request = rzt2h_gpio_request;
+	chip->free = rzt2h_gpio_free;
+	chip->get_direction = rzt2h_gpio_get_direction;
+	chip->direction_input = rzt2h_gpio_direction_input;
+	chip->direction_output = rzt2h_gpio_direction_output;
+	chip->get = rzt2h_gpio_get;
+	chip->set = rzt2h_gpio_set;
+	chip->label = dev_name(dev);
+
+	if (of_property_present(np, "interrupt-controller")) {
+		girq = &chip->irq;
+		gpio_irq_chip_set_chip(girq, &rzt2h_gpio_irqchip);
+		girq->fwnode = dev_fwnode(pctrl->dev);
+		girq->parent_domain = parent_domain;
+		girq->child_to_parent_hwirq = rzt2h_gpio_child_to_parent_hwirq;
+		girq->populate_parent_alloc_arg = gpiochip_populate_parent_fwspec_twocell;
+		girq->child_irq_domain_ops.free = rzt2h_gpio_irq_domain_free;
+		girq->init_valid_mask = rzt2h_gpio_init_irq_valid_mask;
+	}
+
+	range->id = 0;
+	range->pin_base = 0;
+	range->base = 0;
+	range->npins = chip->ngpio;
+	range->name = chip->label;
+	range->gc = chip;
+
+	ret = devm_gpiochip_add_data(dev, chip, pctrl);
+	if (ret)
+		return dev_err_probe(dev, ret, "gpiochip registration failed\n");
+
+	return ret;
+}
+
+static int rzt2h_pinctrl_register(struct rzt2h_pinctrl *pctrl)
+{
+	struct pinctrl_desc *desc = &pctrl->desc;
+	struct device *dev = pctrl->dev;
+	struct pinctrl_pin_desc *pins;
+	unsigned int i;
+	int ret;
+
+	desc->name = DRV_NAME;
+	desc->npins = pctrl->data->n_port_pins;
+	desc->pctlops = &rzt2h_pinctrl_pctlops;
+	desc->pmxops = &rzt2h_pinctrl_pmxops;
+	desc->confops = &rzt2h_pinctrl_confops;
+	desc->owner = THIS_MODULE;
+
+	pins = devm_kcalloc(dev, desc->npins, sizeof(*pins), GFP_KERNEL);
+	if (!pins)
+		return -ENOMEM;
+
+	pctrl->pins = pins;
+	desc->pins = pins;
+
+	for (i = 0; i < pctrl->data->n_port_pins; i++) {
+		pins[i].number = i;
+		pins[i].name = rzt2h_gpio_names[i];
+	}
+
+	ret = devm_pinctrl_register_and_init(dev, desc, pctrl, &pctrl->pctl);
+	if (ret)
+		return dev_err_probe(dev, ret, "pinctrl registration failed\n");
+
+	ret = pinctrl_enable(pctrl->pctl);
+	if (ret)
+		return dev_err_probe(dev, ret, "pinctrl enable failed\n");
+
+	return rzt2h_gpio_register(pctrl);
+}
+
+static int rzt2h_pinctrl_cfg_regions(struct platform_device *pdev,
+				     struct rzt2h_pinctrl *pctrl)
+{
+	struct resource *res;
+
+	pctrl->base0 = devm_platform_ioremap_resource_byname(pdev, "nsr");
+	if (IS_ERR(pctrl->base0))
+		return PTR_ERR(pctrl->base0);
+
+	/*
+	 * Open-coded instead of using devm_platform_ioremap_resource_byname()
+	 * because the "srs" region is optional.
+	 */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "srs");
+	if (res) {
+		u8 port;
+
+		pctrl->base1 = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(pctrl->base1))
+			return PTR_ERR(pctrl->base1);
+
+		pctrl->safety_port_enabled = true;
+
+		/* Configure to select safety region 0x812c0xxx */
+		for (port = 0; port <= RZT2H_MAX_SAFETY_PORTS; port++)
+			writeb(0x0, pctrl->base1 + RSELP(port));
+	}
+
+	return 0;
+}
+
+static int rzt2h_pinctrl_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct rzt2h_pinctrl *pctrl;
+	int ret;
+
+	pctrl = devm_kzalloc(dev, sizeof(*pctrl), GFP_KERNEL);
+	if (!pctrl)
+		return -ENOMEM;
+
+	pctrl->dev = dev;
+	pctrl->data = of_device_get_match_data(dev);
+
+	ret = rzt2h_pinctrl_cfg_regions(pdev, pctrl);
+	if (ret)
+		return ret;
+
+	raw_spin_lock_init(&pctrl->lock);
+	mutex_init(&pctrl->mutex);
+	platform_set_drvdata(pdev, pctrl);
+
+	return rzt2h_pinctrl_register(pctrl);
+}
+
+static const u8 r9a09g077_gpio_configs[] = {
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+};
+
+static const u8 r9a09g087_gpio_configs[] = {
+	0x1f, 0xff, 0xff, 0x1f, 0x00, 0xfe, 0xff, 0x00, 0x7e, 0xf0, 0xff, 0x01,
+	0xff, 0xff, 0xff, 0x00, 0xe0, 0xff, 0xff, 0x00, 0xff, 0xff, 0xff, 0x01,
+	0xe0, 0xff, 0xff, 0x7f, 0x00, 0xfe, 0xff, 0x7f, 0x00, 0xfc, 0x7f,
+};
+
+static struct rzt2h_pinctrl_data r9a09g077_data = {
+	.n_port_pins = ARRAY_SIZE(r9a09g077_gpio_configs) * RZT2H_PINS_PER_PORT,
+	.port_pin_configs = r9a09g077_gpio_configs,
+	.n_ports = ARRAY_SIZE(r9a09g077_gpio_configs),
+};
+
+static struct rzt2h_pinctrl_data r9a09g087_data = {
+	.n_port_pins = ARRAY_SIZE(r9a09g087_gpio_configs) * RZT2H_PINS_PER_PORT,
+	.port_pin_configs = r9a09g087_gpio_configs,
+	.n_ports = ARRAY_SIZE(r9a09g087_gpio_configs),
+};
+
+static const struct of_device_id rzt2h_pinctrl_of_table[] = {
+	{
+		.compatible = "renesas,r9a09g077-pinctrl",
+		.data = &r9a09g077_data,
+	},
+	{
+		.compatible = "renesas,r9a09g087-pinctrl",
+		.data = &r9a09g087_data,
+	},
+	{ /* sentinel */ }
+};
+
+static int rzt2h_pinctrl_suspend_noirq(struct device *dev)
+{
+	struct rzt2h_pinctrl *pctrl = dev_get_drvdata(dev);
+
+	if (atomic_read(&pctrl->wakeup_path))
+		device_set_wakeup_path(dev);
+
+	return 0;
+}
+
+static const struct dev_pm_ops rzt2h_pinctrl_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(rzt2h_pinctrl_suspend_noirq, NULL)
+};
+
+static struct platform_driver rzt2h_pinctrl_driver = {
+	.driver = {
+		.name = DRV_NAME,
+		.of_match_table = of_match_ptr(rzt2h_pinctrl_of_table),
+		.pm = pm_sleep_ptr(&rzt2h_pinctrl_pm_ops),
+		.suppress_bind_attrs = true,
+	},
+	.probe = rzt2h_pinctrl_probe,
+};
+
+static int __init rzt2h_pinctrl_init(void)
+{
+	return platform_driver_register(&rzt2h_pinctrl_driver);
+}
+core_initcall(rzt2h_pinctrl_init);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Thierry Bultel <thierry.bultel.yh@bp.renesas.com>");
+MODULE_AUTHOR("Lad Prabhakar <prabhakar.mahadev-lad.rj@bp.renesas.com>");
+MODULE_DESCRIPTION("Pin and gpio controller driver for the RZ/T2H family");

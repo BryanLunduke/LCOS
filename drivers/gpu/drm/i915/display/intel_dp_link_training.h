@@ -1,0 +1,105 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Copyright © 2019 Intel Corporation
+ */
+
+#ifndef __INTEL_DP_LINK_TRAINING_H__
+#define __INTEL_DP_LINK_TRAINING_H__
+
+#include <drm/display/drm_dp_helper.h>
+
+#include "intel_dp_link_caps.h"
+
+struct intel_atomic_state;
+struct intel_connector;
+struct intel_crtc_state;
+struct intel_dp;
+struct intel_dp_link_training;
+struct intel_encoder;
+
+int intel_dp_read_dprx_caps(struct intel_dp *intel_dp, u8 dpcd[DP_RECEIVER_CAP_SIZE]);
+int intel_dp_init_lttpr_and_dprx_caps(struct intel_dp *intel_dp);
+bool intel_dp_lttpr_transparent_mode_enabled(struct intel_dp *intel_dp);
+
+void intel_dp_link_training_set_mode(struct intel_dp *intel_dp,
+				     int link_rate, bool is_vrr,
+				     bool pr_with_as_sdp_enable);
+void intel_dp_link_training_set_bw(struct intel_dp *intel_dp,
+				   int link_bw, int rate_select, int lane_count,
+				   bool enhanced_framing, bool post_lt_adj_req);
+
+bool intel_dp_get_adjust_train(struct intel_dp *intel_dp,
+			       const struct intel_crtc_state *crtc_state,
+			       enum drm_dp_phy dp_phy,
+			       const u8 link_status[DP_LINK_STATUS_SIZE]);
+void intel_dp_program_link_training_pattern(struct intel_dp *intel_dp,
+					    const struct intel_crtc_state *crtc_state,
+					    enum drm_dp_phy dp_phy,
+					    u8 dp_train_pat);
+void intel_dp_set_signal_levels(struct intel_dp *intel_dp,
+				const struct intel_crtc_state *crtc_state,
+				enum drm_dp_phy dp_phy);
+void intel_dp_start_link_train(struct intel_atomic_state *state,
+			       struct intel_dp *intel_dp,
+			       const struct intel_crtc_state *crtc_state);
+void intel_dp_stop_link_train(struct intel_dp *intel_dp,
+			      const struct intel_crtc_state *crtc_state);
+
+void
+intel_dp_dump_link_status(struct intel_dp *intel_dp, enum drm_dp_phy dp_phy,
+			  const u8 link_status[DP_LINK_STATUS_SIZE]);
+
+/* Get the TPSx symbol type of the value programmed to DP_TRAINING_PATTERN_SET */
+static inline u8 intel_dp_training_pattern_symbol(u8 pattern)
+{
+	return pattern & ~DP_LINK_SCRAMBLING_DISABLE;
+}
+
+void intel_dp_128b132b_sdp_crc16(struct intel_dp *intel_dp,
+				 const struct intel_crtc_state *crtc_state);
+
+bool intel_dp_link_params_valid(struct intel_dp *intel_dp, int link_rate,
+				u8 lane_count);
+
+bool intel_dp_link_training_get_force_retrain(struct intel_dp_link_training *link_training);
+
+void intel_dp_link_check(struct intel_encoder *encoder);
+void intel_dp_check_link_state(struct intel_dp *intel_dp);
+
+void intel_dp_link_training_debugfs_add(struct intel_connector *connector);
+
+void intel_dp_link_training_reset(struct intel_dp_link_training *link_training);
+
+struct intel_dp_link_training *intel_dp_link_training_init(struct intel_dp *intel_dp);
+void intel_dp_link_training_cleanup(struct intel_dp_link_training *link_training);
+
+#if IS_ENABLED(CONFIG_KUNIT)
+
+int intel_dp_get_link_train_fallback_values(struct intel_dp *intel_dp,
+					    const struct intel_crtc_state *crtc_state);
+
+#define INTEL_DP_LINK_TRAINING_TEST_OPS_MEMBERS(__X) \
+	__X(get_fallback_values,	intel_dp_get_link_train_fallback_values)
+
+#define __DECLARE_MEMBER(__name, __fn) \
+	typeof(__fn) *__name;
+
+#define INTEL_DP_LINK_TRAINING_TEST_OPS_DECLARE \
+	INTEL_DP_LINK_TRAINING_TEST_OPS_MEMBERS(__DECLARE_MEMBER)
+
+struct intel_dp_link_training_test_ops {
+	INTEL_DP_LINK_TRAINING_TEST_OPS_DECLARE
+};
+
+#undef INTEL_DP_LINK_TRAINING_TEST_OPS_DECLARE
+#undef __DECLARE_MEMBER
+
+#ifdef I915
+extern const struct intel_dp_link_training_test_ops i915_display_dp_link_training_test_ops;
+#else
+extern const struct intel_dp_link_training_test_ops intel_display_dp_link_training_test_ops;
+#endif	/* I915 */
+
+#endif	/* CONFIG_KUNIT */
+
+#endif /* __INTEL_DP_LINK_TRAINING_H__ */

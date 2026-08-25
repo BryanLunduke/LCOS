@@ -1,0 +1,1814 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright (C) B.A.T.M.A.N. contributors:
+ *
+ * Edo Monticelli, Antonio Quartulli
+ */
+
+#include "tp_meter.h"
+#include "main.h"
+
+#include <linux/atomic.h>
+#include <linux/bug.h>
+#include <linux/build_bug.h>
+#include <linux/byteorder/generic.h>
+#include <linux/cache.h>
+#include <linux/compiler.h>
+#include <linux/completion.h>
+#include <linux/container_of.h>
+#include <linux/err.h>
+#include <linux/etherdevice.h>
+#include <linux/gfp.h>
+#include <linux/if_ether.h>
+#include <linux/init.h>
+#include <linux/jiffies.h>
+#include <linux/kref.h>
+#include <linux/kthread.h>
+#include <linux/limits.h>
+#include <linux/list.h>
+#include <linux/minmax.h>
+#include <linux/netdevice.h>
+#include <linux/param.h>
+#include <linux/printk.h>
+#include <linux/random.h>
+#include <linux/rculist.h>
+#include <linux/rcupdate.h>
+#include <linux/sched.h>
+#include <linux/skbuff.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/stddef.h>
+#include <linux/string.h>
+#include <linux/timer.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
+#include <uapi/linux/batadv_packet.h>
+#include <uapi/linux/batman_adv.h>
+
+#include "hard-interface.h"
+#include "log.h"
+#include "netlink.h"
+#include "originator.h"
+#include "send.h"
+
+/**
+ * BATADV_TP_DEF_TEST_LENGTH - Default test length if not specified by the user
+ *  in milliseconds
+ */
+#define BATADV_TP_DEF_TEST_LENGTH 10000
+
+/**
+ * BATADV_TP_AWND - Advertised window by the receiver (in bytes)
+ */
+#define BATADV_TP_AWND 0x20000000
+
+/**
+ * BATADV_TP_RECV_TIMEOUT - Receiver activity timeout. If the receiver does not
+ *  get anything for such amount of milliseconds, the connection is killed
+ */
+#define BATADV_TP_RECV_TIMEOUT 1000
+
+/**
+ * BATADV_TP_MAX_RTO - Maximum sender timeout. If the sender RTO gets beyond
+ * such amount of milliseconds, the receiver is considered unreachable and the
+ * connection is killed
+ */
+#define BATADV_TP_MAX_RTO 30000
+
+/**
+ * BATADV_TP_FIRST_SEQ - First seqno of each session. The number is rather high
+ *  in order to immediately trigger a wrap around (test purposes)
+ */
+#define BATADV_TP_FIRST_SEQ ((u32)-1 - 2000)
+
+/**
+ * BATADV_TP_PLEN - length of the payload (data after the batadv_unicast header)
+ *  to simulate
+ */
+#define BATADV_TP_PLEN (BATADV_TP_PACKET_LEN - ETH_HLEN - \
+			sizeof(struct batadv_unicast_packet))
+
+/**
+ * BATADV_TP_MAX_UNACKED - maximum number of packets a receiver didn't yet ack
+ */
+#define BATADV_TP_MAX_UNACKED 100
+
+static u8 batadv_tp_prerandom[4096] __read_mostly;
+
+/**
+ * batadv_tp_session_cookie() - generate session cookie based on session ids
+ * @session: TP session identifier
+ * @icmp_uid: icmp pseudo uid of the tp session
+ *
+ * Return: 32 bit tp_meter session cookie
+ */
+static u32 batadv_tp_session_cookie(const u8 session[2], u8 icmp_uid)
+{
+	u32 cookie;
+
+	cookie = icmp_uid << 16;
+	cookie |= session[0] << 8;
+	cookie |= session[1];
+
+	return cookie;
+}
+
+/**
+ * batadv_tp_cwnd() - compute the new cwnd size
+ * @base: base cwnd size value
+ * @increment: the value to add to base to get the new size
+ * @min: minimum cwnd value (usually MSS)
+ *
+ * Return the new cwnd size and ensure it does not exceed the Advertised
+ * Receiver Window size. It is wrapped around safely.
+ * For details refer to Section 3.1 of RFC5681
+ *
+ * Return: new congestion window size in bytes
+ */
+static u32 batadv_tp_cwnd(u32 base, u32 increment, u32 min)
+{
+	u32 new_size = base + increment;
+
+	/* check for wrap-around */
+	if (new_size < base)
+		new_size = (u32)ULONG_MAX;
+
+	new_size = min_t(u32, new_size, BATADV_TP_AWND);
+
+	return max_t(u32, new_size, min);
+}
+
+/**
+ * batadv_tp_update_cwnd() - update the Congestion Windows
+ * @tp_vars: the private data of the current TP meter session
+ * @mss: maximum segment size of transmission
+ *
+ * 1) if the session is in Slow Start, the CWND has to be increased by 1
+ * MSS every unique received ACK
+ * 2) if the session is in Congestion Avoidance, the CWND has to be
+ * increased by MSS * MSS / CWND for every unique received ACK
+ */
+static void batadv_tp_update_cwnd(struct batadv_tp_sender *tp_vars, u32 mss)
+	__must_hold(&tp_vars->cc_lock)
+{
+	/* slow start... */
+	if (tp_vars->cc.cwnd <= tp_vars->cc.ss_threshold) {
+		tp_vars->cc.dec_cwnd = 0;
+		tp_vars->cc.cwnd = batadv_tp_cwnd(tp_vars->cc.cwnd, mss, mss);
+		return;
+	}
+
+	/* prevent overflow in (mss * mss) << 3 */
+	mss = min_t(u32, mss, (1U << 14) - 1);
+
+	/* increment CWND at least of 1 (section 3.1 of RFC5681) */
+	tp_vars->cc.dec_cwnd += max_t(u32, 1U << 3,
+				      ((mss * mss) << 3) / tp_vars->cc.cwnd);
+	if (tp_vars->cc.dec_cwnd < (mss << 3))
+		return;
+
+	tp_vars->cc.cwnd = batadv_tp_cwnd(tp_vars->cc.cwnd, mss, mss);
+	tp_vars->cc.dec_cwnd = 0;
+}
+
+/**
+ * batadv_tp_update_rto() - calculate new retransmission timeout
+ * @tp_vars: the private data of the current TP meter session
+ * @new_rtt: new roundtrip time in msec
+ */
+static void batadv_tp_update_rto(struct batadv_tp_sender *tp_vars,
+				 u32 new_rtt)
+	__must_hold(&tp_vars->cc_lock)
+{
+	long m = new_rtt;
+
+	/* RTT update
+	 * Details in Section 2.2 and 2.3 of RFC6298
+	 *
+	 * It's tricky to understand. Don't lose hair please.
+	 * Inspired by tcp_rtt_estimator() tcp_input.c
+	 */
+	if (tp_vars->cc.srtt != 0) {
+		m -= (tp_vars->cc.srtt >> 3); /* m is now error in rtt est */
+		tp_vars->cc.srtt += m; /* rtt = 7/8 srtt + 1/8 new */
+		if (m < 0)
+			m = -m;
+
+		m -= (tp_vars->cc.rttvar >> 2);
+		tp_vars->cc.rttvar += m; /* mdev ~= 3/4 rttvar + 1/4 new */
+	} else {
+		/* first measure getting in */
+		tp_vars->cc.srtt = m << 3; /* take the measured time to be srtt */
+		tp_vars->cc.rttvar = m << 1; /* new_rtt / 2 */
+	}
+
+	/* rto = srtt + 4 * rttvar.
+	 * rttvar is scaled by 4, therefore doesn't need to be multiplied
+	 */
+	WRITE_ONCE(tp_vars->cc.rto, (tp_vars->cc.srtt >> 3) + tp_vars->cc.rttvar);
+}
+
+/**
+ * batadv_tp_batctl_notify() - send client status result to client
+ * @reason: reason for tp meter session stop
+ * @dst: destination of tp_meter session
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @start_time: start of transmission in jiffies
+ * @total_sent: bytes acked to the receiver
+ * @cookie: cookie of tp_meter session
+ */
+static void batadv_tp_batctl_notify(enum batadv_tp_meter_reason reason,
+				    const u8 *dst, struct batadv_priv *bat_priv,
+				    unsigned long start_time, u64 total_sent,
+				    u32 cookie)
+{
+	u32 total_bytes;
+	u32 test_time;
+	u8 result;
+
+	if (!batadv_tp_is_error(reason)) {
+		result = BATADV_TP_REASON_COMPLETE;
+		test_time = jiffies_to_msecs(jiffies - start_time);
+		total_bytes = total_sent;
+	} else {
+		result = reason;
+		test_time = 0;
+		total_bytes = 0;
+	}
+
+	batadv_netlink_tpmeter_notify(bat_priv, dst, result, test_time,
+				      total_bytes, cookie);
+}
+
+/**
+ * batadv_tp_batctl_error_notify() - send client error result to client
+ * @reason: reason for tp meter session stop
+ * @dst: destination of tp_meter session
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @cookie: cookie of tp_meter session
+ */
+static void batadv_tp_batctl_error_notify(enum batadv_tp_meter_reason reason,
+					  const u8 *dst,
+					  struct batadv_priv *bat_priv,
+					  u32 cookie)
+{
+	batadv_tp_batctl_notify(reason, dst, bat_priv, 0, 0, cookie);
+}
+
+/**
+ * batadv_tp_list_find_sender() - find a sender tp_vars object in the global list
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @dst: the other endpoint MAC address to look for
+ *
+ * Look for a tp_vars object matching dst as end_point and return it after
+ * having increment the refcounter. Return NULL is not found
+ *
+ * Return: matching tp_vars or NULL when no tp_vars with @dst was found
+ */
+static struct batadv_tp_sender *
+batadv_tp_list_find_sender(struct batadv_priv *bat_priv, const u8 *dst)
+{
+	struct batadv_tp_sender *tp_vars = NULL;
+	struct batadv_tp_sender *pos;
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(pos, &bat_priv->tp_sender_list, common.list) {
+		if (!batadv_compare_eth(pos->common.other_end, dst))
+			continue;
+
+		/* most of the time this function is invoked during the normal
+		 * process..it makes sens to pay more when the session is
+		 * finished and to speed the process up during the measurement
+		 */
+		if (unlikely(!kref_get_unless_zero(&pos->common.refcount)))
+			continue;
+
+		tp_vars = pos;
+		break;
+	}
+	rcu_read_unlock();
+
+	return tp_vars;
+}
+
+/**
+ * batadv_tp_list_active() - check if session from/to destination is ongoing
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @dst: the other endpoint MAC address to look for
+ *
+ * Return: true if a matching session with @dst was found, false otherwise
+ */
+static bool batadv_tp_list_active(struct batadv_priv *bat_priv, const u8 *dst)
+	__must_hold(&bat_priv->tp_list_lock)
+{
+	struct batadv_tp_receiver *tp_receiver;
+	struct batadv_tp_sender *tp_sender;
+
+	hlist_for_each_entry_rcu(tp_sender, &bat_priv->tp_sender_list, common.list) {
+		if (batadv_compare_eth(tp_sender->common.other_end, dst))
+			return true;
+	}
+
+	hlist_for_each_entry_rcu(tp_receiver, &bat_priv->tp_receiver_list, common.list) {
+		if (batadv_compare_eth(tp_receiver->common.other_end, dst))
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * batadv_tp_list_find_sender_session() - find tp_vars sender session
+ *  object in the global list
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @dst: the other endpoint MAC address to look for
+ * @session: session identifier
+ *
+ * Look for a tp_vars object matching dst as end_point, session as tp meter
+ * session and return it after having increment the refcounter. Return NULL
+ * is not found
+ *
+ * Return: matching tp_vars or NULL when no tp_vars was found
+ */
+static struct batadv_tp_sender *
+batadv_tp_list_find_sender_session(struct batadv_priv *bat_priv, const u8 *dst,
+				   const u8 *session)
+{
+	struct batadv_tp_sender *tp_vars = NULL;
+	struct batadv_tp_sender *pos;
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(pos, &bat_priv->tp_sender_list, common.list) {
+		if (!batadv_compare_eth(pos->common.other_end, dst))
+			continue;
+
+		if (memcmp(pos->common.session, session, sizeof(pos->common.session)) != 0)
+			continue;
+
+		/* most of the time this function is invoked during the normal
+		 * process..it makes sense to pay more when the session is
+		 * finished and to speed the process up during the measurement
+		 */
+		if (unlikely(!kref_get_unless_zero(&pos->common.refcount)))
+			continue;
+
+		tp_vars = pos;
+		break;
+	}
+	rcu_read_unlock();
+
+	return tp_vars;
+}
+
+/**
+ * batadv_tp_sender_release() - release batadv_tp_sender
+ *  and queue for free after rcu grace period
+ * @ref: kref pointer of the batadv_tp_sender
+ */
+static void batadv_tp_sender_release(struct kref *ref)
+{
+	struct batadv_tp_sender *tp_vars;
+
+	tp_vars = container_of(ref, struct batadv_tp_sender, common.refcount);
+	kfree_rcu(tp_vars, common.rcu);
+}
+
+/**
+ * batadv_tp_sender_put() - decrement the batadv_tp_sender
+ *  refcounter and possibly release it
+ * @tp_vars: the private data of the current TP meter session to be free'd
+ */
+static void batadv_tp_sender_put(struct batadv_tp_sender *tp_vars)
+{
+	if (!tp_vars)
+		return;
+
+	kref_put(&tp_vars->common.refcount, batadv_tp_sender_release);
+}
+
+/**
+ * batadv_tp_list_detach() - remove tp session from mesh session list once
+ * @tp_vars: the private data of the current TP meter session
+ *
+ * Return: whether tp_vars was detached from list and reference must be freed
+ */
+static bool batadv_tp_list_detach(struct batadv_tp_vars_common *tp_vars)
+{
+	bool detached = false;
+
+	spin_lock_bh(&tp_vars->bat_priv->tp_list_lock);
+	if (!hlist_unhashed(&tp_vars->list)) {
+		hlist_del_init_rcu(&tp_vars->list);
+		detached = true;
+	}
+	spin_unlock_bh(&tp_vars->bat_priv->tp_list_lock);
+
+	if (!detached)
+		return false;
+
+	atomic_dec(&tp_vars->bat_priv->tp_num);
+
+	return true;
+}
+
+/**
+ * batadv_tp_sender_cleanup() - cleanup sender data and drop and timer
+ * @tp_vars: the private data of the current TP meter session to cleanup
+ */
+static void batadv_tp_sender_cleanup(struct batadv_tp_sender *tp_vars)
+{
+	disable_delayed_work_sync(&tp_vars->finish_work);
+
+	if (batadv_tp_list_detach(&tp_vars->common))
+		batadv_tp_sender_put(tp_vars);
+
+	/* kill the timer and remove its reference */
+	timer_shutdown_sync(&tp_vars->common.timer);
+	batadv_tp_sender_put(tp_vars);
+}
+
+/**
+ * batadv_tp_sender_end() - print info about ended session and inform client
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @tp_vars: the private data of the current TP meter session
+ */
+static void batadv_tp_sender_end(struct batadv_priv *bat_priv,
+				 struct batadv_tp_sender *tp_vars)
+{
+	enum batadv_tp_meter_reason reason;
+	u32 session_cookie;
+
+	reason = atomic_read(&tp_vars->send_result);
+
+	batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+		   "Test towards %pM finished..shutting down (reason=%d)\n",
+		   tp_vars->common.other_end, reason);
+
+	batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+		   "Last timing stats: SRTT=%ums RTTVAR=%ums RTO=%ums\n",
+		   tp_vars->cc.srtt >> 3, tp_vars->cc.rttvar >> 2, tp_vars->cc.rto);
+
+	batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+		   "Final values: cwnd=%u ss_threshold=%u\n",
+		   tp_vars->cc.cwnd, tp_vars->cc.ss_threshold);
+
+	session_cookie = batadv_tp_session_cookie(tp_vars->common.session,
+						  tp_vars->icmp_uid);
+
+	batadv_tp_batctl_notify(reason,
+				tp_vars->common.other_end,
+				bat_priv,
+				tp_vars->start_time,
+				atomic64_read(&tp_vars->tot_sent),
+				session_cookie);
+}
+
+/**
+ * batadv_tp_sender_shutdown() - let sender thread/timer stop gracefully
+ * @tp_vars: the private data of the current TP meter session
+ * @reason: reason for tp meter session stop
+ */
+static void batadv_tp_sender_shutdown(struct batadv_tp_sender *tp_vars,
+				      enum batadv_tp_meter_reason reason)
+{
+	atomic_cmpxchg(&tp_vars->send_result, 0, reason);
+}
+
+/**
+ * batadv_tp_sender_stopped() - check if tp session was stopped with reason
+ * @tp_vars: the private data of the current TP meter session
+ *
+ * Return: whether stop reason was found
+ */
+static bool batadv_tp_sender_stopped(struct batadv_tp_sender *tp_vars)
+{
+	return atomic_read(&tp_vars->send_result) != 0;
+}
+
+/**
+ * batadv_tp_sender_finish() - stop sender session after test_length was reached
+ * @work: delayed work reference of the related tp_vars
+ */
+static void batadv_tp_sender_finish(struct work_struct *work)
+{
+	struct delayed_work *delayed_work;
+	struct batadv_tp_sender *tp_vars;
+
+	delayed_work = to_delayed_work(work);
+	tp_vars = container_of(delayed_work, struct batadv_tp_sender,
+			       finish_work);
+
+	batadv_tp_sender_shutdown(tp_vars, BATADV_TP_REASON_COMPLETE);
+}
+
+/**
+ * batadv_tp_reset_sender_timer() - reschedule the sender timer
+ * @tp_vars: the private TP meter data for this session
+ *
+ * Reschedule the timer using tp_vars->cc.rto as delay
+ */
+static void batadv_tp_reset_sender_timer(struct batadv_tp_sender *tp_vars)
+{
+	/* most of the time this function is invoked while normal packet
+	 * reception...
+	 */
+	if (unlikely(batadv_tp_sender_stopped(tp_vars)))
+		/* timer ref will be dropped in batadv_tp_sender_cleanup */
+		return;
+
+	mod_timer(&tp_vars->common.timer,
+		  jiffies + msecs_to_jiffies(READ_ONCE(tp_vars->cc.rto)));
+}
+
+/**
+ * batadv_tp_sender_timeout() - timer that fires in case of packet loss
+ * @t: address to timer_list inside tp_vars
+ *
+ * If fired it means that there was packet loss.
+ * Switch to Slow Start, set the ss_threshold to half of the current cwnd and
+ * reset the cwnd to 3*MSS
+ */
+static void batadv_tp_sender_timeout(struct timer_list *t)
+{
+	struct batadv_tp_sender *tp_vars = timer_container_of(tp_vars, t, common.timer);
+	struct batadv_priv *bat_priv = tp_vars->common.bat_priv;
+
+	if (batadv_tp_sender_stopped(tp_vars))
+		return;
+
+	spin_lock_bh(&tp_vars->cc_lock);
+
+	/* if the user waited long enough...shutdown the test */
+	if (unlikely(tp_vars->cc.rto >= BATADV_TP_MAX_RTO)) {
+		spin_unlock_bh(&tp_vars->cc_lock);
+		batadv_tp_sender_shutdown(tp_vars,
+					  BATADV_TP_REASON_DST_UNREACHABLE);
+		return;
+	}
+
+	/* RTO exponential backoff
+	 * Details in Section 5.5 of RFC6298
+	 */
+	WRITE_ONCE(tp_vars->cc.rto, tp_vars->cc.rto * 2);
+
+	tp_vars->cc.ss_threshold = tp_vars->cc.cwnd >> 1;
+	if (tp_vars->cc.ss_threshold < BATADV_TP_PLEN * 2)
+		tp_vars->cc.ss_threshold = BATADV_TP_PLEN * 2;
+
+	batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+		   "Meter: RTO fired during test towards %pM! cwnd=%u new ss_thr=%u, resetting last_sent to %u\n",
+		   tp_vars->common.other_end, tp_vars->cc.cwnd, tp_vars->cc.ss_threshold,
+		   tp_vars->cc.last_acked);
+
+	tp_vars->cc.cwnd = BATADV_TP_PLEN * 3;
+
+	WRITE_ONCE(tp_vars->cc.last_sent, tp_vars->cc.last_acked);
+
+	spin_unlock_bh(&tp_vars->cc_lock);
+
+	/* resend the non-ACKed packets.. */
+	wake_up(&tp_vars->more_bytes);
+
+	batadv_tp_reset_sender_timer(tp_vars);
+}
+
+/**
+ * batadv_tp_fill_prerandom() - Fill buffer with prefetched random bytes
+ * @tp_vars: the private TP meter data for this session
+ * @buf: Buffer to fill with bytes
+ * @nbytes: amount of pseudorandom bytes
+ */
+static void batadv_tp_fill_prerandom(struct batadv_tp_sender *tp_vars,
+				     u8 *buf, size_t nbytes)
+{
+	size_t bytes_inbuf;
+	u32 local_offset;
+	size_t to_copy;
+	size_t pos = 0;
+
+	spin_lock_bh(&tp_vars->prerandom_lock);
+	local_offset = tp_vars->prerandom_offset;
+	tp_vars->prerandom_offset += nbytes;
+	tp_vars->prerandom_offset %= sizeof(batadv_tp_prerandom);
+	spin_unlock_bh(&tp_vars->prerandom_lock);
+
+	while (nbytes) {
+		local_offset %= sizeof(batadv_tp_prerandom);
+		bytes_inbuf = sizeof(batadv_tp_prerandom) - local_offset;
+		to_copy = min(nbytes, bytes_inbuf);
+
+		memcpy(&buf[pos], &batadv_tp_prerandom[local_offset], to_copy);
+		pos += to_copy;
+		nbytes -= to_copy;
+		local_offset = 0;
+	}
+}
+
+/**
+ * batadv_tp_send_msg() - send a single message
+ * @tp_vars: the private TP meter data for this session
+ * @src: source mac address
+ * @orig_node: the originator of the destination
+ * @seqno: sequence number of this packet
+ * @len: length of the entire packet
+ * @session: session identifier
+ * @uid: local ICMP "socket" index
+ * @timestamp: timestamp in jiffies which is replied in ack
+ *
+ * Create and send a single TP Meter message.
+ *
+ * Return: 0 on success, BATADV_TP_REASON_MEMORY_ERROR if the packet couldn't
+ * be allocated, BATADV_TP_REASON_CANT_SEND if the packet could not be
+ * transmitted
+ */
+static int batadv_tp_send_msg(struct batadv_tp_sender *tp_vars, const u8 *src,
+			      struct batadv_orig_node *orig_node,
+			      u32 seqno, size_t len, const u8 *session,
+			      int uid, u32 timestamp)
+{
+	struct batadv_icmp_tp_packet *icmp;
+	struct sk_buff *skb;
+	size_t data_len;
+	u8 *data;
+	int r;
+
+	skb = netdev_alloc_skb_ip_align(NULL, len + ETH_HLEN);
+	if (unlikely(!skb))
+		return BATADV_TP_REASON_MEMORY_ERROR;
+
+	skb_reserve(skb, ETH_HLEN);
+	icmp = skb_put(skb, sizeof(*icmp));
+
+	/* fill the icmp header */
+	ether_addr_copy(icmp->dst, orig_node->orig);
+	ether_addr_copy(icmp->orig, src);
+	icmp->version = BATADV_COMPAT_VERSION;
+	icmp->packet_type = BATADV_ICMP;
+	icmp->ttl = BATADV_TTL;
+	icmp->msg_type = BATADV_TP;
+	icmp->uid = uid;
+
+	icmp->subtype = BATADV_TP_MSG;
+	memcpy(icmp->session, session, sizeof(icmp->session));
+	icmp->seqno = htonl(seqno);
+	icmp->timestamp = htonl(timestamp);
+
+	data_len = len - sizeof(*icmp);
+	data = skb_put(skb, data_len);
+	batadv_tp_fill_prerandom(tp_vars, data, data_len);
+
+	r = batadv_send_skb_to_orig(skb, orig_node, NULL);
+	if (r == NET_XMIT_SUCCESS)
+		return 0;
+
+	return BATADV_TP_REASON_CANT_SEND;
+}
+
+/**
+ * enum batadv_tp_ack_reaction - expected reaction to ack packet
+ */
+enum batadv_tp_ack_reaction {
+	/** @BATADV_TP_ACK_REACTION_OLD_ACK: ignore old ack packet */
+	BATADV_TP_ACK_REACTION_OLD_ACK,
+
+	/** @BATADV_TP_ACK_REACTION_IGNORE: ignore duplicated ack but reset timer */
+	BATADV_TP_ACK_REACTION_IGNORE,
+
+	/** @BATADV_TP_ACK_REACTION_RESEND_WAKEUP: resend data and wakeup "more_bytes" */
+	BATADV_TP_ACK_REACTION_RESEND_WAKEUP,
+
+	/** @BATADV_TP_ACK_REACTION_WAKEUP: wakeup "more_bytes" */
+	BATADV_TP_ACK_REACTION_WAKEUP,
+};
+
+/**
+ * batadv_tp_handle_ack() - Calculate reaction to ACK and update congestion control
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @tp_vars: the private data of the current TP meter session
+ * @recv_ack: received ACK seqno
+ * @mss: maximum segment size for transmission
+ *
+ * Return: expected reaction to this ack
+ */
+static enum batadv_tp_ack_reaction
+batadv_tp_handle_ack(struct batadv_priv *bat_priv,
+		     struct batadv_tp_sender *tp_vars,
+		     u32 recv_ack, size_t mss)
+	__must_hold(&tp_vars->cc_lock)
+{
+	enum batadv_tp_ack_reaction reaction;
+
+	if (batadv_seq_before(recv_ack, tp_vars->cc.last_acked))
+		return BATADV_TP_ACK_REACTION_OLD_ACK;
+
+	/* check if this ACK is a duplicate */
+	if (tp_vars->cc.last_acked == recv_ack) {
+		/* if this is the third duplicate ACK do Fast Retransmit */
+		if (tp_vars->cc.dup_acks > 3)
+			return BATADV_TP_ACK_REACTION_IGNORE;
+
+		tp_vars->cc.dup_acks++;
+		if (tp_vars->cc.dup_acks != 3)
+			return BATADV_TP_ACK_REACTION_IGNORE;
+
+		if (!batadv_seq_before(tp_vars->cc.recover, recv_ack))
+			return BATADV_TP_ACK_REACTION_IGNORE;
+
+		/* Fast Recovery */
+		tp_vars->cc.fast_recovery = true;
+
+		/* Set recover to the last outstanding seqno when Fast Recovery
+		 * is entered. RFC6582, Section 3.2, step 1
+		 */
+		tp_vars->cc.recover = tp_vars->cc.last_sent;
+		tp_vars->cc.ss_threshold = tp_vars->cc.cwnd >> 1;
+		batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+			   "Meter: Fast Recovery, (cur cwnd=%u) ss_thr=%u last_sent=%u recv_ack=%u\n",
+			   tp_vars->cc.cwnd, tp_vars->cc.ss_threshold,
+			   tp_vars->cc.last_sent, recv_ack);
+		tp_vars->cc.cwnd = batadv_tp_cwnd(tp_vars->cc.ss_threshold, 3 * mss,
+						  mss);
+		tp_vars->cc.dec_cwnd = 0;
+		WRITE_ONCE(tp_vars->cc.last_sent, recv_ack);
+
+		return BATADV_TP_ACK_REACTION_RESEND_WAKEUP;
+	}
+
+	/* count the acked data */
+	atomic64_add(recv_ack - tp_vars->cc.last_acked, &tp_vars->tot_sent);
+
+	/* reset the duplicate ACKs counter */
+	tp_vars->cc.dup_acks = 0;
+
+	if (tp_vars->cc.fast_recovery) {
+		/* partial ACK */
+		if (batadv_seq_before(recv_ack, tp_vars->cc.recover)) {
+			/* this is another hole in the window. React
+			 * immediately as specified by NewReno (see
+			 * Section 3.2 of RFC6582 for details)
+			 */
+			reaction = BATADV_TP_ACK_REACTION_RESEND_WAKEUP;
+			tp_vars->cc.cwnd = batadv_tp_cwnd(tp_vars->cc.cwnd,
+							  mss, mss);
+		} else {
+			tp_vars->cc.fast_recovery = false;
+			/* set cwnd to the value of ss_threshold at the
+			 * moment that Fast Recovery was entered.
+			 * RFC6582, Section 3.2, step 3
+			 */
+			tp_vars->cc.cwnd = batadv_tp_cwnd(tp_vars->cc.ss_threshold,
+							  0, mss);
+			reaction = BATADV_TP_ACK_REACTION_WAKEUP;
+		}
+	} else {
+		if (recv_ack - tp_vars->cc.last_acked >= mss)
+			batadv_tp_update_cwnd(tp_vars, mss);
+
+		reaction = BATADV_TP_ACK_REACTION_WAKEUP;
+	}
+
+	/* move the Transmit Window */
+	WRITE_ONCE(tp_vars->cc.last_acked, recv_ack);
+
+	return reaction;
+}
+
+/**
+ * batadv_tp_recv_ack() - ACK receiving function
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @skb: the buffer containing the received packet
+ *
+ * Process a received TP ACK packet
+ */
+static void batadv_tp_recv_ack(struct batadv_priv *bat_priv,
+			       const struct sk_buff *skb)
+{
+	struct batadv_hard_iface *primary_if = NULL;
+	struct batadv_orig_node *orig_node = NULL;
+	const struct batadv_icmp_tp_packet *icmp;
+	enum batadv_tp_ack_reaction reaction;
+	struct batadv_tp_sender *tp_vars;
+	size_t packet_len;
+	u32 recv_ack;
+	size_t mss;
+	u32 rtt;
+
+	packet_len = BATADV_TP_PLEN;
+	mss = BATADV_TP_PLEN;
+	packet_len += sizeof(struct batadv_unicast_packet);
+
+	icmp = (struct batadv_icmp_tp_packet *)skb->data;
+	recv_ack = ntohl(icmp->seqno);
+
+	/* find the tp_vars */
+	tp_vars = batadv_tp_list_find_sender_session(bat_priv, icmp->orig,
+						     icmp->session);
+	if (unlikely(!tp_vars))
+		return;
+
+	if (unlikely(batadv_tp_sender_stopped(tp_vars)))
+		goto out;
+
+	/* old ACK? silently drop it.. */
+	if (batadv_seq_before(recv_ack, READ_ONCE(tp_vars->cc.last_acked)))
+		goto out;
+
+	primary_if = batadv_primary_if_get_selected(bat_priv);
+	if (unlikely(!primary_if))
+		goto out;
+
+	orig_node = batadv_orig_hash_find(bat_priv, icmp->orig);
+	if (unlikely(!orig_node))
+		goto out;
+
+	spin_lock_bh(&tp_vars->cc_lock);
+	/* update RTO with the new sampled RTT, if any */
+	rtt = jiffies_to_msecs(jiffies) - ntohl(icmp->timestamp);
+	if (icmp->timestamp && rtt)
+		batadv_tp_update_rto(tp_vars, rtt);
+
+	reaction = batadv_tp_handle_ack(bat_priv, tp_vars, recv_ack, mss);
+	spin_unlock_bh(&tp_vars->cc_lock);
+
+	if (reaction == BATADV_TP_ACK_REACTION_OLD_ACK)
+		goto out;
+
+	/* ACK for new data... reset the timer */
+	batadv_tp_reset_sender_timer(tp_vars);
+
+	switch (reaction) {
+	default:
+	case BATADV_TP_ACK_REACTION_IGNORE:
+		goto out;
+	case BATADV_TP_ACK_REACTION_RESEND_WAKEUP:
+		batadv_tp_send_msg(tp_vars, primary_if->net_dev->dev_addr,
+				   orig_node, recv_ack, packet_len,
+				   icmp->session, icmp->uid,
+				   jiffies_to_msecs(jiffies));
+		fallthrough;
+	case BATADV_TP_ACK_REACTION_WAKEUP:
+		wake_up(&tp_vars->more_bytes);
+		break;
+	}
+
+out:
+	batadv_hardif_put(primary_if);
+	batadv_orig_node_put(orig_node);
+	batadv_tp_sender_put(tp_vars);
+}
+
+/**
+ * batadv_tp_avail() - check if congestion window is not full
+ * @tp_vars: the private data of the current TP meter session
+ * @payload_len: size of the payload of a single message
+ *
+ * Return: true when congestion window is not full, false otherwise
+ */
+static bool batadv_tp_avail(struct batadv_tp_sender *tp_vars,
+			    size_t payload_len)
+{
+	u32 win_limit;
+	u32 win_left;
+
+	spin_lock_bh(&tp_vars->cc_lock);
+
+	win_limit = tp_vars->cc.last_acked + tp_vars->cc.cwnd;
+
+	if (batadv_seq_before(tp_vars->cc.last_sent, win_limit))
+		win_left = win_limit - tp_vars->cc.last_sent;
+	else
+		win_left = 0;
+
+	spin_unlock_bh(&tp_vars->cc_lock);
+
+	return win_left >= payload_len;
+}
+
+/**
+ * batadv_tp_wait_available() - wait until congestion window becomes free or
+ *  timeout is reached
+ * @tp_vars: the private data of the current TP meter session
+ * @plen: size of the payload of a single message
+ *
+ * Return: 0 if the condition evaluated to false after the timeout elapsed,
+ *  1 if the condition evaluated to true after the timeout elapsed, the
+ *  remaining jiffies (at least 1) if the condition evaluated to true before
+ *  the timeout elapsed, or -ERESTARTSYS if it was interrupted by a signal.
+ */
+static int batadv_tp_wait_available(struct batadv_tp_sender *tp_vars, size_t plen)
+{
+	int ret;
+
+	ret = wait_event_interruptible_timeout(tp_vars->more_bytes,
+					       batadv_tp_avail(tp_vars, plen),
+					       HZ / 10);
+
+	return ret;
+}
+
+/**
+ * batadv_tp_send() - main sending thread of a tp meter session
+ * @arg: address of the related tp_vars
+ *
+ * Return: 0
+ */
+static int batadv_tp_send(void *arg)
+{
+	struct batadv_hard_iface *primary_if = NULL;
+	struct batadv_orig_node *orig_node = NULL;
+	struct batadv_tp_sender *tp_vars = arg;
+	struct batadv_priv *bat_priv;
+	size_t payload_len;
+	size_t packet_len;
+	u32 last_sent;
+	int err = 0;
+
+	bat_priv = tp_vars->common.bat_priv;
+	orig_node = batadv_orig_hash_find(bat_priv, tp_vars->common.other_end);
+	if (unlikely(!orig_node)) {
+		err = BATADV_TP_REASON_DST_UNREACHABLE;
+		batadv_tp_sender_shutdown(tp_vars, err);
+		goto out;
+	}
+
+	primary_if = batadv_primary_if_get_selected(bat_priv);
+	if (unlikely(!primary_if)) {
+		err = BATADV_TP_REASON_DST_UNREACHABLE;
+		batadv_tp_sender_shutdown(tp_vars, err);
+		goto out;
+	}
+
+	/* assume that all the hard_interfaces have a correctly
+	 * configured MTU, so use the mesh_iface MTU as MSS.
+	 * This might not be true and in that case the fragmentation
+	 * should be used.
+	 * Now, try to send the packet as it is
+	 */
+	payload_len = BATADV_TP_PLEN;
+	BUILD_BUG_ON(sizeof(struct batadv_icmp_tp_packet) > BATADV_TP_PLEN);
+
+	batadv_tp_reset_sender_timer(tp_vars);
+
+	/* queue the worker in charge of terminating the test */
+	queue_delayed_work(batadv_event_workqueue, &tp_vars->finish_work,
+			   msecs_to_jiffies(tp_vars->test_length));
+
+	while (!batadv_tp_sender_stopped(tp_vars)) {
+		if (unlikely(!batadv_tp_avail(tp_vars, payload_len))) {
+			batadv_tp_wait_available(tp_vars, payload_len);
+			continue;
+		}
+
+		/* to emulate normal unicast traffic, add to the payload len
+		 * the size of the unicast header
+		 */
+		packet_len = payload_len + sizeof(struct batadv_unicast_packet);
+		last_sent = READ_ONCE(tp_vars->cc.last_sent);
+
+		err = batadv_tp_send_msg(tp_vars, primary_if->net_dev->dev_addr,
+					 orig_node, last_sent, packet_len,
+					 tp_vars->common.session, tp_vars->icmp_uid,
+					 jiffies_to_msecs(jiffies));
+
+		/* something went wrong during the preparation/transmission */
+		if (unlikely(err && err != BATADV_TP_REASON_CANT_SEND)) {
+			batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+				   "Meter: %s() cannot send packets (%d)\n",
+				   __func__, err);
+			/* ensure nobody else tries to stop the thread now */
+			batadv_tp_sender_shutdown(tp_vars, err);
+			break;
+		}
+
+		/* right-shift the TWND */
+		if (!err) {
+			spin_lock_bh(&tp_vars->cc_lock);
+			if (tp_vars->cc.last_sent == last_sent)
+				WRITE_ONCE(tp_vars->cc.last_sent, last_sent + payload_len);
+			spin_unlock_bh(&tp_vars->cc_lock);
+		}
+
+		cond_resched();
+	}
+
+out:
+	batadv_hardif_put(primary_if);
+	batadv_orig_node_put(orig_node);
+
+	batadv_tp_sender_end(bat_priv, tp_vars);
+	batadv_tp_sender_cleanup(tp_vars);
+	complete(&tp_vars->finished);
+
+	batadv_tp_sender_put(tp_vars);
+
+	return 0;
+}
+
+/**
+ * batadv_tp_start_kthread() - start new thread which manages the tp meter
+ *  sender
+ * @tp_vars: the private data of the current TP meter session
+ */
+static void batadv_tp_start_kthread(struct batadv_tp_sender *tp_vars)
+{
+	struct batadv_priv *bat_priv = tp_vars->common.bat_priv;
+	struct task_struct *kthread;
+	u32 session_cookie;
+
+	kref_get(&tp_vars->common.refcount);
+	kthread = kthread_create(batadv_tp_send, tp_vars, "kbatadv_tp_meter");
+	if (IS_ERR(kthread)) {
+		session_cookie = batadv_tp_session_cookie(tp_vars->common.session,
+							  tp_vars->icmp_uid);
+		pr_err("batadv: cannot create tp meter kthread\n");
+		batadv_tp_batctl_error_notify(BATADV_TP_REASON_MEMORY_ERROR,
+					      tp_vars->common.other_end,
+					      bat_priv, session_cookie);
+
+		/* drop reserved reference for kthread */
+		batadv_tp_sender_put(tp_vars);
+
+		/* cleanup of failed tp meter variables */
+		batadv_tp_sender_cleanup(tp_vars);
+		complete(&tp_vars->finished);
+		return;
+	}
+
+	wake_up_process(kthread);
+}
+
+/**
+ * batadv_tp_start() - start a new tp meter session
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @dst: the receiver MAC address
+ * @test_length: test length in milliseconds
+ * @cookie: session cookie
+ */
+void batadv_tp_start(struct batadv_priv *bat_priv, const u8 *dst,
+		     u32 test_length, u32 *cookie)
+{
+	struct batadv_tp_sender *tp_vars;
+	u32 session_cookie;
+	u8 session_id[2];
+	u8 icmp_uid;
+
+	get_random_bytes(session_id, sizeof(session_id));
+	get_random_bytes(&icmp_uid, 1);
+	session_cookie = batadv_tp_session_cookie(session_id, icmp_uid);
+	*cookie = session_cookie;
+
+	/* look for an already existing test towards this node */
+	spin_lock_bh(&bat_priv->tp_list_lock);
+	if (READ_ONCE(bat_priv->mesh_state) != BATADV_MESH_ACTIVE) {
+		spin_unlock_bh(&bat_priv->tp_list_lock);
+		batadv_tp_batctl_error_notify(BATADV_TP_REASON_DST_UNREACHABLE,
+					      dst, bat_priv, session_cookie);
+		return;
+	}
+
+	if (batadv_tp_list_active(bat_priv, dst)) {
+		spin_unlock_bh(&bat_priv->tp_list_lock);
+		batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+			   "Meter: test to or from the same node already ongoing, aborting\n");
+		batadv_tp_batctl_error_notify(BATADV_TP_REASON_ALREADY_ONGOING,
+					      dst, bat_priv, session_cookie);
+		return;
+	}
+
+	if (!atomic_add_unless(&bat_priv->tp_num, 1, BATADV_TP_MAX_NUM)) {
+		spin_unlock_bh(&bat_priv->tp_list_lock);
+		batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+			   "Meter: too many ongoing sessions, aborting (SEND)\n");
+		batadv_tp_batctl_error_notify(BATADV_TP_REASON_TOO_MANY, dst,
+					      bat_priv, session_cookie);
+		return;
+	}
+
+	tp_vars = kmalloc_obj(*tp_vars, GFP_ATOMIC);
+	if (!tp_vars) {
+		atomic_dec(&bat_priv->tp_num);
+		spin_unlock_bh(&bat_priv->tp_list_lock);
+		batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+			   "Meter: %s cannot allocate list elements\n",
+			   __func__);
+		batadv_tp_batctl_error_notify(BATADV_TP_REASON_MEMORY_ERROR,
+					      dst, bat_priv, session_cookie);
+		return;
+	}
+
+	/* initialize tp_vars */
+	ether_addr_copy(tp_vars->common.other_end, dst);
+	kref_init(&tp_vars->common.refcount);
+	atomic_set(&tp_vars->send_result, 0);
+	memcpy(tp_vars->common.session, session_id, sizeof(session_id));
+	tp_vars->icmp_uid = icmp_uid;
+
+	WRITE_ONCE(tp_vars->cc.last_sent, BATADV_TP_FIRST_SEQ);
+	WRITE_ONCE(tp_vars->cc.dup_acks, 0);
+	WRITE_ONCE(tp_vars->cc.last_acked, BATADV_TP_FIRST_SEQ);
+	tp_vars->cc.fast_recovery = false;
+	tp_vars->cc.recover = BATADV_TP_FIRST_SEQ;
+
+	/* initialise the CWND to 3*MSS (Section 3.1 in RFC5681).
+	 * For batman-adv the MSS is the size of the payload received by the
+	 * mesh_interface, hence its MTU
+	 */
+	tp_vars->cc.cwnd = BATADV_TP_PLEN * 3;
+	tp_vars->cc.dec_cwnd = 0;
+
+	/* at the beginning initialise the SS threshold to the biggest possible
+	 * window size, hence the AWND size
+	 */
+	tp_vars->cc.ss_threshold = BATADV_TP_AWND;
+
+	/* RTO initial value is 3 seconds.
+	 * Details in Section 2.1 of RFC6298
+	 */
+	WRITE_ONCE(tp_vars->cc.rto, 1000);
+	tp_vars->cc.srtt = 0;
+	tp_vars->cc.rttvar = 0;
+
+	atomic64_set(&tp_vars->tot_sent, 0);
+
+	kref_get(&tp_vars->common.refcount);
+	timer_setup(&tp_vars->common.timer, batadv_tp_sender_timeout, 0);
+
+	tp_vars->common.bat_priv = bat_priv;
+	tp_vars->start_time = jiffies;
+
+	init_waitqueue_head(&tp_vars->more_bytes);
+	init_completion(&tp_vars->finished);
+
+	spin_lock_init(&tp_vars->cc_lock);
+
+	tp_vars->prerandom_offset = 0;
+	spin_lock_init(&tp_vars->prerandom_lock);
+
+	tp_vars->test_length = test_length;
+	if (!tp_vars->test_length)
+		tp_vars->test_length = BATADV_TP_DEF_TEST_LENGTH;
+
+	/* init work item for finished tp tests */
+	INIT_DELAYED_WORK(&tp_vars->finish_work, batadv_tp_sender_finish);
+
+	kref_get(&tp_vars->common.refcount);
+	hlist_add_head_rcu(&tp_vars->common.list, &bat_priv->tp_sender_list);
+	spin_unlock_bh(&bat_priv->tp_list_lock);
+
+	batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+		   "Meter: starting throughput meter towards %pM (length=%ums)\n",
+		   dst, test_length);
+
+	/* start tp kthread. This way the write() call issued from userspace can
+	 * happily return and avoid to block
+	 */
+	batadv_tp_start_kthread(tp_vars);
+
+	/* don't return reference to new tp_vars */
+	batadv_tp_sender_put(tp_vars);
+}
+
+/**
+ * batadv_tp_stop() - stop currently running tp meter session
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @dst: the receiver MAC address
+ * @return_value: reason for tp meter session stop
+ */
+void batadv_tp_stop(struct batadv_priv *bat_priv, const u8 *dst,
+		    u8 return_value)
+{
+	struct batadv_orig_node *orig_node;
+	struct batadv_tp_sender *tp_vars;
+
+	batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+		   "Meter: stopping test towards %pM\n", dst);
+
+	orig_node = batadv_orig_hash_find(bat_priv, dst);
+	if (!orig_node)
+		return;
+
+	tp_vars = batadv_tp_list_find_sender(bat_priv, orig_node->orig);
+	if (!tp_vars) {
+		batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+			   "Meter: trying to interrupt an already over connection\n");
+		goto out_put_orig_node;
+	}
+
+	batadv_tp_sender_shutdown(tp_vars, return_value);
+	batadv_tp_sender_put(tp_vars);
+out_put_orig_node:
+	batadv_orig_node_put(orig_node);
+}
+
+/**
+ * batadv_tp_list_find_receiver_session() - find tp_vars receiver session
+ *  object in the global list
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @dst: the other endpoint MAC address to look for
+ * @session: session identifier
+ *
+ * Look for a tp_vars object matching dst as end_point, session as tp meter
+ * session and return it after having increment the refcounter. Return NULL
+ * is not found
+ *
+ * Return: matching tp_vars or NULL when no tp_vars was found
+ */
+static struct batadv_tp_receiver *
+batadv_tp_list_find_receiver_session(struct batadv_priv *bat_priv, const u8 *dst,
+				     const u8 *session)
+{
+	struct batadv_tp_receiver *tp_vars = NULL;
+	struct batadv_tp_receiver *pos;
+
+	rcu_read_lock();
+	hlist_for_each_entry_rcu(pos, &bat_priv->tp_receiver_list, common.list) {
+		if (!batadv_compare_eth(pos->common.other_end, dst))
+			continue;
+
+		if (memcmp(pos->common.session, session, sizeof(pos->common.session)) != 0)
+			continue;
+
+		/* most of the time this function is invoked during the normal
+		 * process..it makes sense to pay more when the session is
+		 * finished and to speed the process up during the measurement
+		 */
+		if (unlikely(!kref_get_unless_zero(&pos->common.refcount)))
+			continue;
+
+		tp_vars = pos;
+		break;
+	}
+	rcu_read_unlock();
+
+	return tp_vars;
+}
+
+/**
+ * batadv_tp_receiver_release() - release batadv_tp_receiver
+ *  and queue for free after rcu grace period
+ * @ref: kref pointer of the batadv_tp_receiver
+ */
+static void batadv_tp_receiver_release(struct kref *ref)
+{
+	struct batadv_tp_receiver *tp_vars;
+	struct batadv_tp_unacked *safe;
+	struct batadv_tp_unacked *un;
+
+	tp_vars = container_of(ref, struct batadv_tp_receiver, common.refcount);
+
+	/* lock should not be needed because this object is now out of any
+	 * context!
+	 */
+	spin_lock_bh(&tp_vars->ack_seqno_lock);
+	list_for_each_entry_safe(un, safe, &tp_vars->unacked_list, list) {
+		list_del(&un->list);
+		kfree(un);
+		tp_vars->unacked_count--;
+	}
+	spin_unlock_bh(&tp_vars->ack_seqno_lock);
+
+	kfree_rcu(tp_vars, common.rcu);
+}
+
+/**
+ * batadv_tp_receiver_put() - decrement the batadv_tp_receiver
+ *  refcounter and possibly release it
+ * @tp_vars: the private data of the current TP meter session to be free'd
+ */
+static void batadv_tp_receiver_put(struct batadv_tp_receiver *tp_vars)
+{
+	if (!tp_vars)
+		return;
+
+	kref_put(&tp_vars->common.refcount, batadv_tp_receiver_release);
+}
+
+/**
+ * batadv_tp_reset_receiver_timer() - reset the receiver shutdown timer
+ * @tp_vars: the private data of the current TP meter session
+ *
+ * start the receiver shutdown timer or reset it if already started
+ */
+static void batadv_tp_reset_receiver_timer(struct batadv_tp_receiver *tp_vars)
+{
+	mod_timer(&tp_vars->common.timer,
+		  jiffies + msecs_to_jiffies(BATADV_TP_RECV_TIMEOUT));
+}
+
+/**
+ * batadv_tp_receiver_shutdown() - stop a tp meter receiver when timeout is
+ *  reached without received ack
+ * @t: address to timer_list inside tp_vars
+ */
+static void batadv_tp_receiver_shutdown(struct timer_list *t)
+{
+	struct batadv_tp_receiver *tp_vars = timer_container_of(tp_vars, t, common.timer);
+	struct batadv_tp_unacked *safe;
+	struct batadv_tp_unacked *un;
+	struct batadv_priv *bat_priv;
+
+	bat_priv = tp_vars->common.bat_priv;
+
+	/* if there is recent activity rearm the timer */
+	if (!batadv_has_timed_out(READ_ONCE(tp_vars->last_recv_time),
+				  BATADV_TP_RECV_TIMEOUT)) {
+		/* reset the receiver shutdown timer */
+		batadv_tp_reset_receiver_timer(tp_vars);
+		return;
+	}
+
+	batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+		   "Shutting down for inactivity (more than %dms) from %pM\n",
+		   BATADV_TP_RECV_TIMEOUT, tp_vars->common.other_end);
+
+	if (batadv_tp_list_detach(&tp_vars->common))
+		batadv_tp_receiver_put(tp_vars);
+
+	spin_lock_bh(&tp_vars->ack_seqno_lock);
+	list_for_each_entry_safe(un, safe, &tp_vars->unacked_list, list) {
+		list_del(&un->list);
+		kfree(un);
+		tp_vars->unacked_count--;
+	}
+	spin_unlock_bh(&tp_vars->ack_seqno_lock);
+
+	/* drop reference of timer */
+	if (WARN_ON(atomic_xchg(&tp_vars->receiving, 0) != 1))
+		return;
+
+	batadv_tp_receiver_put(tp_vars);
+}
+
+/**
+ * batadv_tp_send_ack() - send an ACK packet
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @dst: the mac address of the destination originator
+ * @seq: the sequence number to ACK
+ * @timestamp: the timestamp to echo back in the ACK
+ * @session: session identifier
+ * @socket_index: local ICMP socket identifier
+ *
+ * Return: 0 on success, a positive integer representing the reason of the
+ * failure otherwise
+ */
+static int batadv_tp_send_ack(struct batadv_priv *bat_priv, const u8 *dst,
+			      u32 seq, __be32 timestamp, const u8 *session,
+			      int socket_index)
+{
+	struct batadv_hard_iface *primary_if = NULL;
+	struct batadv_orig_node *orig_node;
+	struct batadv_icmp_tp_packet *icmp;
+	struct sk_buff *skb;
+	int ret;
+	int r;
+
+	orig_node = batadv_orig_hash_find(bat_priv, dst);
+	if (unlikely(!orig_node)) {
+		ret = BATADV_TP_REASON_DST_UNREACHABLE;
+		goto out;
+	}
+
+	primary_if = batadv_primary_if_get_selected(bat_priv);
+	if (unlikely(!primary_if)) {
+		ret = BATADV_TP_REASON_DST_UNREACHABLE;
+		goto out;
+	}
+
+	skb = netdev_alloc_skb_ip_align(NULL, sizeof(*icmp) + ETH_HLEN);
+	if (unlikely(!skb)) {
+		ret = BATADV_TP_REASON_MEMORY_ERROR;
+		goto out;
+	}
+
+	skb_reserve(skb, ETH_HLEN);
+	icmp = skb_put(skb, sizeof(*icmp));
+	icmp->packet_type = BATADV_ICMP;
+	icmp->version = BATADV_COMPAT_VERSION;
+	icmp->ttl = BATADV_TTL;
+	icmp->msg_type = BATADV_TP;
+	ether_addr_copy(icmp->dst, orig_node->orig);
+	ether_addr_copy(icmp->orig, primary_if->net_dev->dev_addr);
+	icmp->uid = socket_index;
+
+	icmp->subtype = BATADV_TP_ACK;
+	memcpy(icmp->session, session, sizeof(icmp->session));
+	icmp->seqno = htonl(seq);
+	icmp->timestamp = timestamp;
+
+	/* send the ack */
+	r = batadv_send_skb_to_orig(skb, orig_node, NULL);
+	if (unlikely(r < 0) || r == NET_XMIT_DROP) {
+		ret = BATADV_TP_REASON_DST_UNREACHABLE;
+		goto out;
+	}
+	ret = 0;
+
+out:
+	batadv_orig_node_put(orig_node);
+	batadv_hardif_put(primary_if);
+
+	return ret;
+}
+
+/**
+ * batadv_tp_handle_out_of_order() - store an out of order packet
+ * @tp_vars: the private data of the current TP meter session
+ * @seqno: sequence number of new received packet
+ * @payload_len: length of the received packet
+ *
+ * Store the out of order packet in the unacked list for late processing. This
+ * packets are kept in this list so that they can be ACKed at once as soon as
+ * all the previous packets have been received
+ *
+ * Return: true if the packed has been successfully processed, false otherwise
+ */
+static bool batadv_tp_handle_out_of_order(struct batadv_tp_receiver *tp_vars,
+					  u32 seqno, u32 payload_len)
+	__must_hold(&tp_vars->ack_seqno_lock)
+{
+	struct list_head *pos = &tp_vars->unacked_list;
+	struct batadv_tp_unacked *new = NULL;
+	u32 end_seqno = seqno + payload_len;
+	struct batadv_tp_unacked *safe;
+	struct batadv_tp_unacked *un;
+
+	/* loop over the list to find either an existing entry which the new
+	 * seqno range can be merged with or the position at which a new entry
+	 * has to be inserted.
+	 *
+	 * The iteration is done in the reverse way because it is likely that
+	 * the last received packet (the one being processed now) has a bigger
+	 * seqno than all the others already stored.
+	 */
+	list_for_each_entry_reverse(un, &tp_vars->unacked_list, list) {
+		/* look for the right position - an un which is smaller */
+		if (batadv_seq_before(seqno, un->seqno))
+			continue;
+
+		/* smaller/equal seqno was found but they might be directly
+		 * after another or overlapping. keep only a single entry
+		 *
+		 * It is already known that:
+		 *
+		 *	un->seqno <= seqno
+		 *
+		 * When establishing that:
+		 *
+		 *	seqno <= un->seqno + un->len
+		 *
+		 * Then it is not necessary to add a new entry because the
+		 * smaller/equal seqno of un might already contain the new
+		 * received packet or we only add new data directly after
+		 * the end of un. The latter can be identified using:
+		 *
+		 *	un->seqno + un->len <= end_seqno
+		 */
+		if (!batadv_seq_before(un->seqno + un->len, seqno)) {
+			/* new data directly after un? */
+			if (!batadv_seq_before(end_seqno, un->seqno + un->len))
+				un->len = end_seqno - un->seqno;
+
+			/* un now represents both old un + new range and has to
+			 * be used to check if the gap to the next seqno range
+			 * was closed
+			 */
+			new = un;
+		} else {
+			/* as soon as an entry having a smaller seqno is found,
+			 * the new one is attached _after_ it. In this way the
+			 * list is kept in ascending order
+			 */
+			pos = &un->list;
+		}
+
+		break;
+	}
+
+	/* no entry to merge with was found; insert a new one after the entry
+	 * with the next smaller seqno (or at the front of the list when the
+	 * new seqno is the smallest or the list is empty)
+	 */
+	if (!new) {
+		new = kmalloc_obj(*new, GFP_ATOMIC);
+		if (unlikely(!new))
+			return false;
+
+		new->seqno = seqno;
+		new->len = payload_len;
+
+		list_add(&new->list, pos);
+		tp_vars->unacked_count++;
+	}
+
+	/* check if new filled the gap to the next list entries */
+	un = new;
+	list_for_each_entry_safe_continue(un, safe, &tp_vars->unacked_list, list) {
+		if (batadv_seq_before(end_seqno, un->seqno))
+			break;
+
+		/* next entry is overlapping or adjacent - combine both */
+		if (batadv_seq_before(end_seqno, un->seqno + un->len)) {
+			end_seqno = un->seqno + un->len;
+			new->len = end_seqno - new->seqno;
+		}
+
+		list_del(&un->list);
+		kfree(un);
+		tp_vars->unacked_count--;
+	}
+
+	/* remove the last (biggest) unacked seqno when list is too large */
+	if (tp_vars->unacked_count > BATADV_TP_MAX_UNACKED) {
+		un = list_last_entry(&tp_vars->unacked_list,
+				     struct batadv_tp_unacked, list);
+		list_del(&un->list);
+		kfree(un);
+		tp_vars->unacked_count--;
+	}
+
+	return true;
+}
+
+/**
+ * batadv_tp_ack_unordered() - update number received bytes in current stream
+ *  without gaps
+ * @tp_vars: the private data of the current TP meter session
+ */
+static void batadv_tp_ack_unordered(struct batadv_tp_receiver *tp_vars)
+	__must_hold(&tp_vars->ack_seqno_lock)
+{
+	struct batadv_tp_unacked *safe;
+	struct batadv_tp_unacked *un;
+	u32 to_ack;
+
+	/* go through the unacked packet list and possibly ACK them as
+	 * well
+	 */
+	list_for_each_entry_safe(un, safe, &tp_vars->unacked_list, list) {
+		/* the list is ordered, therefore it is possible to stop as soon
+		 * there is a gap between the last acked seqno and the seqno of
+		 * the packet under inspection
+		 */
+		if (batadv_seq_before(tp_vars->last_recv, un->seqno))
+			break;
+
+		to_ack = un->seqno + un->len;
+
+		if (batadv_seq_before(tp_vars->last_recv, to_ack))
+			tp_vars->last_recv = to_ack;
+
+		list_del(&un->list);
+		kfree(un);
+		tp_vars->unacked_count--;
+	}
+}
+
+/**
+ * batadv_tp_init_recv() - return matching or create new receiver tp_vars
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @icmp: received icmp tp msg
+ *
+ * Return: corresponding tp_vars or NULL on errors
+ */
+static struct batadv_tp_receiver *
+batadv_tp_init_recv(struct batadv_priv *bat_priv,
+		    const struct batadv_icmp_tp_packet *icmp)
+{
+	struct batadv_tp_receiver *tp_vars = NULL;
+
+	spin_lock_bh(&bat_priv->tp_list_lock);
+	if (READ_ONCE(bat_priv->mesh_state) != BATADV_MESH_ACTIVE)
+		goto out_unlock;
+
+	tp_vars = batadv_tp_list_find_receiver_session(bat_priv, icmp->orig,
+						       icmp->session);
+	if (tp_vars) {
+		WRITE_ONCE(tp_vars->last_recv_time, jiffies);
+		goto out_unlock;
+	}
+
+	if (!atomic_add_unless(&bat_priv->tp_num, 1, BATADV_TP_MAX_NUM)) {
+		batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+			   "Meter: too many ongoing sessions, aborting (RECV)\n");
+		goto out_unlock;
+	}
+
+	tp_vars = kmalloc_obj(*tp_vars, GFP_ATOMIC);
+	if (!tp_vars) {
+		atomic_dec(&bat_priv->tp_num);
+		goto out_unlock;
+	}
+
+	ether_addr_copy(tp_vars->common.other_end, icmp->orig);
+	atomic_set(&tp_vars->receiving, 1);
+	memcpy(tp_vars->common.session, icmp->session, sizeof(tp_vars->common.session));
+	tp_vars->last_recv = BATADV_TP_FIRST_SEQ;
+	tp_vars->common.bat_priv = bat_priv;
+	kref_init(&tp_vars->common.refcount);
+
+	spin_lock_init(&tp_vars->ack_seqno_lock);
+	INIT_LIST_HEAD(&tp_vars->unacked_list);
+	tp_vars->unacked_count = 0;
+
+	kref_get(&tp_vars->common.refcount);
+	timer_setup(&tp_vars->common.timer, batadv_tp_receiver_shutdown, 0);
+
+	WRITE_ONCE(tp_vars->last_recv_time, jiffies);
+
+	kref_get(&tp_vars->common.refcount);
+	hlist_add_head_rcu(&tp_vars->common.list, &bat_priv->tp_receiver_list);
+
+	batadv_tp_reset_receiver_timer(tp_vars);
+
+out_unlock:
+	spin_unlock_bh(&bat_priv->tp_list_lock);
+
+	return tp_vars;
+}
+
+/**
+ * batadv_tp_recv_msg() - process a single data message
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @skb: the buffer containing the received packet
+ *
+ * Process a received TP MSG packet
+ */
+static void batadv_tp_recv_msg(struct batadv_priv *bat_priv,
+			       const struct sk_buff *skb)
+{
+	const struct batadv_icmp_tp_packet *icmp;
+	struct batadv_tp_receiver *tp_vars;
+	u32 payload_len;
+	u32 to_ack;
+	u32 seqno;
+
+	icmp = (struct batadv_icmp_tp_packet *)skb->data;
+
+	seqno = ntohl(icmp->seqno);
+	/* check if this is the first seqno. This means that if the
+	 * first packet is lost, the tp meter does not work anymore!
+	 */
+	if (seqno == BATADV_TP_FIRST_SEQ) {
+		tp_vars = batadv_tp_init_recv(bat_priv, icmp);
+		if (!tp_vars) {
+			batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+				   "Meter: seqno != BATADV_TP_FIRST_SEQ cannot initiate connection\n");
+			goto out;
+		}
+	} else {
+		tp_vars = batadv_tp_list_find_receiver_session(bat_priv, icmp->orig,
+							       icmp->session);
+		if (!tp_vars) {
+			batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+				   "Unexpected packet from %pM!\n",
+				   icmp->orig);
+			goto out;
+		}
+
+		WRITE_ONCE(tp_vars->last_recv_time, jiffies);
+	}
+
+	spin_lock_bh(&tp_vars->ack_seqno_lock);
+
+	/* if the packet is a duplicate, it may be the case that an ACK has been
+	 * lost. Resend the ACK
+	 */
+	payload_len = skb->len - sizeof(struct batadv_unicast_packet);
+	to_ack = seqno + payload_len;
+	if (batadv_seq_before(to_ack, tp_vars->last_recv))
+		goto send_ack;
+
+	/* if the packet is out of order enqueue it */
+	if (batadv_seq_before(tp_vars->last_recv, seqno)) {
+		/* exit immediately (and do not send any ACK) if the packet has
+		 * not been enqueued correctly
+		 */
+		if (!batadv_tp_handle_out_of_order(tp_vars, seqno, payload_len)) {
+			spin_unlock_bh(&tp_vars->ack_seqno_lock);
+			goto out;
+		}
+
+		/* send a duplicate ACK */
+		goto send_ack;
+	}
+
+	/* if everything was fine count the ACKed bytes */
+	tp_vars->last_recv = to_ack;
+
+	/* check if this ordered message filled a gap.... */
+	batadv_tp_ack_unordered(tp_vars);
+
+send_ack:
+	to_ack = tp_vars->last_recv;
+	spin_unlock_bh(&tp_vars->ack_seqno_lock);
+
+	/* send the ACK. If the received packet was out of order, the ACK that
+	 * is going to be sent is a duplicate (the sender will count them and
+	 * possibly enter Fast Retransmit as soon as it has reached 3)
+	 */
+	batadv_tp_send_ack(bat_priv, icmp->orig, to_ack,
+			   icmp->timestamp, icmp->session, icmp->uid);
+out:
+	batadv_tp_receiver_put(tp_vars);
+}
+
+/**
+ * batadv_tp_meter_recv() - main TP Meter receiving function
+ * @bat_priv: the bat priv with all the mesh interface information
+ * @skb: the buffer containing the received packet
+ */
+void batadv_tp_meter_recv(struct batadv_priv *bat_priv, struct sk_buff *skb)
+{
+	struct batadv_icmp_tp_packet *icmp;
+
+	if (READ_ONCE(bat_priv->mesh_state) != BATADV_MESH_ACTIVE)
+		goto out;
+
+	icmp = (struct batadv_icmp_tp_packet *)skb->data;
+
+	switch (icmp->subtype) {
+	case BATADV_TP_MSG:
+		batadv_tp_recv_msg(bat_priv, skb);
+		break;
+	case BATADV_TP_ACK:
+		batadv_tp_recv_ack(bat_priv, skb);
+		break;
+	default:
+		batadv_dbg(BATADV_DBG_TP_METER, bat_priv,
+			   "Received unknown TP Metric packet type %u\n",
+			   icmp->subtype);
+	}
+
+out:
+	consume_skb(skb);
+}
+
+/**
+ * batadv_tp_stop_all() - stop all currently running tp meter sessions
+ * @bat_priv: the bat priv with all the mesh interface information
+ */
+void batadv_tp_stop_all(struct batadv_priv *bat_priv)
+{
+	struct batadv_tp_receiver *tp_receivers[BATADV_TP_MAX_NUM];
+	struct batadv_tp_sender *tp_senders[BATADV_TP_MAX_NUM];
+	struct batadv_tp_receiver *tp_receiver;
+	struct batadv_tp_sender *tp_sender;
+	size_t receiver_count = 0;
+	size_t sender_count = 0;
+	size_t i;
+
+	spin_lock_bh(&bat_priv->tp_list_lock);
+	hlist_for_each_entry(tp_receiver, &bat_priv->tp_receiver_list, common.list) {
+		if (WARN_ON_ONCE(receiver_count >= BATADV_TP_MAX_NUM))
+			break;
+
+		if (!kref_get_unless_zero(&tp_receiver->common.refcount))
+			continue;
+
+		tp_receivers[receiver_count++] = tp_receiver;
+	}
+
+	hlist_for_each_entry(tp_sender, &bat_priv->tp_sender_list, common.list) {
+		if (WARN_ON_ONCE(sender_count >= BATADV_TP_MAX_NUM))
+			break;
+
+		if (!kref_get_unless_zero(&tp_sender->common.refcount))
+			continue;
+
+		tp_senders[sender_count++] = tp_sender;
+	}
+	spin_unlock_bh(&bat_priv->tp_list_lock);
+
+	for (i = 0; i < receiver_count; i++) {
+		tp_receiver = tp_receivers[i];
+
+		if (batadv_tp_list_detach(&tp_receiver->common))
+			batadv_tp_receiver_put(tp_receiver);
+
+		timer_shutdown_sync(&tp_receiver->common.timer);
+
+		if (atomic_xchg(&tp_receiver->receiving, 0) != 0)
+			batadv_tp_receiver_put(tp_receiver);
+
+		batadv_tp_receiver_put(tp_receiver);
+	}
+
+	for (i = 0; i < sender_count; i++) {
+		tp_sender = tp_senders[i];
+
+		batadv_tp_sender_shutdown(tp_sender, BATADV_TP_REASON_CANCEL);
+		wake_up(&tp_sender->more_bytes);
+		wait_for_completion(&tp_sender->finished);
+
+		batadv_tp_sender_put(tp_sender);
+	}
+
+	synchronize_net();
+}
+
+/**
+ * batadv_tp_meter_init() - initialize global tp_meter structures
+ */
+void __init batadv_tp_meter_init(void)
+{
+	get_random_bytes(batadv_tp_prerandom, sizeof(batadv_tp_prerandom));
+}

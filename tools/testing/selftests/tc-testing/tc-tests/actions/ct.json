@@ -1,0 +1,746 @@
+[
+    {
+        "id": "696a",
+        "name": "Add simple ct action",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct zone 0 pipe.*index 42 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "e38c",
+        "name": "Add simple ct action with cookie",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct index 42 cookie deadbeef",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct zone 0 pipe.*index 42 ref.*cookie deadbeef",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "9f20",
+        "name": "Add ct clear action",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct clear index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct clear pipe.*index 42 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "0bc1",
+        "name": "Add ct clear action with cookie of max length",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct clear index 42 cookie aa11bb22cc33dd44ee55ff66aa11b1b2",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct clear pipe.*index 42 ref.*cookie aa11bb22cc33dd44ee55ff66aa11b1b2",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "5bea",
+        "name": "Try ct with zone",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct zone 404 index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct zone 404 pipe.*index 42 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "d5d6",
+        "name": "Try ct with zone, commit",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct zone 404 commit index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct commit zone 404 pipe.*index 42 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "029f",
+        "name": "Try ct with zone, commit, mark",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct zone 404 commit mark 0x42 index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct commit mark 66 zone 404 pipe.*index 42 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "a58d",
+        "name": "Try ct with zone, commit, mark, nat",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct zone 404 commit mark 0x42 nat src addr 5.5.5.7 index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct commit mark 66 zone 404 nat src addr 5.5.5.7 pipe.*index 42 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "901b",
+        "name": "Try ct with full nat ipv4 range syntax",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct commit nat src addr 5.5.5.7-5.5.6.0 port 1000-2000 index 44",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct commit zone 0 nat src addr 5.5.5.7-5.5.6.0 port 1000-2000 pipe.*index 44 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "072b",
+        "name": "Try ct with full nat ipv6 syntax",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct commit nat src addr 2001::1 port 1000-2000 index 44",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct commit zone 0 nat src addr 2001::1 port 1000-2000 pipe.*index 44 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "3420",
+        "name": "Try ct with full nat ipv6 range syntax",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct commit nat src addr 2001::1-2001::10 port 1000-2000 index 44",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct commit zone 0 nat src addr 2001::1-2001::10 port 1000-2000 pipe.*index 44 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "4470",
+        "name": "Try ct with full nat ipv6 range syntax + force",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct commit force nat src addr 2001::1-2001::10 port 1000-2000 index 44",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct commit force zone 0 nat src addr 2001::1-2001::10 port 1000-2000 pipe.*index 44 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "5d88",
+        "name": "Try ct with label",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct label 123123 index 44",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct zone 0 label 12312300000000000000000000000000 pipe.*index 44 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "04d4",
+        "name": "Try ct with label with mask",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct label 12312300000000000000000000000001/ffffffff000000000000000000000001 index 44",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct zone 0 label 12312300000000000000000000000001/ffffffff000000000000000000000001 pipe.*index 44 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "9751",
+        "name": "Try ct with mark + mask",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct mark 0x42/0xf0 index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct mark 66/0xf0 zone 0 pipe.*index 42 ref",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "2faa",
+        "name": "Try ct with mark + mask and cookie",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct mark 0x42/0xf0 index 42 cookie aa11bb22cc33dd44ee55ff66aa11b1b2",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct mark 66/0xf0 zone 0 pipe.*index 42 ref.*cookie aa11bb22cc33dd44ee55ff66aa11b1b2",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "3991",
+        "name": "Add simple ct action with no_percpu flag",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ]
+        ],
+        "cmdUnderTest": "$TC actions add action ct no_percpu",
+        "expExitCode": "0",
+        "verifyCmd": "$TC actions list action ct",
+        "matchPattern": "action order [0-9]*: ct zone 0 pipe.*no_percpu",
+        "matchCount": "1",
+        "teardown": [
+            "$TC actions flush action ct"
+        ]
+    },
+    {
+        "id": "3992",
+        "name": "Add ct action triggering DNAT tuple conflict",
+        "category": [
+            "actions",
+            "ct",
+	    "scapy"
+        ],
+        "plugins": {
+           "requires": "nsPlugin"
+        },
+	"plugins": {
+		"requires": [
+			"nsPlugin",
+			"scapyPlugin"
+		]
+	},
+        "setup": [
+            [
+                "$TC qdisc del dev $DEV1 ingress",
+                0,
+                1,
+		2,
+                255
+            ],
+	    "$TC qdisc add dev $DEV1 ingress"
+        ],
+        "cmdUnderTest": "$TC filter add dev $DEV1 ingress protocol ip prio 1 flower ct_state -trk action ct commit nat dst addr 20.0.0.1 port 10 pipe action drop",
+	"scapy": [
+	    {
+		"iface": "$DEV0",
+		"count": 1,
+		"packet": "Ether(type=0x800)/IP(src='10.0.0.10',dst='10.0.0.10')/TCP(sport=5000,dport=10)"
+	    },
+	    {
+		"iface": "$DEV0",
+		"count": 1,
+		"packet": "Ether(type=0x800)/IP(src='10.0.0.10',dst='10.0.0.20')/TCP(sport=5000,dport=10)"
+	    }
+	],
+        "expExitCode": "0",
+        "verifyCmd": "cat /proc/net/nf_conntrack",
+        "matchPattern": "dst=10.0.0.20",
+        "matchCount": "1",
+        "teardown": [
+            "$TC qdisc del dev $DEV1 ingress"
+        ]
+    },
+    {
+        "id": "8883",
+        "name": "Try to attach act_ct to an ets qdisc",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+            "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ],
+            "$TC qdisc add dev $DEV1 root handle 1: ets bands 2"
+        ],
+        "cmdUnderTest": "$TC filter add dev $DEV1 parent 1: prio 1 protocol ip matchall action ct index 42",
+        "expExitCode": "2",
+        "verifyCmd": "$TC -j filter ls dev $DEV1 parent 1: prio 1 protocol ip",
+        "matchJSON": [],
+        "teardown": [
+            "$TC qdisc del dev $DEV1 root"
+        ]
+    },
+    {
+        "id": "3b10",
+        "name": "Attach act_ct to an ingress qdisc",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+            "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ],
+            "$TC qdisc add dev $DEV1 ingress"
+        ],
+        "cmdUnderTest": "$TC filter add dev $DEV1 ingress prio 1 protocol ip matchall action ct index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC -j filter ls dev $DEV1 ingress prio 1 protocol ip",
+        "matchJSON": [
+            {
+                "kind": "matchall"
+            },
+            {
+                "options": {
+                    "actions": [
+                        {
+                            "order": 1,
+                            "kind": "ct",
+                            "index": 42,
+                            "ref": 1,
+                            "bind": 1
+                        }
+                    ]
+                }
+            }
+        ],
+        "teardown": [
+            "$TC qdisc del dev $DEV1 ingress"
+        ]
+    },
+    {
+        "id": "0337",
+        "name": "Attach act_ct to a clsact/egress qdisc",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+            "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ],
+            "$TC qdisc add dev $DEV1 clsact"
+        ],
+        "cmdUnderTest": "$TC filter add dev $DEV1 egress prio 1 protocol ip matchall action ct index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC -j filter ls dev $DEV1 egress prio 1 protocol ip",
+        "matchJSON": [
+            {
+                "kind": "matchall"
+            },
+            {
+                "options": {
+                    "actions": [
+                        {
+                            "order": 1,
+                            "kind": "ct",
+                            "index": 42,
+                            "ref": 1,
+                            "bind": 1
+                        }
+                    ]
+                }
+            }
+        ],
+        "teardown": [
+            "$TC qdisc del dev $DEV1 clsact"
+        ]
+    },
+    {
+        "id": "4f60",
+        "name": "Attach act_ct to a shared block",
+        "category": [
+            "actions",
+            "ct"
+        ],
+        "plugins": {
+            "requires": "nsPlugin"
+        },
+        "setup": [
+            [
+                "$TC actions flush action ct",
+                0,
+                1,
+                255
+            ],
+            "$TC qdisc add dev $DEV1 ingress_block 21 clsact"
+        ],
+        "cmdUnderTest": "$TC filter add block 21 prio 1 protocol ip matchall action ct index 42",
+        "expExitCode": "0",
+        "verifyCmd": "$TC -j filter ls block 21 prio 1 protocol ip",
+        "matchJSON": [
+            {
+                "kind": "matchall"
+            },
+            {
+                "options": {
+                    "actions": [
+                        {
+                            "order": 1,
+                            "kind": "ct",
+                            "index": 42,
+                            "ref": 1,
+                            "bind": 1
+                        }
+                    ]
+                }
+            }
+        ],
+        "teardown": [
+            "$TC qdisc del dev $DEV1 ingress_block 21 clsact"
+        ]
+    },
+    {
+        "id": "9c2a",
+        "name": "Act_ct preserves skb cb across defrag before prio dequeue",
+        "category": [
+            "actions",
+            "ct",
+            "scapy"
+        ],
+        "plugins": {
+            "requires": [
+                "nsPlugin",
+                "scapyPlugin"
+            ]
+        },
+        "setup": [
+            "$TC qdisc add dev $DUMMY root handle 1: prio",
+            "$TC qdisc add dev $DUMMY clsact",
+            "$TC qdisc add dev $DEV1 clsact",
+            "$TC filter add dev $DEV1 ingress protocol ip prio 1 matchall action mirred egress redirect dev $DUMMY"
+        ],
+        "cmdUnderTest": "$TC filter add dev $DUMMY egress protocol ip prio 1 matchall action ct zone 1 pipe",
+        "scapy": [
+            {
+                "iface": "$DEV0",
+                "count": 1,
+                "packet": "[Ether()/frag for frag in fragment(IP(src='10.0.0.10', dst='10.0.0.1', id=1)/UDP(sport=12345, dport=9)/Raw(b'A' * 4000), fragsize=1400)]"
+            }
+        ],
+        "expExitCode": "0",
+        "verifyCmd": "$TC -s qdisc show dev $DUMMY | grep -A 1 '^qdisc prio 1:'",
+        "matchPattern": "Sent [1-9][0-9]* bytes [1-9][0-9]* pkt",
+        "matchCount": "1",
+        "teardown": [
+            "$TC qdisc del dev $DEV1 clsact",
+            "$TC qdisc del dev $DUMMY clsact",
+            "$TC qdisc del dev $DUMMY root handle 1:"
+        ]
+    },
+    {
+        "id": "c7a3",
+        "name": "Verify act_ct drops a packet whose header checks fail",
+        "category": [
+            "actions",
+            "ct",
+            "scapy"
+        ],
+        "plugins": {
+            "requires": [
+                "nsPlugin",
+                "scapyPlugin"
+            ]
+        },
+        "setup": [
+            [
+                "$TC qdisc del dev $DEV1 clsact",
+                0,
+                1,
+                2,
+                255
+            ],
+            "$TC qdisc add dev $DEV1 clsact"
+        ],
+        "cmdUnderTest": "$TC filter add dev $DEV1 ingress protocol all prio 1 matchall action ct",
+        "scapy": [
+            {
+                "iface": "$DEV0",
+                "count": 10,
+                "packet": "Ether(type=0x86dd)/IPv6(nh=0, plen=0, src='::1', dst='::2')"
+            }
+        ],
+        "expExitCode": "0",
+        "verifyCmd": "$TC -s qdisc show dev $DEV1 clsact",
+        "matchPattern": "dropped 10",
+        "matchCount": "1",
+        "teardown": [
+            "$TC qdisc del dev $DEV1 clsact"
+        ]
+    }
+]

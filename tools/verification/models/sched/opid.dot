@@ -1,0 +1,13 @@
+digraph state_automaton {
+	center = true;
+	size = "7,11";
+	{node [shape = plaintext, style=invis, label=""] "__init_any"};
+	{node [shape = doublecircle] "any"};
+	"__init_any" -> "any";
+	"any" [label = "any", color = green3];
+	"any" -> "any" [ label = "sched_need_resched;irq_off == 1\nsched_waking;irq_off == 1 && preempt_off == 1" ];
+	{ rank = min ;
+		"__init_any";
+		"any";
+	}
+}

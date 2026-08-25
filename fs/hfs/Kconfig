@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config HFS_FS
+	tristate "Apple Macintosh file system support"
+	depends on BLOCK
+	select BUFFER_HEAD
+	select NLS
+	select LEGACY_DIRECT_IO
+	help
+	  If you say Y here, you will be able to mount Macintosh-formatted
+	  floppy disks and hard drive partitions with full read-write access.
+	  Please read <file:Documentation/filesystems/hfs.rst> to learn about
+	  the available mount options.
+
+	  To compile this file system support as a module, choose M here: the
+	  module will be called hfs.
+
+config HFS_KUNIT_TEST
+	tristate "KUnit tests for HFS filesystem" if !KUNIT_ALL_TESTS
+	depends on HFS_FS && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  This builds KUnit tests for the HFS filesystem.
+
+	  KUnit tests run during boot and output the results to the debug
+	  log in TAP format (https://testanything.org/). Only useful for
+	  kernel devs running KUnit test harness and are not for inclusion
+	  into a production build.
+
+	  For more information on KUnit and unit tests in general please
+	  refer to the KUnit documentation in Documentation/dev-tools/kunit/.

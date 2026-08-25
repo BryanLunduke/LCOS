@@ -1,0 +1,636 @@
+# SPDX-License-Identifier: ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)
+---
+name: nfsd
+protocol: genetlink
+uapi-header: linux/nfsd_netlink.h
+
+doc: NFSD configuration over generic netlink.
+
+definitions:
+  -
+    type: flags
+    name: cache-type
+    entries: [svc_export, expkey]
+  -
+    type: flags
+    name: export-flags
+    doc: These flags are ordered to match the NFSEXP_* flags in include/linux/nfsd/export.h
+    entries:
+      - readonly
+      - insecure-port
+      - rootsquash
+      - allsquash
+      - async
+      - gathered-writes
+      - noreaddirplus
+      - security-label
+      - sign-fh
+      - nohide
+      - nosubtreecheck
+      - noauthnlm
+      - msnfs
+      - fsid
+      - crossmount
+      - noacl
+      - v4root
+      - pnfs
+  -
+    type: flags
+    name: xprtsec-mode
+    doc: These flags are ordered to match the NFSEXP_XPRTSEC_* flags in include/linux/nfsd/export.h
+    entries:
+      - none
+      - tls
+      - mtls
+
+attribute-sets:
+  -
+    name: cache-notify
+    attributes:
+      -
+        name: cache-type
+        type: u32
+        enum: cache-type
+  -
+    name: rpc-status
+    attributes:
+      -
+        name: xid
+        type: u32
+        byte-order: big-endian
+      -
+        name: flags
+        type: u32
+      -
+        name: prog
+        type: u32
+      -
+        name: version
+        type: u8
+      -
+        name: proc
+        type: u32
+      -
+        name: service-time
+        type: s64
+      -
+        name: pad
+        type: pad
+      -
+        name: saddr4
+        type: u32
+        byte-order: big-endian
+        display-hint: ipv4
+      -
+        name: daddr4
+        type: u32
+        byte-order: big-endian
+        display-hint: ipv4
+      -
+        name: saddr6
+        type: binary
+        display-hint: ipv6
+      -
+        name: daddr6
+        type: binary
+        display-hint: ipv6
+      -
+        name: sport
+        type: u16
+        byte-order: big-endian
+      -
+        name: dport
+        type: u16
+        byte-order: big-endian
+      -
+        name: compound-ops
+        type: u32
+        multi-attr: true
+  -
+    name: server
+    attributes:
+      -
+        name: threads
+        type: u32
+        multi-attr: true
+      -
+        name: gracetime
+        type: u32
+      -
+        name: leasetime
+        type: u32
+      -
+        name: scope
+        type: string
+      -
+        name: min-threads
+        type: u32
+      -
+        name: fh-key
+        type: binary
+        checks:
+            exact-len: 16
+  -
+    name: version
+    attributes:
+      -
+        name: major
+        type: u32
+      -
+        name: minor
+        type: u32
+      -
+        name: enabled
+        type: flag
+  -
+    name: server-proto
+    attributes:
+      -
+        name: version
+        type: nest
+        nested-attributes: version
+        multi-attr: true
+  -
+    name: sock
+    attributes:
+      -
+        name: addr
+        type: binary
+      -
+        name: transport-name
+        type: string
+  -
+    name: server-sock
+    attributes:
+      -
+        name: addr
+        type: nest
+        nested-attributes: sock
+        multi-attr: true
+  -
+    name: pool-mode
+    attributes:
+      -
+        name: mode
+        type: string
+      -
+        name: npools
+        type: u32
+  -
+    name: fslocation
+    attributes:
+      -
+        name: host
+        type: string
+      -
+        name: path
+        type: string
+  -
+    name: fslocations
+    attributes:
+      -
+        name: location
+        type: nest
+        nested-attributes: fslocation
+        multi-attr: true
+  -
+    name: auth-flavor
+    attributes:
+      -
+        name: pseudoflavor
+        type: u32
+      -
+        name: flags
+        type: u32
+        enum: export-flags
+        enum-as-flags: true
+  -
+    name: svc-export
+    attributes:
+      -
+        name: seqno
+        type: u64
+      -
+        name: client
+        type: string
+      -
+        name: path
+        type: string
+      -
+        name: negative
+        type: flag
+      -
+        name: expiry
+        type: u64
+      -
+        name: anon-uid
+        type: u32
+      -
+        name: anon-gid
+        type: u32
+      -
+        name: fslocations
+        type: nest
+        nested-attributes: fslocations
+      -
+        name: uuid
+        type: binary
+      -
+        name: secinfo
+        type: nest
+        nested-attributes: auth-flavor
+        multi-attr: true
+      -
+        name: xprtsec
+        type: u32
+        enum: xprtsec-mode
+        multi-attr: true
+      -
+        name: flags
+        type: u32
+        enum: export-flags
+        enum-as-flags: true
+      -
+        name: fsid
+        type: s32
+  -
+    name: svc-export-reqs
+    attributes:
+      -
+        name: requests
+        type: nest
+        nested-attributes: svc-export
+        multi-attr: true
+  -
+    name: expkey
+    attributes:
+      -
+        name: seqno
+        type: u64
+      -
+        name: client
+        type: string
+      -
+        name: fsidtype
+        type: u8
+      -
+        name: fsid
+        type: binary
+      -
+        name: negative
+        type: flag
+      -
+        name: expiry
+        type: u64
+      -
+        name: path
+        type: string
+  -
+    name: expkey-reqs
+    attributes:
+      -
+        name: requests
+        type: nest
+        nested-attributes: expkey
+        multi-attr: true
+  -
+    name: cache-flush
+    attributes:
+      -
+        name: mask
+        type: u32
+        enum: cache-type
+        enum-as-flags: true
+  -
+    name: unlock-ip
+    attributes:
+      -
+        name: address
+        type: binary
+        doc: struct sockaddr_in or struct sockaddr_in6.
+        checks:
+          min-len: 16
+  -
+    name: unlock-filesystem
+    attributes:
+      -
+        name: path
+        type: string
+        doc: Filesystem path whose state should be released.
+  -
+    name: unlock-export
+    attributes:
+      -
+        name: path
+        type: string
+        doc: >-
+          Export path whose NFSv4 state should be revoked.
+          All state (opens, locks, delegations, layouts) acquired
+          through any export of this path is revoked, regardless
+          of which client holds the state. Intended for use after
+          all clients have been unexported from a given path,
+          enabling the underlying filesystem to be unmounted.
+  -
+    name: server-proc-entry
+    attributes:
+      -
+        name: op
+        type: u32
+      -
+        name: count
+        type: u64
+      -
+        name: pad
+        type: pad
+  -
+    name: server-stats
+    attributes:
+      -
+        name: rc-hits
+        type: u64
+      -
+        name: rc-misses
+        type: u64
+      -
+        name: rc-nocache
+        type: u64
+      -
+        name: pad
+        type: pad
+      -
+        name: fh-stale
+        type: u64
+      -
+        name: io-read
+        type: u64
+      -
+        name: io-write
+        type: u64
+      -
+        name: netcnt
+        type: u32
+      -
+        name: netudpcnt
+        type: u32
+      -
+        name: nettcpcnt
+        type: u32
+      -
+        name: nettcpconn
+        type: u32
+      -
+        name: rpccnt
+        type: u32
+      -
+        name: rpcbadfmt
+        type: u32
+      -
+        name: rpcbadauth
+        type: u32
+      -
+        name: rpcbadclnt
+        type: u32
+      -
+        name: proc2-ops
+        type: nest
+        nested-attributes: server-proc-entry
+        multi-attr: true
+      -
+        name: proc3-ops
+        type: nest
+        nested-attributes: server-proc-entry
+        multi-attr: true
+      -
+        name: proc4-ops
+        type: nest
+        nested-attributes: server-proc-entry
+        multi-attr: true
+      -
+        name: proc4ops-ops
+        type: nest
+        nested-attributes: server-proc-entry
+        multi-attr: true
+      -
+        name: proc4cb-ops
+        type: nest
+        nested-attributes: server-proc-entry
+        multi-attr: true
+
+operations:
+  list:
+    -
+      name: rpc-status-get
+      doc: dump pending nfsd rpc
+      attribute-set: rpc-status
+      dump:
+        reply:
+          attributes:
+            - xid
+            - flags
+            - prog
+            - version
+            - proc
+            - service-time
+            - saddr4
+            - daddr4
+            - saddr6
+            - daddr6
+            - sport
+            - dport
+            - compound-ops
+    -
+      name: threads-set
+      doc: set the maximum number of running threads
+      attribute-set: server
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - threads
+            - gracetime
+            - leasetime
+            - scope
+            - min-threads
+            - fh-key
+    -
+      name: threads-get
+      doc: get the maximum number of running threads
+      attribute-set: server
+      do:
+        reply:
+          attributes:
+            - threads
+            - gracetime
+            - leasetime
+            - scope
+            - min-threads
+    -
+      name: version-set
+      doc: set nfs enabled versions
+      attribute-set: server-proto
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - version
+    -
+      name: version-get
+      doc: get nfs enabled versions
+      attribute-set: server-proto
+      do:
+        reply:
+          attributes:
+            - version
+    -
+      name: listener-set
+      doc: set nfs running sockets
+      attribute-set: server-sock
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - addr
+    -
+      name: listener-get
+      doc: get nfs running listeners
+      attribute-set: server-sock
+      do:
+        reply:
+          attributes:
+            - addr
+    -
+      name: pool-mode-set
+      doc: set the current server pool-mode
+      attribute-set: pool-mode
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - mode
+    -
+      name: pool-mode-get
+      doc: get info about server pool-mode
+      attribute-set: pool-mode
+      do:
+        reply:
+          attributes:
+            - mode
+            - npools
+    -
+      name: cache-notify
+      doc: Notification that there are cache requests that need servicing
+      attribute-set: cache-notify
+      mcgrp: exportd
+      event:
+        attributes:
+          - cache-type
+    -
+      name: svc-export-get-reqs
+      doc: Dump all pending svc_export requests
+      attribute-set: svc-export-reqs
+      flags: [admin-perm]
+      dump:
+          reply:
+            attributes:
+              - requests
+    -
+      name: svc-export-set-reqs
+      doc: Respond to one or more svc_export requests
+      attribute-set: svc-export-reqs
+      flags: [admin-perm]
+      do:
+          request:
+            attributes:
+              - requests
+    -
+      name: expkey-get-reqs
+      doc: Dump all pending expkey requests
+      attribute-set: expkey-reqs
+      flags: [admin-perm]
+      dump:
+          reply:
+            attributes:
+              - requests
+    -
+      name: expkey-set-reqs
+      doc: Respond to one or more expkey requests
+      attribute-set: expkey-reqs
+      flags: [admin-perm]
+      do:
+          request:
+            attributes:
+              - requests
+    -
+      name: cache-flush
+      doc: Flush nfsd caches (svc_export and/or expkey)
+      attribute-set: cache-flush
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - mask
+    -
+      name: unlock-ip
+      doc: release NLM locks held by an IP address
+      attribute-set: unlock-ip
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - address
+    -
+      name: unlock-filesystem
+      doc: revoke NFS state under a filesystem path
+      attribute-set: unlock-filesystem
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - path
+    -
+      name: unlock-export
+      doc: >-
+        Revoke NFSv4 state acquired through exports of a given path.
+        Unlike unlock-filesystem, which operates at superblock granularity,
+        this command targets only state associated with a specific export
+        path. Userspace (exportfs -u) sends this after removing the last
+        client for a path so the underlying filesystem can be unmounted.
+      attribute-set: unlock-export
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - path
+    -
+      name: server-stats-get
+      doc: dump NFS server statistics
+      attribute-set: server-stats
+      dump:
+        reply:
+          attributes:
+            - rc-hits
+            - rc-misses
+            - rc-nocache
+            - fh-stale
+            - io-read
+            - io-write
+            - netcnt
+            - netudpcnt
+            - nettcpcnt
+            - nettcpconn
+            - rpccnt
+            - rpcbadfmt
+            - rpcbadauth
+            - rpcbadclnt
+            - proc2-ops
+            - proc3-ops
+            - proc4-ops
+            - proc4ops-ops
+            - proc4cb-ops
+
+mcast-groups:
+  list:
+    -
+      name: none
+    -
+      name: exportd

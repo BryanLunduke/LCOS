@@ -1,0 +1,149 @@
+==============
+Driver Binding
+==============
+
+Driver binding is the process of associating a device with a device
+driver that can control it. Bus drivers have typically handled this
+because there have been bus-specific structures to represent the
+devices and the drivers. With generic device and device driver
+structures, most of the binding can take place using common code.
+
+
+Bus
+~~~
+
+The bus type structure contains a list of all devices that are on that bus
+type in the system. When device_register is called for a device, it is
+inserted into the end of this list. The bus object also contains a
+list of all drivers of that bus type. When driver_register is called
+for a driver, it is inserted at the end of this list. These are the
+two events which trigger driver binding.
+
+
+device_register
+~~~~~~~~~~~~~~~
+
+When a new device is added, the bus's list of drivers is iterated over
+to find one that supports it. In order to determine that, the device
+ID of the device must match one of the device IDs that the driver
+supports. The format and semantics for comparing IDs is bus-specific.
+Instead of trying to derive a complex state machine and matching
+algorithm, it is up to the bus driver to provide a callback to compare
+a device against the IDs of a driver. The bus returns 1 if a match was
+found; 0 otherwise.
+
+int match(struct device * dev, struct device_driver * drv);
+
+If a match is found, the device's driver field is set to the driver
+and the driver's probe callback is called. This gives the driver a
+chance to verify that it really does support the hardware, and that
+it's in a working state.
+
+Device Class
+~~~~~~~~~~~~
+
+Upon the successful completion of probe, the device is registered with
+the class to which it belongs. Device drivers belong to one and only one
+class, and that is set in the driver's devclass field.
+devclass_add_device is called to enumerate the device within the class
+and actually register it with the class, which happens with the
+class's register_dev callback.
+
+
+Driver
+~~~~~~
+
+When a driver is attached to a device, the driver's probe() function is
+called. Within probe(), the driver initializes the device and allocates
+and initializes per-device data structures. This per-device state is
+associated with the device object for as long as the driver remains bound
+to it. Conceptually, this per-device data together with the binding to
+the device can be thought of as an instance of the driver.
+
+sysfs
+~~~~~
+
+A symlink is created in the bus's 'devices' directory that points to
+the device's directory in the physical hierarchy.
+
+A symlink is created in the driver's 'devices' directory that points
+to the device's directory in the physical hierarchy.
+
+A directory for the device is created in the class's directory. A
+symlink is created in that directory that points to the device's
+physical location in the sysfs tree.
+
+A symlink can be created (though this isn't done yet) in the device's
+physical directory to either its class directory, or the class's
+top-level directory. One can also be created to point to its driver's
+directory also.
+
+
+driver_register
+~~~~~~~~~~~~~~~
+
+The process is almost identical for when a new driver is added.
+The bus's list of devices is iterated over to find a match. Devices
+that already have a driver are skipped. All the devices are iterated
+over, to bind as many devices as possible to the driver.
+
+
+Removal
+~~~~~~~
+
+When a device is removed, the reference count for it will eventually
+go to 0. When it does, the remove callback of the driver is called. It
+is removed from the driver's list of devices and the reference count
+of the driver is decremented. All symlinks between the two are removed.
+
+When a driver is removed, the list of devices that it supports is
+iterated over, and the driver's remove callback is called for each
+one. The device is removed from that list and the symlinks removed.
+
+
+Driver Override
+~~~~~~~~~~~~~~~
+
+Userspace may override the standard matching by writing a driver name to
+a device's ``driver_override`` sysfs attribute.  When set, only a driver
+whose name matches the override will be considered during binding.  This
+bypasses all bus-specific matching (OF, ACPI, ID tables, etc.).
+
+The override may be cleared by writing an empty string, which returns
+the device to standard matching rules.  Writing to ``driver_override``
+does not automatically unbind the device from its current driver or
+make any attempt to load the specified driver.
+
+Buses opt into this mechanism by setting the ``driver_override`` flag in
+their ``struct bus_type``::
+
+  const struct bus_type example_bus_type = {
+      ...
+      .driver_override = true,
+  };
+
+When the flag is set, the driver core automatically creates the
+``driver_override`` sysfs attribute for every device on that bus.
+
+The bus's ``match()`` callback should check the override before performing
+its own matching, using ``device_match_driver_override()``::
+
+  static int example_match(struct device *dev, const struct device_driver *drv)
+  {
+      int ret;
+
+      ret = device_match_driver_override(dev, drv);
+      if (ret >= 0)
+          return ret;
+
+      /* Fall through to bus-specific matching... */
+  }
+
+``device_match_driver_override()`` returns > 0 if the override matches
+the given driver, 0 if the override is set but does not match, or < 0 if
+no override is set at all.
+
+Additional helpers are available:
+
+- ``device_set_driver_override()`` - set or clear the override from kernel code.
+- ``device_has_driver_override()`` - check whether an override is set.

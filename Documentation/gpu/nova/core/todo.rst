@@ -1,0 +1,294 @@
+.. SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+
+=========
+Task List
+=========
+
+Tasks may have the following fields:
+
+- ``Complexity``: Describes the required familiarity with Rust and / or the
+  corresponding kernel APIs or subsystems. There are four different complexities,
+  ``Beginner``, ``Intermediate``, ``Advanced`` and ``Expert``.
+- ``Reference``: References to other tasks.
+- ``Link``: Links to external resources.
+- ``Contact``: The person that can be contacted for further information about
+  the task.
+
+A task might have `[ABCD]` code after its name. This code can be used to grep
+into the code for `TODO` entries related to it.
+
+Enablement (Rust)
+=================
+
+Tasks that are not directly related to nova-core, but are preconditions in terms
+of required APIs.
+
+FromPrimitive API [FPRI]
+------------------------
+
+Sometimes the need arises to convert a number to a value of an enum or a
+structure.
+
+A good example from nova-core would be the ``Chipset`` enum type, which defines
+the value ``AD102``. When probing the GPU the value ``0x192`` can be read from a
+certain register indication the chipset AD102. Hence, the enum value ``AD102``
+should be derived from the number ``0x192``. Currently, nova-core uses a custom
+implementation (``Chipset::from_u32`` for this.
+
+Instead, it would be desirable to have something like the ``FromPrimitive``
+trait [1] from the num crate.
+
+Having this generalization also helps with implementing a generic macro that
+automatically generates the corresponding mappings between a value and a number.
+
+FromPrimitive support has been worked on in the past, but hasn't been followed
+since then [1].
+
+There also have been considerations of ToPrimitive [2].
+
+| Complexity: Beginner
+| Link: https://docs.rs/num/latest/num/trait.FromPrimitive.html
+| Link: https://lore.kernel.org/all/cover.1750689857.git.y.j3ms.n@gmail.com/ [1]
+| Link: https://rust-for-linux.zulipchat.com/#narrow/channel/288089-General/topic/Implement.20.60FromPrimitive.60.20trait.20.2B.20derive.20macro.20for.20nova-core/with/541971854 [2]
+
+Numerical operations [NUMM]
+---------------------------
+
+Nova uses integer operations that are not part of the standard library (or not
+implemented in an optimized way for the kernel). These include:
+
+- The "Find Last Set Bit" (`fls` function of the C part of the kernel)
+  operation.
+
+A `num` core kernel module is being designed to provide these operations.
+
+| Complexity: Intermediate
+| Contact: Alexandre Courbot
+
+Page abstraction for foreign pages
+----------------------------------
+
+Rust abstractions for pages not created by the Rust page abstraction without
+direct ownership.
+
+There is active onging work from Abdiel Janulgue [1] and Lina [2].
+
+| Complexity: Advanced
+| Link: https://lore.kernel.org/linux-mm/20241119112408.779243-1-abdiel.janulgue@gmail.com/ [1]
+| Link: https://lore.kernel.org/rust-for-linux/20250202-rust-page-v1-0-e3170d7fe55e@asahilina.net/ [2]
+
+PCI MISC APIs
+-------------
+
+Extend the existing PCI device / driver abstractions by SR-IOV, capability, MSI
+API abstractions.
+
+SR-IOV [1] is work in progress.
+
+| Complexity: Beginner
+| Link: https://lore.kernel.org/all/20251119-rust-pci-sriov-v1-0-883a94599a97@redhat.com/ [1]
+
+GPU (general)
+=============
+
+Initial Devinit support
+-----------------------
+
+Implement BIOS Device Initialization, i.e. memory sizing, waiting, PLL
+configuration.
+
+| Contact: Dave Airlie
+| Complexity: Beginner
+
+MMU / PT management
+-------------------
+
+Work out the architecture for MMU / page table management.
+
+We need to consider that nova-drm will need rather fine-grained control,
+especially in terms of locking, in order to be able to implement asynchronous
+Vulkan queues.
+
+While generally sharing the corresponding code is desirable, it needs to be
+evaluated how (and if at all) sharing the corresponding code is expedient.
+
+| Complexity: Expert
+
+VRAM memory allocator
+---------------------
+
+Investigate options for a VRAM memory allocator.
+
+Some possible options:
+  - Rust abstractions for
+    - RB tree (interval tree) / drm_mm
+    - maple_tree
+  - native Rust collections
+
+There is work in progress for using drm_buddy [1].
+
+| Complexity: Advanced
+| Link: https://lore.kernel.org/all/20251219203805.1246586-4-joelagnelf@nvidia.com/ [1]
+
+Instance Memory
+---------------
+
+Implement support for instmem (bar2) used to store page tables.
+
+| Complexity: Intermediate
+| Contact: Dave Airlie
+
+GPU System Processor (GSP)
+==========================
+
+Export GSP log buffers
+----------------------
+
+Recent patches from Timur Tabi [1] added support to expose GSP-RM log buffers
+(even after failure to probe the driver) through debugfs.
+
+This is also an interesting feature for nova-core, especially in the early days.
+
+| Link: https://lore.kernel.org/nouveau/20241030202952.694055-2-ttabi@nvidia.com/ [1]
+| Reference: Debugfs abstractions
+| Complexity: Intermediate
+
+GSP firmware abstraction
+------------------------
+
+The GSP-RM firmware API is unstable and may incompatibly change from version to
+version, in terms of data structures and semantics.
+
+This problem is one of the big motivations for using Rust for nova-core, since
+it turns out that Rust's procedural macro feature provides a rather elegant way
+to address this issue:
+
+1. generate Rust structures from the C headers in a separate namespace per version
+2. build abstraction structures (within a generic namespace) that implement the
+   firmware interfaces; annotate the differences in implementation with version
+   identifiers
+3. use a procedural macro to generate the actual per version implementation out
+   of this abstraction
+4. instantiate the correct version type one on runtime (can be sure that all
+   have the same interface because it's defined by a common trait)
+
+There is a PoC implementation of this pattern, in the context of the nova-core
+PoC driver.
+
+This task aims at refining the feature and ideally generalize it, to be usable
+by other drivers as well.
+
+| Complexity: Expert
+
+GSP message queue
+-----------------
+
+Implement low level GSP message queue (command, status) for communication
+between the kernel driver and GSP.
+
+| Complexity: Advanced
+| Contact: Dave Airlie
+
+Bootstrap GSP
+-------------
+
+Call the boot firmware to boot the GSP processor; execute initial control
+messages.
+
+| Complexity: Intermediate
+| Contact: Dave Airlie
+
+Client / Device APIs
+--------------------
+
+Implement the GSP message interface for client / device allocation and the
+corresponding client and device allocation APIs.
+
+| Complexity: Intermediate
+| Contact: Dave Airlie
+
+Bar PDE handling
+----------------
+
+Synchronize page table handling for BARs between the kernel driver and GSP.
+
+| Complexity: Beginner
+| Contact: Dave Airlie
+
+FIFO engine
+-----------
+
+Implement support for the FIFO engine, i.e. the corresponding GSP message
+interface and provide an API for chid allocation and channel handling.
+
+| Complexity: Advanced
+| Contact: Dave Airlie
+
+GR engine
+---------
+
+Implement support for the graphics engine, i.e. the corresponding GSP message
+interface and provide an API for (golden) context creation and promotion.
+
+| Complexity: Advanced
+| Contact: Dave Airlie
+
+CE engine
+---------
+
+Implement support for the copy engine, i.e. the corresponding GSP message
+interface.
+
+| Complexity: Intermediate
+| Contact: Dave Airlie
+
+VFN IRQ controller
+------------------
+
+Support for the VFN interrupt controller.
+
+| Complexity: Intermediate
+| Contact: Dave Airlie
+
+External APIs
+=============
+
+nova-core base API
+------------------
+
+Work out the common pieces of the API to connect 2nd level drivers, i.e. vGPU
+manager and nova-drm.
+
+| Complexity: Advanced
+
+vGPU manager API
+----------------
+
+Work out the API parts required by the vGPU manager, which are not covered by
+the base API.
+
+| Complexity: Advanced
+
+nova-core C API
+---------------
+
+Implement a C wrapper for the APIs required by the vGPU manager driver.
+
+| Complexity: Intermediate
+
+Testing
+=======
+
+CI pipeline
+-----------
+
+Investigate option for continuous integration testing.
+
+This can go from as simple as running KUnit tests over running (graphics) CTS to
+booting up (multiple) guest VMs to test VFIO use-cases.
+
+It might also be worth to consider the introduction of a new test suite directly
+sitting on top of the uAPI for more targeted testing and debugging. There may be
+options for collaboration / shared code with the Mesa project.
+
+| Complexity: Advanced

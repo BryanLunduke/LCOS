@@ -1,0 +1,267 @@
+/*
+ * Copyright (c) 2006 Oracle.  All rights reserved.
+ *
+ * This software is available to you under a choice of one of two
+ * licenses.  You may choose to be licensed under the terms of the GNU
+ * General Public License (GPL) Version 2, available from the file
+ * COPYING in the main directory of this source tree, or the
+ * OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ */
+#include <linux/percpu.h>
+#include <linux/seq_file.h>
+#include <linux/srcu.h>
+#include <linux/slab.h>
+#include <linux/proc_fs.h>
+#include <linux/export.h>
+#include <linux/uio.h>
+
+#include "rds.h"
+
+/*
+ * This file implements a getsockopt() call which copies a set of fixed
+ * sized structs into a user-specified buffer as a means of providing
+ * read-only information about RDS.
+ *
+ * For a given information source there are a given number of fixed sized
+ * structs at a given time.  The structs are only copied if the user-specified
+ * buffer is big enough.  The destination pages that make up the buffer
+ * are pinned for the duration of the copy.
+ *
+ * This gives us the following benefits:
+ *
+ * - simple implementation, no copy "position" across multiple calls
+ * - consistent snapshot of an info source
+ * - atomic copy works well with whatever locking info source has
+ * - one portable tool to get rds info across implementations
+ * - long-lived tool can get info without allocating
+ *
+ * at the following costs:
+ *
+ * - info source copy must be pinned, may be "large"
+ */
+
+struct rds_info_iterator {
+	struct page **pages;
+	void *addr;
+	unsigned long offset;
+};
+
+DEFINE_STATIC_SRCU(rds_info_srcu);
+static DEFINE_SPINLOCK(rds_info_lock);
+static rds_info_func rds_info_funcs[RDS_INFO_LAST - RDS_INFO_FIRST + 1];
+
+void rds_info_register_func(int optname, rds_info_func func)
+{
+	int offset = optname - RDS_INFO_FIRST;
+
+	BUG_ON(optname < RDS_INFO_FIRST || optname > RDS_INFO_LAST);
+
+	spin_lock(&rds_info_lock);
+	if (WARN_ON_ONCE(rds_info_funcs[offset])) {
+		spin_unlock(&rds_info_lock);
+		return;
+	}
+	WRITE_ONCE(rds_info_funcs[offset], func);
+	spin_unlock(&rds_info_lock);
+}
+EXPORT_SYMBOL_GPL(rds_info_register_func);
+
+void rds_info_deregister_func(int optname, rds_info_func func)
+{
+	int offset = optname - RDS_INFO_FIRST;
+
+	BUG_ON(optname < RDS_INFO_FIRST || optname > RDS_INFO_LAST);
+
+	spin_lock(&rds_info_lock);
+	if (WARN_ON_ONCE(rds_info_funcs[offset] != func)) {
+		spin_unlock(&rds_info_lock);
+		return;
+	}
+	WRITE_ONCE(rds_info_funcs[offset], NULL);
+	spin_unlock(&rds_info_lock);
+	synchronize_srcu(&rds_info_srcu);
+}
+EXPORT_SYMBOL_GPL(rds_info_deregister_func);
+
+/*
+ * Typically we hold an atomic kmap across multiple rds_info_copy() calls
+ * because the kmap is so expensive.  This must be called before using blocking
+ * operations while holding the mapping and as the iterator is torn down.
+ */
+void rds_info_iter_unmap(struct rds_info_iterator *iter)
+{
+	if (iter->addr) {
+		kunmap_atomic(iter->addr);
+		iter->addr = NULL;
+	}
+}
+
+/*
+ * get_user_pages() called flush_dcache_page() on the pages for us.
+ */
+void rds_info_copy(struct rds_info_iterator *iter, void *data,
+		   unsigned long bytes)
+{
+	unsigned long this;
+
+	while (bytes) {
+		if (!iter->addr)
+			iter->addr = kmap_atomic(*iter->pages);
+
+		this = min(bytes, PAGE_SIZE - iter->offset);
+
+		rdsdebug("page %p addr %p offset %lu this %lu data %p "
+			  "bytes %lu\n", *iter->pages, iter->addr,
+			  iter->offset, this, data, bytes);
+
+		memcpy(iter->addr + iter->offset, data, this);
+
+		data += this;
+		bytes -= this;
+		iter->offset += this;
+
+		if (iter->offset == PAGE_SIZE) {
+			kunmap_atomic(iter->addr);
+			iter->addr = NULL;
+			iter->offset = 0;
+			iter->pages++;
+		}
+	}
+}
+EXPORT_SYMBOL_GPL(rds_info_copy);
+
+/*
+ * @opt->iter_out describes the buffer that the information snapshot will be
+ * copied into, and @opt->optlen is the size of that buffer on input.  On
+ * output @opt->optlen is set to the size of the requested snapshot in bytes.
+ *
+ * This function returns -errno if there is a failure, particularly -ENOSPC
+ * if the given buffer was not large enough to fit the snapshot.  On success
+ * it returns the positive number of bytes of each array element in the
+ * snapshot.
+ */
+int rds_info_getsockopt(struct socket *sock, int optname, sockopt_t *opt)
+{
+	struct rds_info_iterator iter;
+	struct rds_info_lengths lens;
+	unsigned long nr_pages = 0;
+	rds_info_func func;
+	struct page **pages = NULL;
+	size_t offset0 = 0;
+	int srcu_idx;
+	int npages = 0;
+	int ret;
+	int len;
+	int total;
+
+	len = opt->optlen;
+
+	/* check for all kinds of wrapping and the like */
+	if (len < 0 || len > INT_MAX - PAGE_SIZE + 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* The info producers write into the pages with kmap_atomic() while
+	 * holding a spinlock, so they need a genuine page-backed user buffer.
+	 */
+	if (!user_backed_iter(&opt->iter_out)) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	/* a 0 len call is just trying to probe its length */
+	if (len == 0)
+		goto call_func;
+
+	/*
+	 * Preallocate the page array and pass it in so that
+	 * iov_iter_extract_pages() fills it in place rather than allocating
+	 * one for us.  Handing it a non-NULL array keeps ownership of the
+	 * array with us on every return path, instead of depending on the
+	 * iterator code to allocate and hand it back.
+	 */
+	npages = iov_iter_npages(&opt->iter_out, INT_MAX);
+	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = iov_iter_extract_pages(&opt->iter_out, &pages, len, npages,
+				     0, &offset0);
+	if (ret < 0)
+		goto out;
+	nr_pages = DIV_ROUND_UP(offset0 + ret, PAGE_SIZE);
+	if (ret != len) {
+		ret = -EAGAIN; /* XXX ? */
+		goto out;
+	}
+
+	rdsdebug("len %d nr_pages %lu\n", len, nr_pages);
+
+call_func:
+	srcu_idx = srcu_read_lock(&rds_info_srcu);
+	func = READ_ONCE(rds_info_funcs[optname - RDS_INFO_FIRST]);
+	if (!func) {
+		srcu_read_unlock(&rds_info_srcu, srcu_idx);
+		ret = -ENOPROTOOPT;
+		goto out;
+	}
+
+	iter.pages = pages;
+	iter.addr = NULL;
+	iter.offset = offset0;
+
+	func(sock, len, &iter, &lens);
+	srcu_read_unlock(&rds_info_srcu, srcu_idx);
+	BUG_ON(lens.each == 0);
+
+	total = lens.nr * lens.each;
+
+	rds_info_iter_unmap(&iter);
+
+	if (total > len) {
+		len = total;
+		ret = -ENOSPC;
+	} else {
+		len = total;
+		ret = lens.each;
+	}
+
+	opt->optlen = len;
+
+out:
+	/*
+	 * iov_iter_extract_pages() pins only user-backed (ubuf) iters;
+	 * iov_iter_extract_will_pin() reports whether an unpin is owed here.
+	 */
+	if (pages && iov_iter_extract_will_pin(&opt->iter_out))
+		unpin_user_pages_dirty_lock(pages, nr_pages, true);
+	kvfree(pages);
+
+	return ret;
+}

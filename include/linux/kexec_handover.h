@@ -1,0 +1,142 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#ifndef LINUX_KEXEC_HANDOVER_H
+#define LINUX_KEXEC_HANDOVER_H
+
+#include <linux/err.h>
+#include <linux/errno.h>
+#include <linux/types.h>
+#include <linux/mm.h>
+#include <asm-generic/kexec_handover.h>
+
+struct kho_vmalloc;
+
+struct folio;
+struct page;
+
+#ifdef CONFIG_KEXEC_HANDOVER
+bool kho_is_enabled(void);
+bool is_kho_boot(void);
+
+int kho_preserve_folio(struct folio *folio);
+void kho_unpreserve_folio(struct folio *folio);
+int kho_preserve_pages(struct page *page, unsigned long nr_pages);
+void kho_unpreserve_pages(struct page *page, unsigned long nr_pages);
+int kho_preserve_vmalloc(void *ptr, struct kho_vmalloc *preservation);
+void kho_unpreserve_vmalloc(struct kho_vmalloc *preservation);
+void *kho_alloc_preserve(size_t size);
+void kho_unpreserve_free(void *mem);
+void kho_restore_free(void *mem);
+struct folio *kho_restore_folio(phys_addr_t phys);
+struct page *kho_restore_pages(phys_addr_t phys, unsigned long nr_pages);
+void *kho_restore_vmalloc(const struct kho_vmalloc *preservation);
+int kho_add_subtree(const char *name, void *blob, size_t size);
+void kho_remove_subtree(void *blob);
+int kho_retrieve_subtree(const char *name, phys_addr_t *phys, size_t *size);
+
+void kho_memory_init(void);
+void kho_memory_init_early(void);
+
+void kho_populate(phys_addr_t fdt_phys, u64 fdt_len, phys_addr_t scratch_phys,
+		  u64 scratch_len);
+
+bool kho_scratch_overlap(phys_addr_t phys, size_t size);
+
+static inline enum migratetype kho_scratch_migratetype(unsigned long pfn,
+						       enum migratetype mt)
+{
+	if (kho_scratch_overlap(PFN_PHYS(pfn), pageblock_nr_pages << PAGE_SHIFT))
+		return MIGRATE_CMA;
+	return mt;
+}
+#else
+static inline bool kho_is_enabled(void)
+{
+	return false;
+}
+
+static inline bool is_kho_boot(void)
+{
+	return false;
+}
+
+static inline int kho_preserve_folio(struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void kho_unpreserve_folio(struct folio *folio) { }
+
+static inline int kho_preserve_pages(struct page *page, unsigned int nr_pages)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void kho_unpreserve_pages(struct page *page, unsigned int nr_pages) { }
+
+static inline int kho_preserve_vmalloc(void *ptr,
+				       struct kho_vmalloc *preservation)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void kho_unpreserve_vmalloc(struct kho_vmalloc *preservation) { }
+
+static inline void *kho_alloc_preserve(size_t size)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline void kho_unpreserve_free(void *mem) { }
+static inline void kho_restore_free(void *mem) { }
+
+static inline struct folio *kho_restore_folio(phys_addr_t phys)
+{
+	return NULL;
+}
+
+static inline struct page *kho_restore_pages(phys_addr_t phys,
+					     unsigned int nr_pages)
+{
+	return NULL;
+}
+
+static inline void *kho_restore_vmalloc(const struct kho_vmalloc *preservation)
+{
+	return NULL;
+}
+
+static inline int kho_add_subtree(const char *name, void *blob, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void kho_remove_subtree(void *blob) { }
+
+static inline int kho_retrieve_subtree(const char *name, phys_addr_t *phys,
+				       size_t *size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void kho_memory_init(void) { }
+
+static inline void kho_memory_init_early(void) { }
+
+static inline void kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
+				phys_addr_t scratch_phys, u64 scratch_len)
+{
+}
+
+static inline bool kho_scratch_overlap(phys_addr_t phys, size_t size)
+{
+	return false;
+}
+
+static inline enum migratetype kho_scratch_migratetype(unsigned long pfn,
+						       enum migratetype mt)
+{
+	return mt;
+}
+#endif /* CONFIG_KEXEC_HANDOVER */
+
+#endif /* LINUX_KEXEC_HANDOVER_H */

@@ -1,0 +1,30 @@
+What:		/sys/class/spi_master/spi<bus>/spi<bus>.<dev>/fram
+Date:		June 2021
+KernelVersion:	5.14
+Contact:	Jiri Prchal <jiri.prchal@aksignal.cz>
+Description:
+	Contains the FRAM binary data. Same as EEPROM, just another file
+	name to indicate that it employs ferroelectric process.
+	It performs write operations at bus speed - no write delays.
+
+What:		/sys/class/spi_master/spi<bus>/spi<bus>.<dev>/sernum
+Date:		May 2021
+KernelVersion:	5.14
+Contact:	Jiri Prchal <jiri.prchal@aksignal.cz>
+Description:
+	Contains the serial number of the Cypress FRAM (FM25VN) if it is
+	present.  It will be displayed as a 8 byte hex string, as read
+	from the device.
+
+	This is a read-only attribute.
+
+What:		/sys/class/spi_master/spi<bus>/spi<bus>.<dev>/jedec_id
+Date:		January 2026
+KernelVersion:	6.19
+Contact:	Patrick Wicki <patrick.wicki@siemens.com>
+Description:
+	Contains the raw JEDEC ID bytes returned by the RDID (0x9f) command. The
+	bytes are exposed as a hex string in big-endian order as read from the
+	device.
+
+	This is a read-only attribute.

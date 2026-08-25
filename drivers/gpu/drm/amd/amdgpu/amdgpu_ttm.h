@@ -1,0 +1,272 @@
+/*
+ * Copyright 2016 Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+#ifndef __AMDGPU_TTM_H__
+#define __AMDGPU_TTM_H__
+
+#include <linux/dma-direction.h>
+#include <drm/gpu_scheduler.h>
+#include <drm/ttm/ttm_placement.h>
+#include "amdgpu_vram_mgr.h"
+#include "amdgpu_hmm.h"
+#include "amdgpu_gmc.h"
+
+#define AMDGPU_PL_GDS		(TTM_PL_PRIV + 0)
+#define AMDGPU_PL_GWS		(TTM_PL_PRIV + 1)
+#define AMDGPU_PL_OA		(TTM_PL_PRIV + 2)
+#define AMDGPU_PL_PREEMPT	(TTM_PL_PRIV + 3)
+#define AMDGPU_PL_DOORBELL	(TTM_PL_PRIV + 4)
+#define AMDGPU_PL_MMIO_REMAP	(TTM_PL_PRIV + 5)
+#define __AMDGPU_PL_NUM	(TTM_PL_PRIV + 6)
+
+#define AMDGPU_GTT_MAX_TRANSFER_SIZE	(1ULL << 22)
+
+extern const struct attribute_group amdgpu_vram_mgr_attr_group;
+extern const struct attribute_group amdgpu_gtt_mgr_attr_group;
+
+struct hmm_range;
+
+struct amdgpu_gtt_mgr {
+	struct ttm_resource_manager manager;
+	struct drm_mm mm;
+	spinlock_t lock;
+};
+
+struct amdgpu_ttm_buffer_entity {
+	struct drm_sched_entity base;
+	struct mutex		lock;
+	struct drm_mm_node	gart_node;
+	u64			gart_window_offs[2];
+};
+
+enum amdgpu_resv_region_id {
+	AMDGPU_RESV_STOLEN_VGA,
+	AMDGPU_RESV_STOLEN_EXTENDED,
+	AMDGPU_RESV_STOLEN_RESERVED,
+	AMDGPU_RESV_FW,
+	AMDGPU_RESV_FW_EXTEND,
+	AMDGPU_RESV_FW_VRAM_USAGE,
+	AMDGPU_RESV_DRV_VRAM_USAGE,
+	AMDGPU_RESV_MEM_TRAIN,
+	AMDGPU_RESV_MAX
+};
+
+struct amdgpu_vram_resv {
+	uint64_t		offset;
+	uint64_t		size;
+	struct amdgpu_bo	*bo;
+	void			*cpu_ptr;
+	bool			needs_cpu_map;
+};
+
+struct amdgpu_mman {
+	struct ttm_device		bdev;
+	struct ttm_pool			*ttm_pools;
+	bool				initialized;
+	void __iomem			*aper_base_kaddr;
+
+	/* buffer handling */
+	const struct amdgpu_buffer_funcs	*buffer_funcs;
+	struct drm_gpu_scheduler		*buffer_funcs_scheds[AMDGPU_MAX_RINGS];
+	u32					num_buffer_funcs_scheds;
+	bool					buffer_funcs_enabled;
+
+	/* @default_entity: for workarounds, has no gart windows */
+	struct amdgpu_ttm_buffer_entity default_entity;
+	struct amdgpu_ttm_buffer_entity *clear_entities;
+	atomic_t next_clear_entity;
+	u32 num_clear_entities;
+	struct amdgpu_ttm_buffer_entity move_entities[TTM_NUM_MOVE_FENCES];
+	atomic_t next_move_entity;
+	u32 num_move_entities;
+
+	struct amdgpu_vram_mgr vram_mgr;
+	struct amdgpu_gtt_mgr gtt_mgr;
+	struct ttm_resource_manager preempt_mgr;
+
+	bool			keep_stolen_vga_memory;
+
+	struct amdgpu_vram_resv		resv_region[AMDGPU_RESV_MAX];
+
+	/* PAGE_SIZE'd BO for process memory r/w over SDMA. */
+	struct amdgpu_bo	*sdma_access_bo;
+	void			*sdma_access_ptr;
+};
+
+struct amdgpu_copy_mem {
+	struct ttm_buffer_object	*bo;
+	struct ttm_resource		*mem;
+	unsigned long			offset;
+};
+
+#define AMDGPU_COPY_FLAGS_TMZ		(1 << 0)
+#define AMDGPU_COPY_FLAGS_READ_DECOMPRESSED	(1 << 1)
+#define AMDGPU_COPY_FLAGS_WRITE_COMPRESSED	(1 << 2)
+#define AMDGPU_COPY_FLAGS_MAX_COMPRESSED_SHIFT		3
+#define AMDGPU_COPY_FLAGS_MAX_COMPRESSED_MASK		0x03
+#define AMDGPU_COPY_FLAGS_NUMBER_TYPE_SHIFT		5
+#define AMDGPU_COPY_FLAGS_NUMBER_TYPE_MASK		0x07
+#define AMDGPU_COPY_FLAGS_DATA_FORMAT_SHIFT		8
+#define AMDGPU_COPY_FLAGS_DATA_FORMAT_MASK		0x3f
+#define AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_SHIFT	14
+#define AMDGPU_COPY_FLAGS_WRITE_COMPRESS_DISABLE_MASK	0x1
+
+#define AMDGPU_COPY_FLAGS_SET(field, value) \
+	(((__u32)(value) & AMDGPU_COPY_FLAGS_##field##_MASK) << AMDGPU_COPY_FLAGS_##field##_SHIFT)
+#define AMDGPU_COPY_FLAGS_GET(value, field) \
+	(((__u32)(value) >> AMDGPU_COPY_FLAGS_##field##_SHIFT) & AMDGPU_COPY_FLAGS_##field##_MASK)
+
+int amdgpu_gtt_mgr_init(struct amdgpu_device *adev, uint64_t gtt_size);
+void amdgpu_gtt_mgr_fini(struct amdgpu_device *adev);
+int amdgpu_preempt_mgr_init(struct amdgpu_device *adev);
+void amdgpu_preempt_mgr_fini(struct amdgpu_device *adev);
+void amdgpu_preempt_mgr_sysfs_fini(struct amdgpu_device *adev);
+int amdgpu_vram_mgr_init(struct amdgpu_device *adev);
+void amdgpu_vram_mgr_fini(struct amdgpu_device *adev);
+
+bool amdgpu_gtt_mgr_has_gart_addr(struct ttm_resource *mem);
+void amdgpu_gtt_mgr_mark_bo_teardown(struct ttm_buffer_object *tbo);
+void amdgpu_gtt_mgr_recover(struct amdgpu_gtt_mgr *mgr);
+
+int amdgpu_gtt_mgr_alloc_entries(struct amdgpu_gtt_mgr *mgr,
+				 struct drm_mm_node *mm_node,
+				 u64 num_pages,
+				 enum drm_mm_insert_mode mode);
+void amdgpu_gtt_mgr_free_entries(struct amdgpu_gtt_mgr *mgr,
+				 struct drm_mm_node *mm_node);
+uint64_t amdgpu_preempt_mgr_usage(struct ttm_resource_manager *man);
+
+u64 amdgpu_vram_mgr_bo_visible_size(struct amdgpu_bo *bo);
+int amdgpu_vram_mgr_alloc_sgt(struct amdgpu_device *adev,
+			      struct ttm_resource *mem,
+			      u64 offset, u64 size,
+			      struct device *dev,
+			      enum dma_data_direction dir,
+			      struct sg_table **sgt);
+void amdgpu_vram_mgr_free_sgt(struct device *dev,
+			      enum dma_data_direction dir,
+			      struct sg_table *sgt);
+uint64_t amdgpu_vram_mgr_vis_usage(struct amdgpu_vram_mgr *mgr);
+int amdgpu_vram_mgr_reserve_range(struct amdgpu_vram_mgr *mgr,
+				  uint64_t start, uint64_t size);
+int amdgpu_vram_mgr_query_page_status(struct amdgpu_vram_mgr *mgr,
+				      uint64_t start);
+void amdgpu_vram_mgr_clear_reset_blocks(struct amdgpu_device *adev);
+
+bool amdgpu_res_cpu_visible(struct amdgpu_device *adev,
+			    struct ttm_resource *res);
+
+void amdgpu_ttm_init_vram_resv(struct amdgpu_device *adev,
+				enum amdgpu_resv_region_id id,
+				uint64_t offset, uint64_t size,
+				bool needs_cpu_map);
+int amdgpu_ttm_mark_vram_reserved(struct amdgpu_device *adev,
+				  enum amdgpu_resv_region_id id);
+void amdgpu_ttm_unmark_vram_reserved(struct amdgpu_device *adev,
+				     enum amdgpu_resv_region_id id);
+
+int amdgpu_ttm_init(struct amdgpu_device *adev);
+void amdgpu_ttm_fini(struct amdgpu_device *adev);
+void amdgpu_ttm_enable_buffer_funcs(struct amdgpu_device *adev);
+void amdgpu_ttm_disable_buffer_funcs(struct amdgpu_device *adev);
+int amdgpu_copy_buffer(struct amdgpu_device *adev,
+		       struct amdgpu_ttm_buffer_entity *entity,
+		       uint64_t src_offset,
+		       uint64_t dst_offset, uint32_t byte_count,
+		       struct dma_resv *resv,
+		       struct dma_fence **fence,
+		       bool vm_needs_flush, uint32_t copy_flags);
+int amdgpu_ttm_clear_buffer(struct amdgpu_ttm_buffer_entity *entity,
+			    struct amdgpu_bo *bo,
+			    struct dma_resv *resv,
+			    struct dma_fence **out_fence,
+			    bool consider_clear_status,
+			    u64 k_job_id);
+struct amdgpu_ttm_buffer_entity *amdgpu_ttm_next_clear_entity(struct amdgpu_device *adev);
+
+int amdgpu_ttm_alloc_gart(struct ttm_buffer_object *bo);
+void amdgpu_ttm_recover_gart(struct ttm_buffer_object *tbo);
+uint64_t amdgpu_ttm_domain_start(struct amdgpu_device *adev, uint32_t type);
+
+#if IS_ENABLED(CONFIG_DRM_AMDGPU_USERPTR)
+int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo,
+				 struct amdgpu_hmm_range *range);
+#else
+static inline int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo,
+					       struct amdgpu_hmm_range *range)
+{
+	return -EPERM;
+}
+#endif
+
+/**
+ * amdgpu_compute_gart_address() - Returns GART address of an entity's window
+ * @gmc: The &struct amdgpu_gmc instance to use
+ * @entity: The &struct amdgpu_ttm_buffer_entity owning the GART window
+ * @index: The window to use (must be 0 or 1)
+ */
+static inline u64 amdgpu_compute_gart_address(struct amdgpu_gmc *gmc,
+					      struct amdgpu_ttm_buffer_entity *entity,
+					      int index)
+{
+	return gmc->gart_start + entity->gart_window_offs[index];
+}
+
+/**
+ * amdgpu_gtt_node_to_byte_offset() - Returns a byte offset of a gtt node
+ */
+static inline u64 amdgpu_gtt_node_to_byte_offset(const struct drm_mm_node *gtt_node)
+{
+	return gtt_node->start * (u64)PAGE_SIZE;
+}
+
+void amdgpu_ttm_tt_set_user_pages(struct ttm_tt *ttm, struct amdgpu_hmm_range *range);
+int amdgpu_ttm_tt_get_userptr(const struct ttm_buffer_object *tbo,
+			      uint64_t *user_addr);
+int amdgpu_ttm_tt_set_userptr(struct ttm_buffer_object *bo,
+			      uint64_t addr, uint32_t flags);
+bool amdgpu_ttm_tt_has_userptr(struct ttm_tt *ttm);
+struct mm_struct *amdgpu_ttm_tt_get_usermm(struct ttm_tt *ttm);
+bool amdgpu_ttm_tt_affect_userptr(struct ttm_tt *ttm, unsigned long start,
+				  unsigned long end, unsigned long *userptr);
+bool amdgpu_ttm_tt_userptr_invalidated(struct ttm_tt *ttm,
+				       int *last_invalidated);
+bool amdgpu_ttm_tt_is_userptr(struct ttm_tt *ttm);
+bool amdgpu_ttm_tt_is_readonly(struct ttm_tt *ttm);
+uint64_t amdgpu_ttm_tt_pde_flags(struct ttm_tt *ttm, struct ttm_resource *mem);
+uint64_t amdgpu_ttm_tt_pte_flags(struct amdgpu_device *adev, struct ttm_tt *ttm,
+				 struct ttm_resource *mem);
+int amdgpu_ttm_evict_resources(struct amdgpu_device *adev, int mem_type);
+
+void amdgpu_ttm_debugfs_init(struct amdgpu_device *adev);
+
+int amdgpu_ttm_mmio_remap_alloc_sgt(struct amdgpu_device *adev,
+				    struct ttm_resource *res,
+				    struct device *dev,
+				    enum dma_data_direction dir,
+				    struct sg_table **sgt);
+void amdgpu_ttm_mmio_remap_free_sgt(struct device *dev,
+				    enum dma_data_direction dir,
+				    struct sg_table *sgt);
+
+#endif

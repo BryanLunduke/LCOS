@@ -1,0 +1,207 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * connection tracking helpers.
+ *
+ * 16 Dec 2003: Yasuyuki Kozakai @USAGI <yasuyuki.kozakai@toshiba.co.jp>
+ *	- generalize L3 protocol dependent part.
+ *
+ * Derived from include/linux/netfiter_ipv4/ip_conntrack_helper.h
+ */
+
+#ifndef _NF_CONNTRACK_HELPER_H
+#define _NF_CONNTRACK_HELPER_H
+#include <linux/refcount.h>
+#include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_extend.h>
+#include <net/netfilter/nf_conntrack_expect.h>
+
+#define NF_NAT_HELPER_PREFIX		"ip_nat_"
+#define NF_NAT_HELPER_NAME(name)	NF_NAT_HELPER_PREFIX name
+#define MODULE_ALIAS_NF_NAT_HELPER(name) \
+	MODULE_ALIAS(NF_NAT_HELPER_NAME(name))
+
+struct module;
+
+enum nf_ct_helper_flags {
+	NF_CT_HELPER_F_USERSPACE	= (1 << 0),
+	NF_CT_HELPER_F_CONFIGURED	= (1 << 1),
+};
+
+#define NF_CT_HELPER_NAME_LEN	16
+
+/* Must be kept in sync with the classes defined by helpers */
+#define NF_CT_MAX_EXPECT_CLASSES	4
+
+struct nf_conntrack_helper {
+	struct hlist_node hnode;	/* Internal use. */
+
+	struct rcu_head rcu;
+
+	char name[NF_CT_HELPER_NAME_LEN]; /* name of the module */
+	struct module *me;		/* pointer to self */
+	struct nf_conntrack_expect_policy expect_policy[NF_CT_MAX_EXPECT_CLASSES];
+
+	refcount_t ct_refcnt;
+
+	u8 nfproto;	/* NFPROTO_*, can be NFPROTO_UNSPEC */
+	u8 l4proto;	/* IPPROTO_UDP/TCP */
+
+	/* Function to call when data passes; return verdict */
+	int __rcu (*help)(struct sk_buff *skb, unsigned int protoff,
+			  struct nf_conn *ct,
+			  enum ip_conntrack_info conntrackinfo);
+
+	void (*destroy)(struct nf_conn *ct);
+
+	int (*from_nlattr)(struct nlattr *attr, struct nf_conn *ct);
+	int (*to_nlattr)(struct sk_buff *skb, const struct nf_conn *ct);
+	unsigned int expect_class_max;
+
+	unsigned int flags;
+
+	/* For user-space helpers: */
+	unsigned int queue_num;
+	/* length of userspace private data stored in nf_conn_help->data */
+	u16 data_len;
+	/* name of NAT helper module */
+	char nat_mod_name[NF_CT_HELPER_NAME_LEN];
+};
+
+/* nf_conn feature for connections that have a helper */
+struct nf_conn_help {
+	/* Helper. if any */
+	struct nf_conntrack_helper __rcu *helper;
+
+	struct hlist_head expectations;
+
+	/* Current number of expected connections */
+	u8 expecting[NF_CT_MAX_EXPECT_CLASSES];
+
+	/* private helper information. */
+	char data[32] __aligned(8);
+};
+
+#define NF_CT_HELPER_BUILD_BUG_ON(structsize) \
+	BUILD_BUG_ON((structsize) > sizeof_field(struct nf_conn_help, data))
+
+struct nf_conntrack_helper *__nf_conntrack_helper_find(const char *name,
+						       u16 l3num, u8 protonum);
+
+struct nf_conntrack_helper *nf_conntrack_helper_try_module_get(const char *name,
+							       u16 l3num,
+							       u8 protonum);
+void nf_conntrack_helper_put(struct nf_conntrack_helper *helper);
+
+void nf_ct_helper_init(struct nf_conntrack_helper *helper,
+		       u8 l3num, u16 protonum, const char *name,
+		       const struct nf_conntrack_expect_policy *exp_pol,
+		       u32 expect_class_max,
+		       int (*help)(struct sk_buff *skb, unsigned int protoff,
+				   struct nf_conn *ct,
+				   enum ip_conntrack_info ctinfo),
+		       int (*from_nlattr)(struct nlattr *attr,
+					  struct nf_conn *ct),
+		       struct module *module);
+
+int nf_conntrack_helper_register(struct nf_conntrack_helper *, struct nf_conntrack_helper **);
+int __nf_conntrack_helper_register(struct nf_conntrack_helper *);
+void nf_conntrack_helper_unregister(struct nf_conntrack_helper *);
+void nf_conntrack_helper_release(struct nf_conntrack_helper *);
+
+int nf_conntrack_helpers_register(struct nf_conntrack_helper *, unsigned int,
+				  struct nf_conntrack_helper **);
+void nf_conntrack_helpers_unregister(struct nf_conntrack_helper **,
+				     unsigned int);
+
+#define nf_conntrack_helper_deprecated(name) \
+	pr_warn("The %s conntrack helper is scheduled for removal.\n"	\
+		"Please contact the netfilter-devel mailing list if you still need this.\n", name)
+
+struct nf_conn_help *nf_ct_helper_ext_add(struct nf_conn *ct, gfp_t gfp);
+
+int __nf_ct_try_assign_helper(struct nf_conn *ct, struct nf_conn *tmpl,
+			      gfp_t flags);
+
+int nf_ct_helper(struct sk_buff *skb, struct nf_conn *ct,
+		 enum ip_conntrack_info ctinfo, u16 proto);
+int nf_ct_add_helper(struct nf_conn *ct, const char *name, u8 family,
+		     u8 proto, bool nat, struct nf_conntrack_helper **hp);
+
+void nf_ct_helper_destroy(struct nf_conn *ct);
+
+static inline struct nf_conn_help *nfct_help(const struct nf_conn *ct)
+{
+	return nf_ct_ext_find(ct, NF_CT_EXT_HELPER);
+}
+
+static inline void *nfct_help_data(const struct nf_conn *ct)
+{
+	struct nf_conn_help *help;
+
+	help = nf_ct_ext_find(ct, NF_CT_EXT_HELPER);
+	if (!help)
+		return NULL;
+
+	return (void *)help->data;
+}
+
+static inline void nf_ct_help_put(const struct nf_conn *ct)
+{
+	struct nf_conntrack_helper *helper;
+	struct nf_conn_help *help;
+
+	help = nfct_help(ct);
+	if (!help)
+		return;
+
+	helper = rcu_dereference(help->helper);
+	if (helper && refcount_dec_and_test(&helper->ct_refcnt))
+		kfree_rcu(helper, rcu);
+}
+
+int nf_conntrack_helper_init(void);
+void nf_conntrack_helper_fini(void);
+
+int nf_conntrack_broadcast_help(struct sk_buff *skb, struct nf_conn *ct,
+				enum ip_conntrack_info ctinfo,
+				unsigned int timeout);
+
+struct nf_ct_helper_expectfn {
+	struct list_head head;
+	const char *name;
+	void (*expectfn)(struct nf_conn *ct, struct nf_conntrack_expect *exp);
+};
+
+__printf(3,4)
+void nf_ct_helper_log(struct sk_buff *skb, const struct nf_conn *ct,
+		      const char *fmt, ...);
+
+void nf_ct_helper_expectfn_register(struct nf_ct_helper_expectfn *n);
+void nf_ct_helper_expectfn_unregister(struct nf_ct_helper_expectfn *n);
+void nf_ct_helper_expectfn_destroy(const struct nf_ct_helper_expectfn *n);
+struct nf_ct_helper_expectfn *
+nf_ct_helper_expectfn_find_by_name(const char *name);
+struct nf_ct_helper_expectfn *
+nf_ct_helper_expectfn_find_by_symbol(const void *symbol);
+
+extern struct hlist_head *nf_ct_helper_hash;
+extern unsigned int nf_ct_helper_hsize;
+
+struct nf_conntrack_nat_helper {
+	struct list_head list;
+	char mod_name[NF_CT_HELPER_NAME_LEN];	/* module name */
+	struct module *module;			/* pointer to self */
+};
+
+#define NF_CT_NAT_HELPER_INIT(name) \
+	{ \
+	.mod_name = NF_NAT_HELPER_NAME(name), \
+	.module = THIS_MODULE \
+	}
+
+void nf_nat_helper_register(struct nf_conntrack_nat_helper *nat);
+void nf_nat_helper_unregister(struct nf_conntrack_nat_helper *nat);
+int nf_nat_helper_try_module_get(const char *name, u16 l3num,
+				 u8 protonum);
+void nf_nat_helper_put(struct nf_conntrack_helper *helper);
+#endif /*_NF_CONNTRACK_HELPER_H*/

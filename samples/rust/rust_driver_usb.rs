@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0
+// SPDX-FileCopyrightText: Copyright (C) 2025 Collabora Ltd.
+
+//! Rust USB driver sample.
+
+use kernel::{
+    device::{
+        self,
+        Core, //
+    },
+    prelude::*,
+    sync::aref::ARef,
+    usb, //
+};
+
+struct SampleDriver {
+    _intf: ARef<usb::Interface>,
+}
+
+kernel::usb_device_table!(
+    USB_TABLE,
+    <SampleDriver as usb::Driver>::IdInfo,
+    [(usb::DeviceId::from_id(0x1234, 0x5678), ()),]
+);
+
+impl usb::Driver for SampleDriver {
+    type IdInfo = ();
+    type Data<'bound> = Self;
+    const ID_TABLE: usb::IdTable<Self::IdInfo> = &USB_TABLE;
+
+    fn probe<'bound>(
+        intf: &'bound usb::Interface<Core<'_>>,
+        _id: &usb::DeviceId,
+        _info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self, Error> + 'bound {
+        let dev: &device::Device<Core<'_>> = intf.as_ref();
+        dev_info!(dev, "Rust USB driver sample probed\n");
+
+        Ok(Self { _intf: intf.into() })
+    }
+
+    fn disconnect<'bound>(intf: &'bound usb::Interface<Core<'_>>, _data: Pin<&Self>) {
+        let dev: &device::Device<Core<'_>> = intf.as_ref();
+        dev_info!(dev, "Rust USB driver sample disconnected\n");
+    }
+}
+
+kernel::module_usb_driver! {
+    type: SampleDriver,
+    name: "rust_driver_usb",
+    authors: ["Daniel Almeida"],
+    description: "Rust USB driver sample",
+    license: "GPL v2",
+}

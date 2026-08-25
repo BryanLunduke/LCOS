@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: MIT
+//
+// Copyright 2025 Advanced Micro Devices, Inc.
+
+#include "soc_and_ip_translator.h"
+#include "soc_and_ip_translator/dcn401/dcn401_soc_and_ip_translator.h"
+#include "soc_and_ip_translator/dcn42/dcn42_soc_and_ip_translator.h"
+#include "soc_and_ip_translator/dcn42b/dcn42b_soc_and_ip_translator.h"
+#include "soc_and_ip_translator/dcn60/dcn60_soc_and_ip_translator.h"
+
+static void dc_construct_soc_and_ip_translator(struct soc_and_ip_translator *soc_and_ip_translator,
+		enum dce_version dc_version)
+{
+	switch (dc_version) {
+	case DCN_VERSION_4_01:
+		dcn401_construct_soc_and_ip_translator(soc_and_ip_translator);
+		break;
+	case DCN_VERSION_4_2:
+		dcn42_construct_soc_and_ip_translator(soc_and_ip_translator);
+		break;
+	case DCN_VERSION_4_2B:
+		dcn42b_construct_soc_and_ip_translator(soc_and_ip_translator);
+		break;
+	case DCN_VERSION_6_0:
+		dcn60_construct_soc_and_ip_translator(soc_and_ip_translator);
+		break;
+	default:
+		break;
+	}
+}
+
+struct soc_and_ip_translator *dc_create_soc_and_ip_translator(enum dce_version dc_version)
+{
+	struct soc_and_ip_translator *soc_and_ip_translator;
+
+	soc_and_ip_translator = kzalloc_obj(*soc_and_ip_translator);
+	if (!soc_and_ip_translator)
+		return NULL;
+
+	dc_construct_soc_and_ip_translator(soc_and_ip_translator, dc_version);
+
+	return soc_and_ip_translator;
+}
+
+void dc_destroy_soc_and_ip_translator(struct soc_and_ip_translator **soc_and_ip_translator)
+{
+	kfree(*soc_and_ip_translator);
+	*soc_and_ip_translator = NULL;
+}

@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * DTS file for AMD Seattle Overdrive Development Board
+ * Note: For Seattle Rev.B0
+ *
+ * Copyright (C) 2015 Advanced Micro Devices, Inc.
+ */
+
+/dts-v1/;
+
+/include/ "amd-seattle-soc.dtsi"
+/include/ "amd-seattle-cpus.dtsi"
+
+/ {
+	model = "AMD Seattle (Rev.B0) Development Board (Overdrive)";
+	compatible = "amd,seattle-overdrive", "amd,seattle";
+
+	chosen {
+		stdout-path = &serial0;
+	};
+
+	psci {
+		compatible = "arm,psci-0.2";
+		method = "smc";
+	};
+};
+
+&ccp0 {
+	status = "okay";
+};
+
+/**
+ * NOTE: In Rev.B, gpio0 is reserved.
+ */
+&gpio1 {
+	status = "okay";
+};
+
+&gpio4 {
+	status = "okay";
+};
+
+&i2c0 {
+	status = "okay";
+};
+
+&i2c1 {
+	status = "okay";
+};
+
+&pcie0 {
+	status = "okay";
+};
+
+&spi0 {
+	status = "okay";
+};
+
+&spi1 {
+	status = "okay";
+	sdcard0: mmc@0 {
+		compatible = "mmc-spi-slot";
+		reg = <0>;
+		spi-max-frequency = <20000000>;
+		voltage-ranges = <3200 3400>;
+		pl022,interface = <0>;
+		pl022,com-mode = <0x0>;
+		pl022,rx-level-trig = <0>;
+		pl022,tx-level-trig = <0>;
+	};
+};
+
+&smb0 {
+	xgmac0: ethernet@e0700000 {
+		compatible = "amd,xgbe-seattle-v1a";
+		reg = <0 0xe0700000 0 0x80000>,
+		      <0 0xe0780000 0 0x80000>,
+		      <0 0xe1240800 0 0x00400>, /* SERDES RX/TX0 */
+		      <0 0xe1250000 0 0x00060>, /* SERDES IR 1/2 */
+		      <0 0xe12500f8 0 0x00004>; /* SERDES IR 2/2 */
+		interrupts = <0 325 4>,
+			     <0 346 1>, <0 347 1>, <0 348 1>, <0 349 1>,
+			     <0 323 4>;
+		amd,per-channel-interrupt;
+		amd,speed-set = <0>;
+		amd,serdes-blwc = <1>, <1>, <0>;
+		amd,serdes-cdr-rate = <2>, <2>, <7>;
+		amd,serdes-pq-skew = <10>, <10>, <18>;
+		amd,serdes-tx-amp = <0>, <0>, <0>;
+		amd,serdes-dfe-tap-config = <3>, <3>, <3>;
+		amd,serdes-dfe-tap-enable = <0>, <0>, <7>;
+		mac-address = [ 02 A1 A2 A3 A4 A5 ];
+		clocks = <&xgmacclk0_dma_250mhz>, <&xgmacclk0_ptp_250mhz>;
+		clock-names = "dma_clk", "ptp_clk";
+		phy-mode = "xgmii";
+		iommus = <&xgmac0_smmu 0x00 0x17>; /* 0-7, 16-23 */
+		dma-coherent;
+	};
+
+	xgmac1: ethernet@e0900000 {
+		compatible = "amd,xgbe-seattle-v1a";
+		reg = <0 0xe0900000 0 0x80000>,
+		      <0 0xe0980000 0 0x80000>,
+		      <0 0xe1240c00 0 0x00400>, /* SERDES RX/TX1 */
+		      <0 0xe1250080 0 0x00060>, /* SERDES IR 1/2 */
+		      <0 0xe12500fc 0 0x00004>; /* SERDES IR 2/2 */
+		interrupts = <0 324 4>,
+			     <0 341 1>, <0 342 1>, <0 343 1>, <0 344 1>,
+			     <0 322 4>;
+		amd,per-channel-interrupt;
+		amd,speed-set = <0>;
+		amd,serdes-blwc = <1>, <1>, <0>;
+		amd,serdes-cdr-rate = <2>, <2>, <7>;
+		amd,serdes-pq-skew = <10>, <10>, <18>;
+		amd,serdes-tx-amp = <0>, <0>, <0>;
+		amd,serdes-dfe-tap-config = <3>, <3>, <3>;
+		amd,serdes-dfe-tap-enable = <0>, <0>, <7>;
+		mac-address = [ 02 B1 B2 B3 B4 B5 ];
+		clocks = <&xgmacclk1_dma_250mhz>, <&xgmacclk1_ptp_250mhz>;
+		clock-names = "dma_clk", "ptp_clk";
+		phy-mode = "xgmii";
+		iommus = <&xgmac1_smmu 0x00 0x17>; /* 0-7, 16-23 */
+		dma-coherent;
+	};
+
+	xgmac0_smmu: iommu@e0600000 {
+		 compatible = "arm,mmu-401";
+		 reg = <0 0xe0600000 0 0x10000>;
+		 #global-interrupts = <1>;
+		 interrupts = /* Uses combined intr for both
+			       * global and context
+			       */
+			      <0 336 4>,
+			      <0 336 4>;
+		#iommu-cells = <2>;
+		dma-coherent;
+	 };
+
+	 xgmac1_smmu: iommu@e0800000 {
+		 compatible = "arm,mmu-401";
+		 reg = <0 0xe0800000 0 0x10000>;
+		 #global-interrupts = <1>;
+		 interrupts = /* Uses combined intr for both
+			       * global and context
+			       */
+			      <0 335 4>,
+			      <0 335 4>;
+		#iommu-cells = <2>;
+		dma-coherent;
+	 };
+};

@@ -1,0 +1,141 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * Copied from arch/arm64/include/asm/hwcap.h
+ *
+ * Copyright (C) 2012 ARM Ltd.
+ * Copyright (C) 2017 SiFive
+ */
+#ifndef _ASM_RISCV_HWCAP_H
+#define _ASM_RISCV_HWCAP_H
+
+#include <uapi/asm/hwcap.h>
+
+#define RISCV_ISA_EXT_A		('a' - 'a')
+#define RISCV_ISA_EXT_C		('c' - 'a')
+#define RISCV_ISA_EXT_D		('d' - 'a')
+#define RISCV_ISA_EXT_F		('f' - 'a')
+#define RISCV_ISA_EXT_H		('h' - 'a')
+#define RISCV_ISA_EXT_I		('i' - 'a')
+#define RISCV_ISA_EXT_M		('m' - 'a')
+#define RISCV_ISA_EXT_Q		('q' - 'a')
+#define RISCV_ISA_EXT_V		('v' - 'a')
+
+/*
+ * These macros represent the logical IDs of each multi-letter RISC-V ISA
+ * extension and are used in the ISA bitmap. The logical IDs start from
+ * RISCV_ISA_EXT_BASE, which allows the 0-25 range to be reserved for single
+ * letter extensions. The maximum, RISCV_ISA_EXT_MAX, is defined in order
+ * to allocate the bitmap and may be increased when necessary.
+ *
+ * New extensions should just be added to the bottom, rather than added
+ * alphabetically, in order to avoid unnecessary shuffling.
+ */
+#define RISCV_ISA_EXT_BASE		26
+
+#define RISCV_ISA_EXT_SSCOFPMF		26
+#define RISCV_ISA_EXT_SSTC		27
+#define RISCV_ISA_EXT_SVINVAL		28
+#define RISCV_ISA_EXT_SVPBMT		29
+#define RISCV_ISA_EXT_ZBB		30
+#define RISCV_ISA_EXT_ZICBOM		31
+#define RISCV_ISA_EXT_ZIHINTPAUSE	32
+#define RISCV_ISA_EXT_SVNAPOT		33
+#define RISCV_ISA_EXT_ZICBOZ		34
+#define RISCV_ISA_EXT_SMAIA		35
+#define RISCV_ISA_EXT_SSAIA		36
+#define RISCV_ISA_EXT_ZBA		37
+#define RISCV_ISA_EXT_ZBS		38
+#define RISCV_ISA_EXT_ZICNTR		39
+#define RISCV_ISA_EXT_ZICSR		40
+#define RISCV_ISA_EXT_ZIFENCEI		41
+#define RISCV_ISA_EXT_ZIHPM		42
+#define RISCV_ISA_EXT_SMSTATEEN		43
+#define RISCV_ISA_EXT_ZICOND		44
+#define RISCV_ISA_EXT_ZBC		45
+#define RISCV_ISA_EXT_ZBKB		46
+#define RISCV_ISA_EXT_ZBKC		47
+#define RISCV_ISA_EXT_ZBKX		48
+#define RISCV_ISA_EXT_ZKND		49
+#define RISCV_ISA_EXT_ZKNE		50
+#define RISCV_ISA_EXT_ZKNH		51
+#define RISCV_ISA_EXT_ZKR		52
+#define RISCV_ISA_EXT_ZKSED		53
+#define RISCV_ISA_EXT_ZKSH		54
+#define RISCV_ISA_EXT_ZKT		55
+#define RISCV_ISA_EXT_ZVBB		56
+#define RISCV_ISA_EXT_ZVBC		57
+#define RISCV_ISA_EXT_ZVKB		58
+#define RISCV_ISA_EXT_ZVKG		59
+#define RISCV_ISA_EXT_ZVKNED		60
+#define RISCV_ISA_EXT_ZVKNHA		61
+#define RISCV_ISA_EXT_ZVKNHB		62
+#define RISCV_ISA_EXT_ZVKSED		63
+#define RISCV_ISA_EXT_ZVKSH		64
+#define RISCV_ISA_EXT_ZVKT		65
+#define RISCV_ISA_EXT_ZFH		66
+#define RISCV_ISA_EXT_ZFHMIN		67
+#define RISCV_ISA_EXT_ZIHINTNTL		68
+#define RISCV_ISA_EXT_ZVFH		69
+#define RISCV_ISA_EXT_ZVFHMIN		70
+#define RISCV_ISA_EXT_ZFA		71
+#define RISCV_ISA_EXT_ZTSO		72
+#define RISCV_ISA_EXT_ZACAS		73
+#define RISCV_ISA_EXT_ZVE32X		74
+#define RISCV_ISA_EXT_ZVE32F		75
+#define RISCV_ISA_EXT_ZVE64X		76
+#define RISCV_ISA_EXT_ZVE64F		77
+#define RISCV_ISA_EXT_ZVE64D		78
+#define RISCV_ISA_EXT_ZIMOP		79
+#define RISCV_ISA_EXT_ZCA		80
+#define RISCV_ISA_EXT_ZCB		81
+#define RISCV_ISA_EXT_ZCD		82
+#define RISCV_ISA_EXT_ZCF		83
+#define RISCV_ISA_EXT_ZCMOP		84
+#define RISCV_ISA_EXT_ZAWRS		85
+#define RISCV_ISA_EXT_SVVPTC		86
+#define RISCV_ISA_EXT_SMMPM		87
+#define RISCV_ISA_EXT_SMNPM		88
+#define RISCV_ISA_EXT_SSNPM		89
+#define RISCV_ISA_EXT_ZABHA		90
+#define RISCV_ISA_EXT_ZICCRSE		91
+#define RISCV_ISA_EXT_SVADE		92
+#define RISCV_ISA_EXT_SVADU		93
+#define RISCV_ISA_EXT_ZFBFMIN		94
+#define RISCV_ISA_EXT_ZVFBFMIN		95
+#define RISCV_ISA_EXT_ZVFBFWMA		96
+#define RISCV_ISA_EXT_ZAAMO		97
+#define RISCV_ISA_EXT_ZALRSC		98
+#define RISCV_ISA_EXT_ZICBOP		99
+#define RISCV_ISA_EXT_SVRSW60T59B	100
+#define RISCV_ISA_EXT_ZALASR		101
+#define RISCV_ISA_EXT_ZILSD		102
+#define RISCV_ISA_EXT_ZCLSD		103
+#define RISCV_ISA_EXT_ZICFILP		104
+#define RISCV_ISA_EXT_ZICFISS		105
+#define RISCV_ISA_EXT_SSCSRIND		106
+#define RISCV_ISA_EXT_SMCSRIND		107
+#define RISCV_ISA_EXT_SMCNTRPMF		108
+#define RISCV_ISA_EXT_SSCCFG		109
+#define RISCV_ISA_EXT_SMCDELEG		110
+#define RISCV_ISA_EXT_SSQOSID		111
+#define RISCV_ISA_EXT_ZICCLSM		112
+#define RISCV_ISA_EXT_ZICCAMOA		113
+#define RISCV_ISA_EXT_ZICCIF		114
+#define RISCV_ISA_EXT_ZA64RS		115
+
+#define RISCV_ISA_EXT_XLINUXENVCFG	127
+
+#define RISCV_ISA_EXT_MAX		128
+#define RISCV_ISA_EXT_INVALID		U32_MAX
+
+#ifdef CONFIG_RISCV_M_MODE
+#define RISCV_ISA_EXT_SxAIA		RISCV_ISA_EXT_SMAIA
+#define RISCV_ISA_EXT_SUPM		RISCV_ISA_EXT_SMNPM
+#define RISCV_ISA_EXT_SxCSRIND		RISCV_ISA_EXT_SMCSRIND
+#else
+#define RISCV_ISA_EXT_SxAIA		RISCV_ISA_EXT_SSAIA
+#define RISCV_ISA_EXT_SUPM		RISCV_ISA_EXT_SSNPM
+#define RISCV_ISA_EXT_SxCSRIND		RISCV_ISA_EXT_SSCSRIND
+#endif
+
+#endif /* _ASM_RISCV_HWCAP_H */

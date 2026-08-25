@@ -1,0 +1,225 @@
+/*
+ * Copyright 2012-15 Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: AMD
+ *
+ */
+
+#include "dm_services.h"
+
+/*
+ * Pre-requisites: headers required by header of this unit
+ */
+#include "include/gpio_types.h"
+
+/*
+ * Header of this unit
+ */
+
+#include "hw_translate.h"
+
+/*
+ * Post-requisites: headers required by this unit
+ */
+
+#if defined(CONFIG_DRM_AMD_DC_SI)
+#include "dce60/hw_translate_dce60.h"
+#endif
+#include "dce80/hw_translate_dce80.h"
+#include "dce110/hw_translate_dce110.h"
+#include "dce120/hw_translate_dce120.h"
+#include "dcn10/hw_translate_dcn10.h"
+#include "dcn20/hw_translate_dcn20.h"
+#include "dcn21/hw_translate_dcn21.h"
+#include "dcn30/hw_translate_dcn30.h"
+#include "dcn315/hw_translate_dcn315.h"
+#include "dcn32/hw_translate_dcn32.h"
+#include "dcn401/hw_translate_dcn401.h"
+#include "dcn42/hw_translate_dcn42.h"
+#include "dcn42b/hw_translate_dcn42b.h"
+#include "dcn60/hw_translate_dcn60.h"
+
+/*
+ * This unit
+ */
+
+bool dal_hw_translate_init(
+	struct hw_translate *translate,
+	enum dce_version dce_version,
+	enum dce_environment dce_environment)
+{
+	(void)dce_environment;
+	switch (dce_version) {
+#if defined(CONFIG_DRM_AMD_DC_SI)
+	case DCE_VERSION_6_0:
+	case DCE_VERSION_6_1:
+	case DCE_VERSION_6_4:
+		dal_hw_translate_dce60_init(translate);
+		return true;
+#endif
+	case DCE_VERSION_8_0:
+	case DCE_VERSION_8_1:
+	case DCE_VERSION_8_3:
+		dal_hw_translate_dce80_init(translate);
+		return true;
+	case DCE_VERSION_10_0:
+	case DCE_VERSION_11_0:
+	case DCE_VERSION_11_2:
+	case DCE_VERSION_11_22:
+		dal_hw_translate_dce110_init(translate);
+		return true;
+	case DCE_VERSION_12_0:
+	case DCE_VERSION_12_1:
+		dal_hw_translate_dce120_init(translate);
+		return true;
+	case DCN_VERSION_1_0:
+	case DCN_VERSION_1_01:
+		dal_hw_translate_dcn10_init(translate);
+		return true;
+	case DCN_VERSION_2_0:
+		dal_hw_translate_dcn20_init(translate);
+		return true;
+	case DCN_VERSION_2_01:
+	case DCN_VERSION_2_1:
+		dal_hw_translate_dcn21_init(translate);
+		return true;
+	case DCN_VERSION_3_0:
+	case DCN_VERSION_3_01:
+	case DCN_VERSION_3_02:
+	case DCN_VERSION_3_03:
+	case DCN_VERSION_3_1:
+	case DCN_VERSION_3_14:
+	case DCN_VERSION_3_16:
+		dal_hw_translate_dcn30_init(translate);
+		return true;
+	case DCN_VERSION_3_15:
+		dal_hw_translate_dcn315_init(translate);
+		return true;
+	case DCN_VERSION_3_2:
+	case DCN_VERSION_3_21:
+	case DCN_VERSION_3_5:
+	case DCN_VERSION_3_51:
+	case DCN_VERSION_3_6:
+		dal_hw_translate_dcn32_init(translate);
+		return true;
+	case DCN_VERSION_4_01:
+		dal_hw_translate_dcn401_init(translate);
+		return true;
+	case DCN_VERSION_4_2:
+		dal_hw_translate_dcn42_init(translate);
+		return true;
+	case DCN_VERSION_4_2B:
+		dal_hw_translate_dcn42b_init(translate);
+		return true;
+	case DCN_VERSION_6_0:
+		dal_hw_translate_dcn60_init(translate);
+		return true;
+	default:
+		BREAK_TO_DEBUGGER();
+		return false;
+	}
+}
+
+bool dal_hw_translate_gpio_offset_to_id(
+	const struct gpio_id_offset_entry *table,
+	uint32_t table_size,
+	uint32_t offset,
+	uint32_t mask,
+	enum gpio_id *id,
+	uint32_t *en)
+{
+	uint32_t i;
+
+	for (i = 0; i < table_size; i++) {
+		const struct gpio_id_offset_entry *entry = &table[i];
+
+		if (entry->offset != offset)
+			continue;
+
+		if (entry->check_mask && entry->mask != mask)
+			continue;
+
+		*id = entry->id;
+		*en = entry->en;
+
+		return true;
+	}
+
+	return false;
+}
+
+/* we don't care about the GPIO_ID for DDC
+ * in DdcHandle it will use GPIO_ID_DDC_DATA/GPIO_ID_DDC_CLOCK
+ * directly in the create method
+ */
+bool dal_hw_translate_gpio_ddc_offset_to_id(
+	const struct gpio_ddc_offset_entry *table,
+	uint32_t table_size,
+	uint32_t offset,
+	uint32_t *en)
+{
+	uint32_t i;
+
+	for (i = 0; i < table_size; i++) {
+		const struct gpio_ddc_offset_entry *entry = &table[i];
+
+		if (entry->offset != offset)
+			continue;
+
+		*en = entry->en;
+
+		return true;
+	}
+
+	return false;
+}
+
+bool dal_hw_translate_id_to_offset(
+	const struct gpio_pin_entry *table,
+	uint32_t table_size,
+	enum gpio_id id,
+	uint32_t en,
+	struct gpio_pin_info *info)
+{
+	uint32_t i;
+
+	for (i = 0; i < table_size; i++) {
+		const struct gpio_pin_entry *entry = &table[i];
+
+		if (entry->id != id || entry->en != en)
+			continue;
+
+		info->offset = entry->offset;
+		info->mask = entry->mask;
+
+		info->offset_y = info->offset + 2;
+		info->offset_en = info->offset + 1;
+		info->offset_mask = info->offset - 1;
+
+		info->mask_y = info->mask;
+		info->mask_en = info->mask;
+		info->mask_mask = info->mask;
+
+		return true;
+	}
+
+	return false;
+}

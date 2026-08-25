@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB
+/* Copyright (c) 2020 Mellanox Technologies Inc. All rights reserved. */
+
+#include "mlx5_core.h"
+#include "eswitch.h"
+#include "helper.h"
+#include "ofld.h"
+
+static void esw_acl_egress_ofld_fwd2vport_destroy(struct mlx5_vport *vport)
+{
+	if (!vport->egress.offloads.fwd_rule)
+		return;
+
+	mlx5_del_flow_rules(vport->egress.offloads.fwd_rule);
+	vport->egress.offloads.fwd_rule = NULL;
+}
+
+void esw_acl_egress_ofld_bounce_rule_destroy(struct mlx5_vport *vport, int rule_index)
+{
+	struct mlx5_flow_handle *bounce_rule =
+		xa_load(&vport->egress.offloads.bounce_rules, rule_index);
+
+	if (!bounce_rule)
+		return;
+
+	mlx5_del_flow_rules(bounce_rule);
+	xa_erase(&vport->egress.offloads.bounce_rules, rule_index);
+}
+
+static void esw_acl_egress_ofld_bounce_rules_destroy(struct mlx5_vport *vport)
+{
+	struct mlx5_flow_handle *bounce_rule;
+	unsigned long i;
+
+	xa_for_each(&vport->egress.offloads.bounce_rules, i, bounce_rule) {
+		mlx5_del_flow_rules(bounce_rule);
+		xa_erase(&vport->egress.offloads.bounce_rules, i);
+	}
+}
+
+static int esw_acl_egress_ofld_fwd2vport_create(struct mlx5_eswitch *esw,
+						struct mlx5_vport *vport,
+						struct mlx5_flow_destination *fwd_dest)
+{
+	struct mlx5_flow_act flow_act = {};
+	int err = 0;
+
+	esw_debug(esw->dev, "vport(%d) configure egress acl rule fwd2vport(%d)\n",
+		  vport->vport, fwd_dest->vport.num);
+
+	/* Delete the old egress forward-to-vport rule if any */
+	esw_acl_egress_ofld_fwd2vport_destroy(vport);
+
+	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+
+	vport->egress.offloads.fwd_rule =
+		mlx5_add_flow_rules(vport->egress.acl, NULL,
+				    &flow_act, fwd_dest, 1);
+	if (IS_ERR(vport->egress.offloads.fwd_rule)) {
+		err = PTR_ERR(vport->egress.offloads.fwd_rule);
+		esw_warn(esw->dev,
+			 "vport(%d) failed to add fwd2vport acl rule err(%d)\n",
+			 vport->vport, err);
+		vport->egress.offloads.fwd_rule = NULL;
+	}
+
+	return err;
+}
+
+static int esw_acl_egress_ofld_rules_create(struct mlx5_eswitch *esw,
+					    struct mlx5_vport *vport,
+					    struct mlx5_flow_destination *fwd_dest)
+{
+	int err = 0;
+	int action;
+
+	if (MLX5_CAP_GEN(esw->dev, prio_tag_required)) {
+		/* For prio tag mode, there is only 1 FTEs:
+		 * 1) prio tag packets - pop the prio tag VLAN, allow
+		 * Unmatched traffic is allowed by default
+		 */
+		esw_debug(esw->dev,
+			  "vport[%d] configure prio tag egress rules\n", vport->vport);
+
+		action = MLX5_FLOW_CONTEXT_ACTION_VLAN_POP;
+		action |= fwd_dest ? MLX5_FLOW_CONTEXT_ACTION_FWD_DEST :
+			  MLX5_FLOW_CONTEXT_ACTION_ALLOW;
+
+		/* prio tag vlan rule - pop it so vport receives untagged packets */
+		err = esw_egress_acl_vlan_create(esw, vport, fwd_dest, 0, action);
+		if (err)
+			goto prio_err;
+	}
+
+	if (fwd_dest) {
+		err = esw_acl_egress_ofld_fwd2vport_create(esw, vport, fwd_dest);
+		if (err)
+			goto fwd_err;
+	}
+
+	return 0;
+
+fwd_err:
+	esw_acl_egress_vlan_destroy(vport);
+prio_err:
+	return err;
+}
+
+static void esw_acl_egress_ofld_rules_destroy(struct mlx5_vport *vport)
+{
+	esw_acl_egress_vlan_destroy(vport);
+	esw_acl_egress_ofld_fwd2vport_destroy(vport);
+	esw_acl_egress_ofld_bounce_rules_destroy(vport);
+}
+
+static int esw_acl_egress_ofld_fwd_grp_create(struct mlx5_eswitch *esw,
+					      struct mlx5_vport *vport)
+{
+	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
+	struct mlx5_flow_group *fwd_grp;
+	u32 *flow_group_in;
+	u32 flow_index = 0;
+	int ret = 0;
+
+	if (MLX5_CAP_GEN(esw->dev, prio_tag_required))
+		flow_index++;
+
+	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+	if (!flow_group_in)
+		return -ENOMEM;
+
+	/* This group holds 1 FTE to forward all packets to other vport
+	 * when bond vports is supported.
+	 */
+	MLX5_SET(create_flow_group_in, flow_group_in, start_flow_index, flow_index);
+	MLX5_SET(create_flow_group_in, flow_group_in, end_flow_index, flow_index);
+	fwd_grp = mlx5_create_flow_group(vport->egress.acl, flow_group_in);
+	if (IS_ERR(fwd_grp)) {
+		ret = PTR_ERR(fwd_grp);
+		esw_warn(esw->dev,
+			 "Failed to create vport[%d] egress fwd2vport flow group, err(%d)\n",
+			 vport->vport, ret);
+		goto out;
+	}
+	vport->egress.offloads.fwd_grp = fwd_grp;
+	esw_debug(esw->dev,
+		  "lazy-created fwd_grp for vport %d (flow_index=%u)\n",
+		  vport->vport, flow_index);
+
+out:
+	kvfree(flow_group_in);
+	return ret;
+}
+
+static void esw_acl_egress_ofld_groups_destroy(struct mlx5_vport *vport)
+{
+	if (!IS_ERR_OR_NULL(vport->egress.offloads.fwd_grp)) {
+		mlx5_destroy_flow_group(vport->egress.offloads.fwd_grp);
+		vport->egress.offloads.fwd_grp = NULL;
+	}
+
+	if (!IS_ERR_OR_NULL(vport->egress.offloads.bounce_grp)) {
+		mlx5_destroy_flow_group(vport->egress.offloads.bounce_grp);
+		vport->egress.offloads.bounce_grp = NULL;
+	}
+
+	esw_acl_egress_vlan_grp_destroy(vport);
+}
+
+static bool esw_acl_egress_needed(struct mlx5_eswitch *esw, u16 vport_num)
+{
+	return mlx5_eswitch_is_vf_vport(esw, vport_num) || mlx5_esw_is_sf_vport(esw, vport_num);
+}
+
+int esw_acl_egress_ofld_setup(struct mlx5_eswitch *esw, struct mlx5_vport *vport)
+{
+	int table_size = 1;
+	int err;
+
+	if (!esw_acl_egress_needed(esw, vport->vport))
+		return 0;
+
+	/* The fwd2vport FT/group is created lazily on bond events; if prio_tag
+	 * is not required, skip eager FT allocation here entirely.
+	 */
+	if (!MLX5_CAP_GEN(esw->dev, prio_tag_required))
+		return 0;
+
+	esw_acl_egress_ofld_rules_destroy(vport);
+
+	/* Reserve an extra FTE so the fwd_grp can be added lazily later. */
+	if (mlx5_esw_acl_egress_fwd2vport_supported(esw))
+		table_size++;
+	vport->egress.acl = esw_acl_table_create(esw, vport,
+						 MLX5_FLOW_NAMESPACE_ESW_EGRESS, table_size);
+	if (IS_ERR(vport->egress.acl)) {
+		err = PTR_ERR(vport->egress.acl);
+		vport->egress.acl = NULL;
+		return err;
+	}
+	vport->egress.type = VPORT_EGRESS_ACL_TYPE_DEFAULT;
+
+	err = esw_acl_egress_vlan_grp_create(esw, vport);
+	if (err)
+		goto table_err;
+
+	esw_debug(esw->dev, "vport[%d] configure egress rules\n", vport->vport);
+
+	err = esw_acl_egress_ofld_rules_create(esw, vport, NULL);
+	if (err)
+		goto vlan_grp_err;
+
+	return 0;
+
+vlan_grp_err:
+	esw_acl_egress_vlan_grp_destroy(vport);
+table_err:
+	esw_acl_egress_table_destroy(vport);
+	return err;
+}
+
+void esw_acl_egress_ofld_cleanup(struct mlx5_vport *vport)
+{
+	esw_acl_egress_ofld_rules_destroy(vport);
+	esw_acl_egress_ofld_groups_destroy(vport);
+	esw_acl_egress_table_destroy(vport);
+}
+
+/* Lazily allocate the egress ACL table and fwd_grp for a vport that is about
+ * to receive a fwd2vport rule. The table is otherwise created eagerly only
+ * when prio_tag is required.
+ */
+static int esw_acl_egress_ofld_fwd2vport_setup(struct mlx5_eswitch *esw,
+					       struct mlx5_vport *vport)
+{
+	struct mlx5_flow_table *acl = NULL;
+	int err;
+
+	if (!vport->egress.acl) {
+		acl = esw_acl_table_create(esw, vport,
+					   MLX5_FLOW_NAMESPACE_ESW_EGRESS, 1);
+		if (IS_ERR(acl))
+			return PTR_ERR(acl);
+		vport->egress.acl = acl;
+		vport->egress.type = VPORT_EGRESS_ACL_TYPE_DEFAULT;
+	}
+
+	if (vport->egress.offloads.fwd_grp)
+		return 0;
+
+	err = esw_acl_egress_ofld_fwd_grp_create(esw, vport);
+	if (err && acl)
+		esw_acl_egress_table_destroy(vport);
+	return err;
+}
+
+int mlx5_esw_acl_egress_vport_bond(struct mlx5_eswitch *esw, u16 active_vport_num,
+				   u16 passive_vport_num)
+{
+	struct mlx5_vport *passive_vport = mlx5_eswitch_get_vport(esw, passive_vport_num);
+	struct mlx5_vport *active_vport = mlx5_eswitch_get_vport(esw, active_vport_num);
+	struct mlx5_flow_destination fwd_dest = {};
+	int err;
+
+	if (IS_ERR(active_vport))
+		return PTR_ERR(active_vport);
+	if (IS_ERR(passive_vport))
+		return PTR_ERR(passive_vport);
+
+	mutex_lock(&esw->state_lock);
+
+	err = esw_acl_egress_ofld_fwd2vport_setup(esw, passive_vport);
+	if (err)
+		goto unlock;
+
+	/* Cleanup and recreate rules WITHOUT fwd2vport of active vport */
+	esw_acl_egress_ofld_rules_destroy(active_vport);
+	esw_acl_egress_ofld_rules_create(esw, active_vport, NULL);
+
+	/* Cleanup and recreate all rules + fwd2vport rule of passive vport to forward */
+	esw_acl_egress_ofld_rules_destroy(passive_vport);
+	fwd_dest.type = MLX5_FLOW_DESTINATION_TYPE_VPORT;
+	fwd_dest.vport.num = active_vport_num;
+	fwd_dest.vport.vhca_id = MLX5_CAP_GEN(esw->dev, vhca_id);
+	fwd_dest.vport.flags = MLX5_FLOW_DEST_VPORT_VHCA_ID;
+
+	err = esw_acl_egress_ofld_rules_create(esw, passive_vport, &fwd_dest);
+
+unlock:
+	mutex_unlock(&esw->state_lock);
+	return err;
+}
+
+int mlx5_esw_acl_egress_vport_unbond(struct mlx5_eswitch *esw, u16 vport_num)
+{
+	struct mlx5_vport *vport = mlx5_eswitch_get_vport(esw, vport_num);
+	int err;
+
+	if (IS_ERR(vport))
+		return PTR_ERR(vport);
+
+	mutex_lock(&esw->state_lock);
+	esw_acl_egress_ofld_rules_destroy(vport);
+	err = esw_acl_egress_ofld_rules_create(esw, vport, NULL);
+	mutex_unlock(&esw->state_lock);
+	return err;
+}

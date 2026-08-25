@@ -1,0 +1,2036 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * bpf_jit_comp64.c: eBPF JIT compiler
+ *
+ * Copyright 2016 Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+ *		  IBM Corporation
+ *
+ * Based on the powerpc classic BPF JIT compiler by Matt Evans
+ */
+#include <linux/moduleloader.h>
+#include <asm/cacheflush.h>
+#include <asm/asm-compat.h>
+#include <linux/netdevice.h>
+#include <linux/filter.h>
+#include <linux/if_vlan.h>
+#include <asm/kprobes.h>
+#include <linux/bpf.h>
+#include <asm/security_features.h>
+
+#include "bpf_jit.h"
+
+/*
+ * Stack layout with frame:
+ * Layout when setting up our own stack frame.
+ * Note: r1 at bottom, component offsets positive wrt r1.
+ * Ensure the top half (upto local_tmp_var) stays consistent
+ * with our redzone usage.
+ *
+ * tail_call_info - stores tailcall count value in main program's
+ *                  frame, stores reference to tail_call_info of
+ *                  main's frame in sub-prog's frame.
+ *
+ *		[	prev sp		] <-------------
+ *		[    tail_call_info	] 8		|
+ *		[   nv gpr save area	] (6 * 8)	|
+ *		[ addl. nv gpr save area] (12 * 8)	| <--- exception boundary/callback program
+ *		[    local_tmp_var	] 24		|
+ * fp (r31) -->	[   ebpf stack space	] upto 512	|
+ *		[     frame header	] 32/112	|
+ * sp (r1) --->	[    stack pointer	] --------------
+ *
+ * Additional (12 * 8) in 'nv gpr save area' only in case of
+ * exception boundary/callback.
+ */
+
+/* BPF non-volatile registers save area size */
+#define BPF_PPC_STACK_SAVE	(6 * 8)
+
+/* for bpf JIT code internal usage */
+#define BPF_PPC_STACK_LOCALS	24
+/*
+ * for additional non volatile registers(r14-r25) to be saved
+ * at exception boundary
+ */
+#define BPF_PPC_EXC_STACK_SAVE (12 * 8)
+
+/* stack frame excluding BPF stack, ensure this is quadword aligned */
+#define BPF_PPC_STACKFRAME	(STACK_FRAME_MIN_SIZE + \
+				 BPF_PPC_STACK_LOCALS + \
+				 BPF_PPC_STACK_SAVE   + \
+				 BPF_PPC_TAILCALL)
+
+/*
+ * same as BPF_PPC_STACKFRAME with save area for additional
+ * non volatile registers saved at exception boundary.
+ * This is quad-word aligned.
+ */
+#define BPF_PPC_EXC_STACKFRAME (BPF_PPC_STACKFRAME + BPF_PPC_EXC_STACK_SAVE)
+
+/* BPF register usage */
+#define TMP_REG_1	(MAX_BPF_JIT_REG + 0)
+#define TMP_REG_2	(MAX_BPF_JIT_REG + 1)
+#define ARENA_VM_START  (MAX_BPF_JIT_REG + 2)
+
+/* BPF to ppc register mappings */
+void bpf_jit_init_reg_mapping(struct codegen_context *ctx)
+{
+	/* function return value */
+	ctx->b2p[BPF_REG_0] = _R8;
+	/* function arguments */
+	ctx->b2p[BPF_REG_1] = _R3;
+	ctx->b2p[BPF_REG_2] = _R4;
+	ctx->b2p[BPF_REG_3] = _R5;
+	ctx->b2p[BPF_REG_4] = _R6;
+	ctx->b2p[BPF_REG_5] = _R7;
+	/* non volatile registers */
+	ctx->b2p[BPF_REG_6] = _R27;
+	ctx->b2p[BPF_REG_7] = _R28;
+	ctx->b2p[BPF_REG_8] = _R29;
+	ctx->b2p[BPF_REG_9] = _R30;
+	/* frame pointer aka BPF_REG_10 */
+	ctx->b2p[BPF_REG_FP] = _R31;
+	/* eBPF jit internal registers */
+	ctx->b2p[BPF_REG_AX] = _R12;
+	ctx->b2p[TMP_REG_1] = _R9;
+	ctx->b2p[TMP_REG_2] = _R10;
+	/* non volatile register for kern_vm_start address */
+	ctx->b2p[ARENA_VM_START] = _R26;
+}
+
+/* PPC NVR range -- update this if we ever use NVRs below r26 */
+#define BPF_PPC_NVR_MIN		_R26
+
+static inline bool bpf_has_stack_frame(struct codegen_context *ctx)
+{
+	/*
+	 * We only need a stack frame if:
+	 * - we call other functions (kernel helpers), or
+	 * - the bpf program uses its stack area
+	 * The latter condition is deduced from the usage of BPF_REG_FP
+	 *
+	 * bpf_throw() leads to exception callback from a BPF (sub)program.
+	 * The (sub)program is always marked as SEEN_FUNC, creating a stack
+	 * frame. The exception callback uses the frame of the exception
+	 * boundary, so the exception boundary program must have a frame.
+	 */
+	return ctx->seen & SEEN_FUNC ||
+	       bpf_is_seen_register(ctx, bpf_to_ppc(BPF_REG_FP)) ||
+	       ctx->exception_cb ||
+	       ctx->exception_boundary;
+}
+
+/*
+ * Stack layout with redzone:
+ * When not setting up our own stackframe, the redzone (288 bytes) usage is:
+ * Note: r1 from prev frame. Component offset negative wrt r1.
+ *
+ *		[	prev sp		] <-------------
+ *		[	  ...       	] 		|
+ * sp (r1) --->	[    stack pointer	] --------------
+ *		[    tail_call_info	] 8
+ *		[   nv gpr save area	] (6 * 8)
+ *		[ addl. nv gpr save area] (12 * 8) <--- exception boundary/callback program
+ *		[    local_tmp_var	] 24
+ *		[   unused red zone	] 224
+ *
+ * Additional (12 * 8) in 'nv gpr save area' only in case of
+ * exception boundary/callback.
+ */
+static int bpf_jit_stack_local(struct codegen_context *ctx)
+{
+	if (bpf_has_stack_frame(ctx)) {
+		/* Stack layout with frame */
+		return STACK_FRAME_MIN_SIZE + ctx->stack_size;
+	} else {
+		/* Stack layout with redzone */
+		return -(BPF_PPC_TAILCALL
+			+BPF_PPC_STACK_SAVE
+			+(ctx->exception_boundary || ctx->exception_cb ?
+						BPF_PPC_EXC_STACK_SAVE : 0)
+			+BPF_PPC_STACK_LOCALS
+			);
+	}
+}
+
+static int bpf_jit_stack_tailcallinfo_offset(struct codegen_context *ctx)
+{
+	return bpf_jit_stack_local(ctx) + BPF_PPC_STACK_LOCALS + BPF_PPC_STACK_SAVE;
+}
+
+static int bpf_jit_stack_offsetof(struct codegen_context *ctx, int reg)
+{
+	int min_valid_nvreg = BPF_PPC_NVR_MIN;
+	/* Default frame size for all cases except exception boundary */
+	int frame_nvr_size = BPF_PPC_STACKFRAME;
+
+	/* Consider all nv regs for handling exceptions */
+	if (ctx->exception_boundary || ctx->exception_cb) {
+		min_valid_nvreg = _R14;
+		frame_nvr_size = BPF_PPC_EXC_STACKFRAME;
+	}
+
+	if (reg >= min_valid_nvreg && reg < 32)
+		return (bpf_has_stack_frame(ctx) ?
+			(frame_nvr_size + ctx->stack_size) : 0)
+				- (8 * (32 - reg)) - BPF_PPC_TAILCALL;
+
+	pr_err("BPF JIT is asking about unknown registers");
+	BUG();
+}
+
+void prepare_for_fsession_fentry(u32 *image, struct codegen_context *ctx, int cookie_cnt,
+				int cookie_off, int retval_off)
+{
+	EMIT(PPC_RAW_LI(bpf_to_ppc(TMP_REG_1), 0));
+
+	for (int i = 0; i < cookie_cnt; i++)
+		EMIT(PPC_RAW_STD(bpf_to_ppc(TMP_REG_1), _R1, cookie_off + 8 * i));
+	EMIT(PPC_RAW_STD(bpf_to_ppc(TMP_REG_1), _R1, retval_off));
+}
+
+void store_func_meta(u32 *image, struct codegen_context *ctx,
+					u64 func_meta, int func_meta_off)
+{
+	/*
+	 * Store func_meta to stack at [R1 + func_meta_off] = func_meta
+	 *
+	 * func_meta :
+	 *	bit[63]: is_return flag
+	 *	byte[1]: cookie offset from ctx
+	 *	byte[0]: args count
+	 */
+	PPC_LI64(bpf_to_ppc(TMP_REG_1), func_meta);
+	EMIT(PPC_RAW_STD(bpf_to_ppc(TMP_REG_1), _R1, func_meta_off));
+}
+
+void bpf_jit_realloc_regs(struct codegen_context *ctx)
+{
+}
+
+static void emit_fp_priv_stack(u32 *image, struct codegen_context *ctx)
+{
+	PPC_LI64(bpf_to_ppc(BPF_REG_FP), (__force long)ctx->priv_sp);
+	/*
+	 * Load base percpu pointer of private stack allocation.
+	 * Runtime per-cpu address = (base + data_offset) + (guard + stack_size)
+	 */
+#ifdef CONFIG_SMP
+	/* Load percpu data offset */
+	EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_1), _R13,
+		offsetof(struct paca_struct, data_offset)));
+	EMIT(PPC_RAW_ADD(bpf_to_ppc(BPF_REG_FP),
+		bpf_to_ppc(TMP_REG_1), bpf_to_ppc(BPF_REG_FP)));
+#endif
+	EMIT(PPC_RAW_ADDI(bpf_to_ppc(BPF_REG_FP), bpf_to_ppc(BPF_REG_FP),
+			PRIV_STACK_GUARD_SZ + round_up(ctx->priv_stack_size, 16)));
+}
+
+/*
+ * For exception boundary & exception_cb progs:
+ *     return increased size to accommodate additional NVRs.
+ */
+static int bpf_jit_stack_size(struct codegen_context *ctx)
+{
+	return ctx->exception_boundary || ctx->exception_cb ?
+					BPF_PPC_EXC_STACKFRAME :
+					BPF_PPC_STACKFRAME;
+}
+
+void bpf_jit_build_prologue(u32 *image, struct codegen_context *ctx)
+{
+	int i;
+
+	/* Instruction for trampoline attach */
+	EMIT(PPC_RAW_NOP());
+
+#ifndef CONFIG_PPC_KERNEL_PCREL
+	if (IS_ENABLED(CONFIG_PPC64_ELF_ABI_V2))
+		EMIT(PPC_RAW_LD(_R2, _R13, offsetof(struct paca_struct, kernel_toc)));
+#endif
+
+	/*
+	 * Tail call count(tcc) is saved & updated only in main
+	 * program's frame and the address of tcc in main program's
+	 * frame (tcc_ptr) is saved in subprogs frame.
+	 *
+	 * Offset of tail_call_info on any frame will be interpreted
+	 * as either tcc_ptr or tcc value depending on whether it is
+	 * greater than MAX_TAIL_CALL_CNT or not.
+	 */
+	if (!ctx->is_subprog) {
+		EMIT(PPC_RAW_LI(bpf_to_ppc(TMP_REG_1), 0));
+		/* this goes in the redzone */
+		EMIT(PPC_RAW_STD(bpf_to_ppc(TMP_REG_1), _R1, -(BPF_PPC_TAILCALL)));
+	} else if (!ctx->exception_cb) {
+		/*
+		 * Tailcall jitting for non exception_cb progs only.
+		 * exception_cb won't require tail_call_info to be setup.
+		 *
+		 * tail_call_info interpretation logic:
+		 *
+		 * if tail_call_info < MAX_TAIL_CALL_CNT
+		 *      main prog calling first subprog -> copy reference
+		 * else
+		 *      subsequent subprog calling another subprog -> directly copy content
+		 */
+		EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_2), _R1, 0));
+		EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_1), bpf_to_ppc(TMP_REG_2), -(BPF_PPC_TAILCALL)));
+		EMIT(PPC_RAW_CMPLWI(bpf_to_ppc(TMP_REG_1), MAX_TAIL_CALL_CNT));
+		PPC_BCC_CONST_SHORT(COND_GT, 8);
+		EMIT(PPC_RAW_ADDI(bpf_to_ppc(TMP_REG_1), bpf_to_ppc(TMP_REG_2),
+								-(BPF_PPC_TAILCALL)));
+		EMIT(PPC_RAW_STD(bpf_to_ppc(TMP_REG_1), _R1, -(BPF_PPC_TAILCALL)));
+	}
+
+	if (bpf_has_stack_frame(ctx) && !ctx->exception_cb) {
+		/*
+		 * We need a stack frame, but we don't necessarily need to
+		 * save/restore LR unless we call other functions
+		 */
+		if (ctx->seen & SEEN_FUNC) {
+			EMIT(PPC_RAW_MFLR(_R0));
+			EMIT(PPC_RAW_STD(_R0, _R1, PPC_LR_STKOFF));
+		}
+
+		EMIT(PPC_RAW_STDU(_R1, _R1,
+				-(bpf_jit_stack_size(ctx) + ctx->stack_size)));
+	}
+
+	/*
+	 * Program acting as exception boundary pushes R14..R25 in addition to
+	 * BPF callee-saved non volatile registers. Exception callback uses
+	 * the boundary program's stack frame, recover additionally saved
+	 * registers in epilogue of exception callback.
+	 */
+	if (ctx->exception_boundary) {
+		for (i = _R14; i <= _R25; i++)
+			EMIT(PPC_RAW_STD(i, _R1, bpf_jit_stack_offsetof(ctx, i)));
+	}
+
+	if (!ctx->exception_cb) {
+		/*
+		 * Back up non-volatile regs -- BPF registers 6-10
+		 * If we haven't created our own stack frame, we save these
+		 * in the protected zone below the previous stack frame
+		 */
+		for (i = BPF_REG_6; i <= BPF_REG_10; i++)
+			if (ctx->exception_boundary || bpf_is_seen_register(ctx, bpf_to_ppc(i)))
+				EMIT(PPC_RAW_STD(bpf_to_ppc(i), _R1,
+					bpf_jit_stack_offsetof(ctx, bpf_to_ppc(i))));
+
+		if (ctx->exception_boundary || ctx->arena_vm_start)
+			EMIT(PPC_RAW_STD(bpf_to_ppc(ARENA_VM_START), _R1,
+				 bpf_jit_stack_offsetof(ctx, bpf_to_ppc(ARENA_VM_START))));
+	} else {
+		/*
+		 * Exception callback receives Frame Pointer of boundary
+		 * program(main prog) as third arg
+		 */
+		EMIT(PPC_RAW_MR(_R1, _R5));
+		/*
+		 * Exception callback reuses the stack frame of exception boundary.
+		 * But BPF stack depth of exception callback and exception boundary
+		 * don't have to be same. If BPF stack depth is different, adjust the
+		 * stack frame size considering BPF stack depth of exception callback.
+		 * The non-volatile register save area remains unchanged. These non-
+		 * volatile registers are restored in exception callback's epilogue.
+		 */
+		EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_1), _R5, 0));
+		EMIT(PPC_RAW_SUB(bpf_to_ppc(TMP_REG_2), bpf_to_ppc(TMP_REG_1), _R1));
+		EMIT(PPC_RAW_ADDI(bpf_to_ppc(TMP_REG_2), bpf_to_ppc(TMP_REG_2),
+			-BPF_PPC_EXC_STACKFRAME));
+		EMIT(PPC_RAW_CMPLDI(bpf_to_ppc(TMP_REG_2), ctx->stack_size));
+		PPC_BCC_CONST_SHORT(COND_EQ, 12);
+		EMIT(PPC_RAW_MR(_R1, bpf_to_ppc(TMP_REG_1)));
+		EMIT(PPC_RAW_STDU(_R1, _R1, -(BPF_PPC_EXC_STACKFRAME + ctx->stack_size)));
+	}
+
+	/*
+	 * Exception_cb not restricted from using stack area or arena.
+	 * Setup frame pointer to point to the bpf stack area
+	 */
+	if (bpf_is_seen_register(ctx, bpf_to_ppc(BPF_REG_FP))) {
+		if (ctx->priv_sp) {
+			/* Set up fp in private stack */
+			emit_fp_priv_stack(image, ctx);
+		} else {
+			/* Setup frame pointer to point to the bpf stack area */
+			EMIT(PPC_RAW_ADDI(bpf_to_ppc(BPF_REG_FP), _R1,
+				STACK_FRAME_MIN_SIZE + ctx->stack_size));
+		}
+	}
+
+	if (ctx->arena_vm_start)
+		PPC_LI64(bpf_to_ppc(ARENA_VM_START), ctx->arena_vm_start);
+}
+
+static void bpf_jit_emit_common_epilogue(u32 *image, struct codegen_context *ctx)
+{
+	int i;
+
+	/* Restore NVRs */
+	for (i = BPF_REG_6; i <= BPF_REG_10; i++)
+		if (ctx->exception_cb || bpf_is_seen_register(ctx, bpf_to_ppc(i)))
+			EMIT(PPC_RAW_LD(bpf_to_ppc(i), _R1, bpf_jit_stack_offsetof(ctx, bpf_to_ppc(i))));
+
+	if (ctx->exception_cb || ctx->arena_vm_start)
+		EMIT(PPC_RAW_LD(bpf_to_ppc(ARENA_VM_START), _R1,
+				bpf_jit_stack_offsetof(ctx, bpf_to_ppc(ARENA_VM_START))));
+
+	if (ctx->exception_cb) {
+		/*
+		 * Recover additionally saved non volatile registers from stack
+		 * frame of exception boundary program.
+		 */
+		for (i = _R14; i <= _R25; i++)
+			EMIT(PPC_RAW_LD(i, _R1, bpf_jit_stack_offsetof(ctx, i)));
+	}
+
+	/* Tear down our stack frame */
+	if (bpf_has_stack_frame(ctx)) {
+		EMIT(PPC_RAW_ADDI(_R1, _R1, bpf_jit_stack_size(ctx) + ctx->stack_size));
+
+		if (ctx->seen & SEEN_FUNC || ctx->exception_cb) {
+			EMIT(PPC_RAW_LD(_R0, _R1, PPC_LR_STKOFF));
+			EMIT(PPC_RAW_MTLR(_R0));
+		}
+	}
+}
+
+void bpf_jit_build_epilogue(u32 *image, struct codegen_context *ctx)
+{
+	bpf_jit_emit_common_epilogue(image, ctx);
+
+	/* Move result to r3 */
+	EMIT(PPC_RAW_MR(_R3, bpf_to_ppc(BPF_REG_0)));
+
+	EMIT(PPC_RAW_BLR());
+
+	bpf_jit_build_fentry_stubs(image, ctx);
+}
+
+/*
+ * arch_bpf_stack_walk() - BPF stack walker for PowerPC
+ *
+ * Based on arch_stack_walk() from stacktrace.c.
+ * PowerPC uses stack frames rather than stack pointers. See [1] for
+ * the equivalence between frame pointers and stack pointers.
+ * Additional reference at [2].
+ * TODO: refactor with arch_stack_walk()
+ *
+ * [1]: https://lore.kernel.org/all/20200220115141.2707-1-mpe@ellerman.id.au/
+ * [2]: https://lore.kernel.org/bpf/20260122211854.5508-5-adubey@linux.ibm.com/
+ */
+
+void arch_bpf_stack_walk(bool (*consume_fn)(void *, u64, u64, u64), void *cookie)
+{
+	// callback processing always in current context
+	unsigned long sp = current_stack_frame();
+
+	for (;;) {
+		unsigned long *stack = (unsigned long *) sp;
+		unsigned long ip;
+
+		if (!validate_sp(sp, current))
+			return;
+
+		ip = stack[STACK_FRAME_LR_SAVE];
+		if (!ip)
+			break;
+
+		/*
+		 * consume_fn common code expects stack pointer in third
+		 * argument. There is no sp in ppc64, rather pass frame
+		 * pointer(named sp here).
+		 */
+		if (ip && !consume_fn(cookie, ip, sp, sp))
+			break;
+
+		sp = stack[0];
+	}
+}
+
+static int bpf_jit_emit_func_call(u32 *image, struct codegen_context *ctx, u64 func_addr, int reg)
+{
+	long reladdr = func_addr - kernel_toc_addr();
+
+	if (reladdr > 0x7FFFFFFF || reladdr < -(0x80000000L)) {
+		pr_err("eBPF: address of %ps out of range of kernel_toc.\n", (void *)func_addr);
+		return -ERANGE;
+	}
+
+	EMIT(PPC_RAW_ADDIS(reg, _R2, PPC_HA(reladdr)));
+	EMIT(PPC_RAW_ADDI(reg, reg, PPC_LO(reladdr)));
+	EMIT(PPC_RAW_MTCTR(reg));
+	EMIT(PPC_RAW_BCTRL());
+
+	return 0;
+}
+
+int bpf_jit_emit_func_call_rel(u32 *image, u32 *fimage, struct codegen_context *ctx, u64 func)
+{
+	unsigned long func_addr = func ? ppc_function_entry((void *)func) : 0;
+
+	/* bpf to bpf call, func is not known in the initial pass. Emit 5 nops as a placeholder */
+	if (!func) {
+		for (int i = 0; i < 5; i++)
+			EMIT(PPC_RAW_NOP());
+		/* elfv1 needs an additional instruction to load addr from descriptor */
+		if (IS_ENABLED(CONFIG_PPC64_ELF_ABI_V1))
+			EMIT(PPC_RAW_NOP());
+		EMIT(PPC_RAW_MTCTR(_R12));
+		EMIT(PPC_RAW_BCTRL());
+		return 0;
+	}
+
+#ifdef CONFIG_PPC_KERNEL_PCREL
+	long reladdr;
+
+	reladdr = func_addr - local_paca->kernelbase;
+
+	/*
+	 * If fimage is NULL (the initial pass to find image size),
+	 * account for the maximum no. of instructions possible.
+	 */
+	if (!fimage) {
+		ctx->idx += 7;
+		return 0;
+	} else if (reladdr < (long)SZ_8G && reladdr >= -(long)SZ_8G) {
+		EMIT(PPC_RAW_LD(_R12, _R13, offsetof(struct paca_struct, kernelbase)));
+		/* Align for subsequent prefix instruction */
+		if (!IS_ALIGNED((unsigned long)fimage + CTX_NIA(ctx), 8))
+			EMIT(PPC_RAW_NOP());
+		/* paddi r12,r12,addr */
+		EMIT(PPC_PREFIX_MLS | __PPC_PRFX_R(0) | IMM_H18(reladdr));
+		EMIT(PPC_INST_PADDI | ___PPC_RT(_R12) | ___PPC_RA(_R12) | IMM_L(reladdr));
+	} else {
+		unsigned long pc = (unsigned long)fimage + CTX_NIA(ctx);
+		bool alignment_needed = !IS_ALIGNED(pc, 8);
+
+		reladdr = func_addr - (alignment_needed ? pc + 4 :  pc);
+
+		if (reladdr < (long)SZ_8G && reladdr >= -(long)SZ_8G) {
+			if (alignment_needed)
+				EMIT(PPC_RAW_NOP());
+			/* pla r12,addr */
+			EMIT(PPC_PREFIX_MLS | __PPC_PRFX_R(1) | IMM_H18(reladdr));
+			EMIT(PPC_INST_PADDI | ___PPC_RT(_R12) | IMM_L(reladdr));
+		} else {
+			/* We can clobber r12 */
+			PPC_LI64(_R12, func);
+		}
+	}
+	EMIT(PPC_RAW_MTCTR(_R12));
+	EMIT(PPC_RAW_BCTRL());
+#else
+	if (core_kernel_text(func_addr)) {
+		int ret = bpf_jit_emit_func_call(image, ctx, func_addr, _R12);
+		if (ret)
+			return ret;
+	} else {
+		if (IS_ENABLED(CONFIG_PPC64_ELF_ABI_V1)) {
+			/* func points to the function descriptor */
+			PPC_LI64(bpf_to_ppc(TMP_REG_2), func);
+			/* Load actual entry point from function descriptor */
+			EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_1), bpf_to_ppc(TMP_REG_2), 0));
+			/* ... and move it to CTR */
+			EMIT(PPC_RAW_MTCTR(bpf_to_ppc(TMP_REG_1)));
+			/*
+			 * Load TOC from function descriptor at offset 8.
+			 * We can clobber r2 since we get called through a
+			 * function pointer (so caller will save/restore r2).
+			 */
+			if (is_module_text_address(func_addr))
+				EMIT(PPC_RAW_LD(_R2, bpf_to_ppc(TMP_REG_2), 8));
+		} else {
+			PPC_LI64(_R12, func);
+			EMIT(PPC_RAW_MTCTR(_R12));
+		}
+		EMIT(PPC_RAW_BCTRL());
+		/*
+		 * Load r2 with kernel TOC as kernel TOC is used if function address falls
+		 * within core kernel text.
+		 */
+		if (is_module_text_address(func_addr))
+			EMIT(PPC_RAW_LD(_R2, _R13, offsetof(struct paca_struct, kernel_toc)));
+	}
+#endif
+
+	return 0;
+}
+
+static int zero_extend(u32 *image, struct codegen_context *ctx, u32 src_reg, u32 dst_reg, u32 size)
+{
+	switch (size) {
+	case 1:
+		 /* zero-extend 8 bits into 64 bits */
+		EMIT(PPC_RAW_RLDICL(dst_reg, src_reg, 0, 56));
+		return 0;
+	case 2:
+		 /* zero-extend 16 bits into 64 bits */
+		EMIT(PPC_RAW_RLDICL(dst_reg, src_reg, 0, 48));
+		return 0;
+	case 4:
+		 /* zero-extend 32 bits into 64 bits */
+		EMIT(PPC_RAW_RLDICL(dst_reg, src_reg, 0, 32));
+		fallthrough;
+	case 8:
+		/* Nothing to do */
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+static int sign_extend(u32 *image, struct codegen_context *ctx, u32 src_reg, u32 dst_reg, u32 size)
+{
+	switch (size) {
+	case 1:
+		 /* sign-extend 8 bits into 64 bits */
+		EMIT(PPC_RAW_EXTSB(dst_reg, src_reg));
+		return 0;
+	case 2:
+		 /* sign-extend 16 bits into 64 bits */
+		EMIT(PPC_RAW_EXTSH(dst_reg, src_reg));
+		return 0;
+	case 4:
+		 /* sign-extend 32 bits into 64 bits */
+		EMIT(PPC_RAW_EXTSW(dst_reg, src_reg));
+		fallthrough;
+	case 8:
+		/* Nothing to do */
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+/*
+ * Handle powerpc ABI expectations from caller:
+ *   - Unsigned arguments are zero-extended.
+ *   - Signed arguments are sign-extended.
+ */
+static int prepare_for_kfunc_call(const struct bpf_prog *fp, u32 *image,
+				  struct codegen_context *ctx,
+				  const struct bpf_insn *insn)
+{
+	const struct btf_func_model *m = bpf_jit_find_kfunc_model(fp, insn);
+	int i;
+
+	if (!m)
+		return -1;
+
+	for (i = 0; i < m->nr_args; i++) {
+		/* Note that BPF ABI only allows up to 5 args for kfuncs */
+		u32 reg = bpf_to_ppc(BPF_REG_1 + i), size = m->arg_size[i];
+
+		if (!(m->arg_flags[i] & BTF_FMODEL_SIGNED_ARG)) {
+			if (zero_extend(image, ctx, reg, reg, size))
+				return -1;
+		} else {
+			if (sign_extend(image, ctx, reg, reg, size))
+				return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int bpf_jit_emit_tail_call(u32 *image, struct codegen_context *ctx, u32 out)
+{
+	/*
+	 * By now, the eBPF program has already setup parameters in r3, r4 and r5
+	 * r3/BPF_REG_1 - pointer to ctx -- passed as is to the next bpf program
+	 * r4/BPF_REG_2 - pointer to bpf_array
+	 * r5/BPF_REG_3 - index in bpf_array
+	 */
+	int b2p_bpf_array = bpf_to_ppc(BPF_REG_2);
+	int b2p_index = bpf_to_ppc(BPF_REG_3);
+	int bpf_tailcall_prologue_size = 12;
+
+	if (!IS_ENABLED(CONFIG_PPC_KERNEL_PCREL) && IS_ENABLED(CONFIG_PPC64_ELF_ABI_V2))
+		bpf_tailcall_prologue_size += 4; /* skip past the toc load */
+
+	/*
+	 * if (index >= array->map.max_entries)
+	 *   goto out;
+	 */
+	EMIT(PPC_RAW_LWZ(bpf_to_ppc(TMP_REG_1), b2p_bpf_array, offsetof(struct bpf_array, map.max_entries)));
+	EMIT(PPC_RAW_RLWINM(b2p_index, b2p_index, 0, 0, 31));
+	EMIT(PPC_RAW_CMPLW(b2p_index, bpf_to_ppc(TMP_REG_1)));
+	PPC_BCC_SHORT(COND_GE, out);
+
+	EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_1), _R1, bpf_jit_stack_tailcallinfo_offset(ctx)));
+	EMIT(PPC_RAW_CMPLWI(bpf_to_ppc(TMP_REG_1), MAX_TAIL_CALL_CNT));
+	PPC_BCC_CONST_SHORT(COND_LE, 8);
+
+	/* dereference TMP_REG_1 */
+	EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_1), bpf_to_ppc(TMP_REG_1), 0));
+
+	/*
+	 * if (tail_call_info == MAX_TAIL_CALL_CNT)
+	 *   goto out;
+	 */
+	EMIT(PPC_RAW_CMPLWI(bpf_to_ppc(TMP_REG_1), MAX_TAIL_CALL_CNT));
+	PPC_BCC_SHORT(COND_EQ, out);
+
+	/*
+	 * tail_call_info++; <- Actual value of tcc here
+	 * Writeback this updated value only if tailcall succeeds.
+	 */
+	EMIT(PPC_RAW_ADDI(bpf_to_ppc(TMP_REG_1), bpf_to_ppc(TMP_REG_1), 1));
+
+	/* prog = array->ptrs[index]; */
+	EMIT(PPC_RAW_MULI(bpf_to_ppc(TMP_REG_2), b2p_index, 8));
+	EMIT(PPC_RAW_ADD(bpf_to_ppc(TMP_REG_2), bpf_to_ppc(TMP_REG_2), b2p_bpf_array));
+	EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_2), bpf_to_ppc(TMP_REG_2),
+			offsetof(struct bpf_array, ptrs)));
+
+	/*
+	 * if (prog == NULL)
+	 *   goto out;
+	 */
+	EMIT(PPC_RAW_CMPLDI(bpf_to_ppc(TMP_REG_2), 0));
+	PPC_BCC_SHORT(COND_EQ, out);
+
+	/* goto *(prog->bpf_func + prologue_size); */
+	EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_2), bpf_to_ppc(TMP_REG_2),
+			offsetof(struct bpf_prog, bpf_func)));
+	EMIT(PPC_RAW_ADDI(bpf_to_ppc(TMP_REG_2), bpf_to_ppc(TMP_REG_2),
+			  FUNCTION_DESCR_SIZE + bpf_tailcall_prologue_size));
+	EMIT(PPC_RAW_MTCTR(bpf_to_ppc(TMP_REG_2)));
+
+	/*
+	 * Before writing updated tail_call_info, distinguish if current frame
+	 * is storing a reference to tail_call_info or actual tcc value in
+	 * tail_call_info.
+	 */
+	EMIT(PPC_RAW_LD(bpf_to_ppc(TMP_REG_2), _R1, bpf_jit_stack_tailcallinfo_offset(ctx)));
+	EMIT(PPC_RAW_CMPLWI(bpf_to_ppc(TMP_REG_2), MAX_TAIL_CALL_CNT));
+	PPC_BCC_CONST_SHORT(COND_GT, 8);
+
+	/* First get address of tail_call_info */
+	EMIT(PPC_RAW_ADDI(bpf_to_ppc(TMP_REG_2), _R1, bpf_jit_stack_tailcallinfo_offset(ctx)));
+	/* Writeback updated value to tail_call_info */
+	EMIT(PPC_RAW_STD(bpf_to_ppc(TMP_REG_1), bpf_to_ppc(TMP_REG_2), 0));
+
+	/* tear down stack, restore NVRs, ... */
+	bpf_jit_emit_common_epilogue(image, ctx);
+
+	EMIT(PPC_RAW_BCTR());
+
+	/* out: */
+	return 0;
+}
+
+bool bpf_jit_bypass_spec_v1(void)
+{
+#if defined(CONFIG_PPC_E500) || defined(CONFIG_PPC_BOOK3S_64)
+	return !(security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
+		 security_ftr_enabled(SEC_FTR_BNDS_CHK_SPEC_BAR));
+#else
+	return true;
+#endif
+}
+
+bool bpf_jit_bypass_spec_v4(void)
+{
+	return !(security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
+		 security_ftr_enabled(SEC_FTR_STF_BARRIER) &&
+		 stf_barrier_type_get() != STF_BARRIER_NONE);
+}
+
+/*
+ * We spill into the redzone always, even if the bpf program has its own stackframe.
+ * Offsets hardcoded based on BPF_PPC_STACK_SAVE -- see bpf_jit_stack_local()
+ */
+void bpf_stf_barrier(void);
+
+asm (
+"		.global bpf_stf_barrier		;"
+"	bpf_stf_barrier:			;"
+"		std	21,-80(1)		;"
+"		std	22,-72(1)		;"
+"		sync				;"
+"		ld	21,-80(1)		;"
+"		ld	22,-72(1)		;"
+"		ori	31,31,0			;"
+"		.rept 14			;"
+"		b	1f			;"
+"	1:					;"
+"		.endr				;"
+"		blr				;"
+);
+
+static int bpf_jit_emit_atomic_ops(u32 *image, struct codegen_context *ctx,
+				   const struct bpf_insn *insn, u32 *jmp_off,
+				   u32 *tmp_idx, u32 *addrp)
+{
+	u32 tmp1_reg = bpf_to_ppc(TMP_REG_1);
+	u32 tmp2_reg = bpf_to_ppc(TMP_REG_2);
+	u32 size = BPF_SIZE(insn->code);
+	u32 src_reg = bpf_to_ppc(insn->src_reg);
+	u32 dst_reg = bpf_to_ppc(insn->dst_reg);
+	s32 imm = insn->imm;
+
+	u32 save_reg = tmp2_reg;
+	u32 ret_reg = src_reg;
+	u32 fixup_idx;
+
+	/* Get offset into TMP_REG_1 */
+	EMIT(PPC_RAW_LI(tmp1_reg, insn->off));
+       /*
+	* Enforce full ordering for operations with BPF_FETCH by emitting a 'sync'
+	* before and after the operation.
+	*
+	* This is a requirement in the Linux Kernel Memory Model.
+	* See __cmpxchg_u64() in asm/cmpxchg.h as an example.
+	*/
+	if ((imm & BPF_FETCH) && IS_ENABLED(CONFIG_SMP))
+		EMIT(PPC_RAW_SYNC());
+
+	*tmp_idx = ctx->idx;
+
+	/* load value from memory into TMP_REG_2 */
+	if (size == BPF_DW)
+		EMIT(PPC_RAW_LDARX(tmp2_reg, tmp1_reg, dst_reg, 0));
+	else
+		EMIT(PPC_RAW_LWARX(tmp2_reg, tmp1_reg, dst_reg, 0));
+	/* Save old value in _R0 */
+	if (imm & BPF_FETCH)
+		EMIT(PPC_RAW_MR(_R0, tmp2_reg));
+
+	switch (imm) {
+	case BPF_ADD:
+	case BPF_ADD | BPF_FETCH:
+		EMIT(PPC_RAW_ADD(tmp2_reg, tmp2_reg, src_reg));
+		break;
+	case BPF_AND:
+	case BPF_AND | BPF_FETCH:
+		EMIT(PPC_RAW_AND(tmp2_reg, tmp2_reg, src_reg));
+		break;
+	case BPF_OR:
+	case BPF_OR | BPF_FETCH:
+		EMIT(PPC_RAW_OR(tmp2_reg, tmp2_reg, src_reg));
+		break;
+	case BPF_XOR:
+	case BPF_XOR | BPF_FETCH:
+		EMIT(PPC_RAW_XOR(tmp2_reg, tmp2_reg, src_reg));
+		break;
+	case BPF_CMPXCHG:
+	       /*
+		* Return old value in BPF_REG_0 for BPF_CMPXCHG &
+		* in src_reg for other cases.
+		*/
+		ret_reg = bpf_to_ppc(BPF_REG_0);
+
+		/* Compare with old value in BPF_R0 */
+		if (size == BPF_DW)
+			EMIT(PPC_RAW_CMPD(bpf_to_ppc(BPF_REG_0), tmp2_reg));
+		else
+			EMIT(PPC_RAW_CMPW(bpf_to_ppc(BPF_REG_0), tmp2_reg));
+		/* Don't set if different from old value */
+		PPC_BCC_SHORT(COND_NE, (ctx->idx + 3) * 4);
+		fallthrough;
+	case BPF_XCHG:
+		save_reg = src_reg;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	/* store new value */
+	if (size == BPF_DW)
+		EMIT(PPC_RAW_STDCX(save_reg, tmp1_reg, dst_reg));
+	else
+		EMIT(PPC_RAW_STWCX(save_reg, tmp1_reg, dst_reg));
+	/* we're done if this succeeded */
+	PPC_BCC_SHORT(COND_NE, *tmp_idx * 4);
+	fixup_idx = ctx->idx;
+
+	if (imm & BPF_FETCH) {
+		/* Emit 'sync' to enforce full ordering */
+		if (IS_ENABLED(CONFIG_SMP))
+			EMIT(PPC_RAW_SYNC());
+		EMIT(PPC_RAW_MR(ret_reg, _R0));
+		/*
+		 * Skip unnecessary zero-extension for 32-bit cmpxchg.
+		 * For context, see commit 39491867ace5.
+		 */
+		if (size != BPF_DW && imm == BPF_CMPXCHG &&
+		    insn_is_zext(insn + 1))
+			*addrp = ctx->idx * 4;
+	}
+
+	*jmp_off = (fixup_idx - *tmp_idx) * 4;
+
+	return 0;
+}
+
+static int bpf_jit_emit_probe_mem_store(struct codegen_context *ctx, u32 src_reg, s16 off,
+					u32 code, u32 *image)
+{
+	u32 tmp1_reg = bpf_to_ppc(TMP_REG_1);
+	u32 tmp2_reg = bpf_to_ppc(TMP_REG_2);
+
+	switch (BPF_SIZE(code)) {
+	case BPF_B:
+		EMIT(PPC_RAW_STB(src_reg, tmp1_reg, off));
+		break;
+	case BPF_H:
+		EMIT(PPC_RAW_STH(src_reg, tmp1_reg, off));
+		break;
+	case BPF_W:
+		EMIT(PPC_RAW_STW(src_reg, tmp1_reg, off));
+		break;
+	case BPF_DW:
+		if (off % 4) {
+			EMIT(PPC_RAW_LI(tmp2_reg, off));
+			EMIT(PPC_RAW_STDX(src_reg, tmp1_reg, tmp2_reg));
+		} else {
+			EMIT(PPC_RAW_STD(src_reg, tmp1_reg, off));
+		}
+		break;
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static int emit_atomic_ld_st(const struct bpf_insn insn, struct codegen_context *ctx, u32 *image)
+{
+	u32 code = insn.code;
+	u32 dst_reg = bpf_to_ppc(insn.dst_reg);
+	u32 src_reg = bpf_to_ppc(insn.src_reg);
+	u32 size = BPF_SIZE(code);
+	u32 tmp1_reg = bpf_to_ppc(TMP_REG_1);
+	u32 tmp2_reg = bpf_to_ppc(TMP_REG_2);
+	s16 off = insn.off;
+	s32 imm = insn.imm;
+
+	switch (imm) {
+	case BPF_LOAD_ACQ:
+		switch (size) {
+		case BPF_B:
+			EMIT(PPC_RAW_LBZ(dst_reg, src_reg, off));
+			break;
+		case BPF_H:
+			EMIT(PPC_RAW_LHZ(dst_reg, src_reg, off));
+			break;
+		case BPF_W:
+			EMIT(PPC_RAW_LWZ(dst_reg, src_reg, off));
+			break;
+		case BPF_DW:
+			if (off % 4) {
+				EMIT(PPC_RAW_LI(tmp1_reg, off));
+				EMIT(PPC_RAW_LDX(dst_reg, src_reg, tmp1_reg));
+			} else {
+				EMIT(PPC_RAW_LD(dst_reg, src_reg, off));
+			}
+			break;
+		}
+		EMIT(PPC_RAW_LWSYNC());
+		break;
+	case BPF_STORE_REL:
+		EMIT(PPC_RAW_LWSYNC());
+		switch (size) {
+		case BPF_B:
+			EMIT(PPC_RAW_STB(src_reg, dst_reg, off));
+			break;
+		case BPF_H:
+			EMIT(PPC_RAW_STH(src_reg, dst_reg, off));
+			break;
+		case BPF_W:
+			EMIT(PPC_RAW_STW(src_reg, dst_reg, off));
+			break;
+		case BPF_DW:
+			if (off % 4) {
+				EMIT(PPC_RAW_LI(tmp2_reg, off));
+				EMIT(PPC_RAW_STDX(src_reg, dst_reg, tmp2_reg));
+			} else {
+				EMIT(PPC_RAW_STD(src_reg, dst_reg, off));
+			}
+			break;
+		}
+		break;
+	default:
+		pr_err_ratelimited("unexpected atomic load/store op code %02x\n",
+				   imm);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Assemble the body code between the prologue & epilogue */
+int bpf_jit_build_body(struct bpf_prog *fp, u32 *image, u32 *fimage, struct codegen_context *ctx,
+		       u32 *addrs, int pass, bool extra_pass)
+{
+	enum stf_barrier_type stf_barrier = stf_barrier_type_get();
+	bool sync_emitted, ori31_emitted;
+	const struct bpf_insn *insn = fp->insnsi;
+	int flen = fp->len;
+	int i, ret;
+
+	/* Start of epilogue code - will only be valid 2nd pass onwards */
+	u32 exit_addr = addrs[flen];
+
+	for (i = 0; i < flen; i++) {
+		u32 code = insn[i].code;
+		u32 dst_reg = bpf_to_ppc(insn[i].dst_reg);
+		u32 src_reg = bpf_to_ppc(insn[i].src_reg);
+		u32 size = BPF_SIZE(code);
+		u32 tmp1_reg = bpf_to_ppc(TMP_REG_1);
+		u32 tmp2_reg = bpf_to_ppc(TMP_REG_2);
+		s16 off = insn[i].off;
+		s32 imm = insn[i].imm;
+		bool func_addr_fixed;
+		u64 func_addr;
+		u64 imm64;
+		u32 true_cond;
+		u32 tmp_idx;
+		u32 jmp_off;
+
+		/*
+		 * addrs[] maps a BPF bytecode address into a real offset from
+		 * the start of the body code.
+		 */
+		addrs[i] = ctx->idx * 4;
+
+		/*
+		 * As an optimization, we note down which non-volatile registers
+		 * are used so that we can only save/restore those in our
+		 * prologue and epilogue. We do this here regardless of whether
+		 * the actual BPF instruction uses src/dst registers or not
+		 * (for instance, BPF_CALL does not use them). The expectation
+		 * is that those instructions will have src_reg/dst_reg set to
+		 * 0. Even otherwise, we just lose some prologue/epilogue
+		 * optimization but everything else should work without
+		 * any issues.
+		 */
+		if (dst_reg >= BPF_PPC_NVR_MIN && dst_reg < 32)
+			bpf_set_seen_register(ctx, dst_reg);
+		if (src_reg >= BPF_PPC_NVR_MIN && src_reg < 32)
+			bpf_set_seen_register(ctx, src_reg);
+
+		switch (code) {
+		/*
+		 * Arithmetic operations: ADD/SUB/MUL/DIV/MOD/NEG
+		 */
+		case BPF_ALU | BPF_ADD | BPF_X: /* (u32) dst += (u32) src */
+		case BPF_ALU64 | BPF_ADD | BPF_X: /* dst += src */
+			EMIT(PPC_RAW_ADD(dst_reg, dst_reg, src_reg));
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_SUB | BPF_X: /* (u32) dst -= (u32) src */
+		case BPF_ALU64 | BPF_SUB | BPF_X: /* dst -= src */
+			EMIT(PPC_RAW_SUB(dst_reg, dst_reg, src_reg));
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_ADD | BPF_K: /* (u32) dst += (u32) imm */
+		case BPF_ALU64 | BPF_ADD | BPF_K: /* dst += imm */
+			if (!imm) {
+				goto bpf_alu32_trunc;
+			} else if (imm >= -32768 && imm < 32768) {
+				EMIT(PPC_RAW_ADDI(dst_reg, dst_reg, IMM_L(imm)));
+			} else {
+				PPC_LI32(tmp1_reg, imm);
+				EMIT(PPC_RAW_ADD(dst_reg, dst_reg, tmp1_reg));
+			}
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_SUB | BPF_K: /* (u32) dst -= (u32) imm */
+		case BPF_ALU64 | BPF_SUB | BPF_K: /* dst -= imm */
+			if (!imm) {
+				goto bpf_alu32_trunc;
+			} else if (imm > -32768 && imm <= 32768) {
+				EMIT(PPC_RAW_ADDI(dst_reg, dst_reg, IMM_L(-imm)));
+			} else {
+				PPC_LI32(tmp1_reg, imm);
+				EMIT(PPC_RAW_SUB(dst_reg, dst_reg, tmp1_reg));
+			}
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_MUL | BPF_X: /* (u32) dst *= (u32) src */
+		case BPF_ALU64 | BPF_MUL | BPF_X: /* dst *= src */
+			if (BPF_CLASS(code) == BPF_ALU)
+				EMIT(PPC_RAW_MULW(dst_reg, dst_reg, src_reg));
+			else
+				EMIT(PPC_RAW_MULD(dst_reg, dst_reg, src_reg));
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_MUL | BPF_K: /* (u32) dst *= (u32) imm */
+		case BPF_ALU64 | BPF_MUL | BPF_K: /* dst *= imm */
+			if (imm >= -32768 && imm < 32768)
+				EMIT(PPC_RAW_MULI(dst_reg, dst_reg, IMM_L(imm)));
+			else {
+				PPC_LI32(tmp1_reg, imm);
+				if (BPF_CLASS(code) == BPF_ALU)
+					EMIT(PPC_RAW_MULW(dst_reg, dst_reg, tmp1_reg));
+				else
+					EMIT(PPC_RAW_MULD(dst_reg, dst_reg, tmp1_reg));
+			}
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_DIV | BPF_X: /* (u32) dst /= (u32) src */
+		case BPF_ALU | BPF_MOD | BPF_X: /* (u32) dst %= (u32) src */
+			if (BPF_OP(code) == BPF_MOD) {
+				if (off)
+					EMIT(PPC_RAW_DIVW(tmp1_reg, dst_reg, src_reg));
+				else
+					EMIT(PPC_RAW_DIVWU(tmp1_reg, dst_reg, src_reg));
+
+				EMIT(PPC_RAW_MULW(tmp1_reg, src_reg, tmp1_reg));
+				EMIT(PPC_RAW_SUB(dst_reg, dst_reg, tmp1_reg));
+			} else
+				if (off)
+					EMIT(PPC_RAW_DIVW(dst_reg, dst_reg, src_reg));
+				else
+					EMIT(PPC_RAW_DIVWU(dst_reg, dst_reg, src_reg));
+			goto bpf_alu32_trunc;
+		case BPF_ALU64 | BPF_DIV | BPF_X: /* dst /= src */
+		case BPF_ALU64 | BPF_MOD | BPF_X: /* dst %= src */
+			if (BPF_OP(code) == BPF_MOD) {
+				if (off)
+					EMIT(PPC_RAW_DIVD(tmp1_reg, dst_reg, src_reg));
+				else
+					EMIT(PPC_RAW_DIVDU(tmp1_reg, dst_reg, src_reg));
+				EMIT(PPC_RAW_MULD(tmp1_reg, src_reg, tmp1_reg));
+				EMIT(PPC_RAW_SUB(dst_reg, dst_reg, tmp1_reg));
+			} else
+				if (off)
+					EMIT(PPC_RAW_DIVD(dst_reg, dst_reg, src_reg));
+				else
+					EMIT(PPC_RAW_DIVDU(dst_reg, dst_reg, src_reg));
+			break;
+		case BPF_ALU | BPF_MOD | BPF_K: /* (u32) dst %= (u32) imm */
+		case BPF_ALU | BPF_DIV | BPF_K: /* (u32) dst /= (u32) imm */
+		case BPF_ALU64 | BPF_MOD | BPF_K: /* dst %= imm */
+		case BPF_ALU64 | BPF_DIV | BPF_K: /* dst /= imm */
+			if (imm == 0)
+				return -EINVAL;
+			if (imm == 1) {
+				if (BPF_OP(code) == BPF_DIV) {
+					goto bpf_alu32_trunc;
+				} else {
+					EMIT(PPC_RAW_LI(dst_reg, 0));
+					break;
+				}
+			}
+
+			PPC_LI32(tmp1_reg, imm);
+			switch (BPF_CLASS(code)) {
+			case BPF_ALU:
+				if (BPF_OP(code) == BPF_MOD) {
+					if (off)
+						EMIT(PPC_RAW_DIVW(tmp2_reg, dst_reg, tmp1_reg));
+					else
+						EMIT(PPC_RAW_DIVWU(tmp2_reg, dst_reg, tmp1_reg));
+					EMIT(PPC_RAW_MULW(tmp1_reg, tmp1_reg, tmp2_reg));
+					EMIT(PPC_RAW_SUB(dst_reg, dst_reg, tmp1_reg));
+				} else
+					if (off)
+						EMIT(PPC_RAW_DIVW(dst_reg, dst_reg, tmp1_reg));
+					else
+						EMIT(PPC_RAW_DIVWU(dst_reg, dst_reg, tmp1_reg));
+				break;
+			case BPF_ALU64:
+				if (BPF_OP(code) == BPF_MOD) {
+					if (off)
+						EMIT(PPC_RAW_DIVD(tmp2_reg, dst_reg, tmp1_reg));
+					else
+						EMIT(PPC_RAW_DIVDU(tmp2_reg, dst_reg, tmp1_reg));
+					EMIT(PPC_RAW_MULD(tmp1_reg, tmp1_reg, tmp2_reg));
+					EMIT(PPC_RAW_SUB(dst_reg, dst_reg, tmp1_reg));
+				} else
+					if (off)
+						EMIT(PPC_RAW_DIVD(dst_reg, dst_reg, tmp1_reg));
+					else
+						EMIT(PPC_RAW_DIVDU(dst_reg, dst_reg, tmp1_reg));
+				break;
+			}
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_NEG: /* (u32) dst = -dst */
+		case BPF_ALU64 | BPF_NEG: /* dst = -dst */
+			EMIT(PPC_RAW_NEG(dst_reg, dst_reg));
+			goto bpf_alu32_trunc;
+
+		/*
+		 * Logical operations: AND/OR/XOR/[A]LSH/[A]RSH
+		 */
+		case BPF_ALU | BPF_AND | BPF_X: /* (u32) dst = dst & src */
+		case BPF_ALU64 | BPF_AND | BPF_X: /* dst = dst & src */
+			EMIT(PPC_RAW_AND(dst_reg, dst_reg, src_reg));
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_AND | BPF_K: /* (u32) dst = dst & imm */
+		case BPF_ALU64 | BPF_AND | BPF_K: /* dst = dst & imm */
+			if (!IMM_H(imm))
+				EMIT(PPC_RAW_ANDI(dst_reg, dst_reg, IMM_L(imm)));
+			else {
+				/* Sign-extended */
+				PPC_LI32(tmp1_reg, imm);
+				EMIT(PPC_RAW_AND(dst_reg, dst_reg, tmp1_reg));
+			}
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_OR | BPF_X: /* dst = (u32) dst | (u32) src */
+		case BPF_ALU64 | BPF_OR | BPF_X: /* dst = dst | src */
+			EMIT(PPC_RAW_OR(dst_reg, dst_reg, src_reg));
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_OR | BPF_K:/* dst = (u32) dst | (u32) imm */
+		case BPF_ALU64 | BPF_OR | BPF_K:/* dst = dst | imm */
+			if (imm < 0 && BPF_CLASS(code) == BPF_ALU64) {
+				/* Sign-extended */
+				PPC_LI32(tmp1_reg, imm);
+				EMIT(PPC_RAW_OR(dst_reg, dst_reg, tmp1_reg));
+			} else {
+				if (IMM_L(imm))
+					EMIT(PPC_RAW_ORI(dst_reg, dst_reg, IMM_L(imm)));
+				if (IMM_H(imm))
+					EMIT(PPC_RAW_ORIS(dst_reg, dst_reg, IMM_H(imm)));
+			}
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_XOR | BPF_X: /* (u32) dst ^= src */
+		case BPF_ALU64 | BPF_XOR | BPF_X: /* dst ^= src */
+			EMIT(PPC_RAW_XOR(dst_reg, dst_reg, src_reg));
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_XOR | BPF_K: /* (u32) dst ^= (u32) imm */
+		case BPF_ALU64 | BPF_XOR | BPF_K: /* dst ^= imm */
+			if (imm < 0 && BPF_CLASS(code) == BPF_ALU64) {
+				/* Sign-extended */
+				PPC_LI32(tmp1_reg, imm);
+				EMIT(PPC_RAW_XOR(dst_reg, dst_reg, tmp1_reg));
+			} else {
+				if (IMM_L(imm))
+					EMIT(PPC_RAW_XORI(dst_reg, dst_reg, IMM_L(imm)));
+				if (IMM_H(imm))
+					EMIT(PPC_RAW_XORIS(dst_reg, dst_reg, IMM_H(imm)));
+			}
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_LSH | BPF_X: /* (u32) dst <<= (u32) src */
+			/* slw clears top 32 bits */
+			EMIT(PPC_RAW_SLW(dst_reg, dst_reg, src_reg));
+			/* skip zero extension move, but set address map. */
+			if (insn_is_zext(&insn[i + 1]))
+				addrs[++i] = ctx->idx * 4;
+			break;
+		case BPF_ALU64 | BPF_LSH | BPF_X: /* dst <<= src; */
+			EMIT(PPC_RAW_SLD(dst_reg, dst_reg, src_reg));
+			break;
+		case BPF_ALU | BPF_LSH | BPF_K: /* (u32) dst <<== (u32) imm */
+			/* with imm 0, we still need to clear top 32 bits */
+			EMIT(PPC_RAW_SLWI(dst_reg, dst_reg, imm));
+			if (insn_is_zext(&insn[i + 1]))
+				addrs[++i] = ctx->idx * 4;
+			break;
+		case BPF_ALU64 | BPF_LSH | BPF_K: /* dst <<== imm */
+			if (imm != 0)
+				EMIT(PPC_RAW_SLDI(dst_reg, dst_reg, imm));
+			break;
+		case BPF_ALU | BPF_RSH | BPF_X: /* (u32) dst >>= (u32) src */
+			EMIT(PPC_RAW_SRW(dst_reg, dst_reg, src_reg));
+			if (insn_is_zext(&insn[i + 1]))
+				addrs[++i] = ctx->idx * 4;
+			break;
+		case BPF_ALU64 | BPF_RSH | BPF_X: /* dst >>= src */
+			EMIT(PPC_RAW_SRD(dst_reg, dst_reg, src_reg));
+			break;
+		case BPF_ALU | BPF_RSH | BPF_K: /* (u32) dst >>= (u32) imm */
+			EMIT(PPC_RAW_SRWI(dst_reg, dst_reg, imm));
+			if (insn_is_zext(&insn[i + 1]))
+				addrs[++i] = ctx->idx * 4;
+			break;
+		case BPF_ALU64 | BPF_RSH | BPF_K: /* dst >>= imm */
+			if (imm != 0)
+				EMIT(PPC_RAW_SRDI(dst_reg, dst_reg, imm));
+			break;
+		case BPF_ALU | BPF_ARSH | BPF_X: /* (s32) dst >>= src */
+			EMIT(PPC_RAW_SRAW(dst_reg, dst_reg, src_reg));
+			goto bpf_alu32_trunc;
+		case BPF_ALU64 | BPF_ARSH | BPF_X: /* (s64) dst >>= src */
+			EMIT(PPC_RAW_SRAD(dst_reg, dst_reg, src_reg));
+			break;
+		case BPF_ALU | BPF_ARSH | BPF_K: /* (s32) dst >>= imm */
+			EMIT(PPC_RAW_SRAWI(dst_reg, dst_reg, imm));
+			goto bpf_alu32_trunc;
+		case BPF_ALU64 | BPF_ARSH | BPF_K: /* (s64) dst >>= imm */
+			if (imm != 0)
+				EMIT(PPC_RAW_SRADI(dst_reg, dst_reg, imm));
+			break;
+
+		/*
+		 * MOV
+		 */
+		case BPF_ALU | BPF_MOV | BPF_X: /* (u32) dst = src */
+		case BPF_ALU64 | BPF_MOV | BPF_X: /* dst = src */
+
+			if (insn_is_mov_percpu_addr(&insn[i])) {
+				if (IS_ENABLED(CONFIG_SMP)) {
+					EMIT(PPC_RAW_LD(tmp1_reg, _R13, offsetof(struct paca_struct, data_offset)));
+					EMIT(PPC_RAW_ADD(dst_reg, src_reg, tmp1_reg));
+				} else if (src_reg != dst_reg) {
+					EMIT(PPC_RAW_MR(dst_reg, src_reg));
+				}
+				break;
+			}
+
+			if (insn_is_cast_user(&insn[i])) {
+				EMIT(PPC_RAW_RLDICL_DOT(tmp1_reg, src_reg, 0, 32));
+				PPC_LI64(dst_reg, (ctx->user_vm_start & 0xffffffff00000000UL));
+				PPC_BCC_SHORT(COND_EQ, (ctx->idx + 2) * 4);
+				EMIT(PPC_RAW_OR(tmp1_reg, dst_reg, tmp1_reg));
+				EMIT(PPC_RAW_MR(dst_reg, tmp1_reg));
+				break;
+			}
+
+			if (imm == 1) {
+				/* special mov32 for zext */
+				EMIT(PPC_RAW_RLWINM(dst_reg, dst_reg, 0, 0, 31));
+				break;
+			}
+			if (off == 0) {
+				/* MOV */
+				if (dst_reg != src_reg)
+					EMIT(PPC_RAW_MR(dst_reg, src_reg));
+			} else {
+				/* MOVSX: dst = (s8,s16,s32)src (off = 8,16,32) */
+				if (sign_extend(image, ctx, src_reg, dst_reg, off / 8))
+					return -1;
+			}
+			goto bpf_alu32_trunc;
+		case BPF_ALU | BPF_MOV | BPF_K: /* (u32) dst = imm */
+		case BPF_ALU64 | BPF_MOV | BPF_K: /* dst = (s64) imm */
+			PPC_LI32(dst_reg, imm);
+			if (imm < 0)
+				goto bpf_alu32_trunc;
+			else if (insn_is_zext(&insn[i + 1]))
+				addrs[++i] = ctx->idx * 4;
+			break;
+
+bpf_alu32_trunc:
+		/* Truncate to 32-bits */
+		if (BPF_CLASS(code) == BPF_ALU && !fp->aux->verifier_zext)
+			EMIT(PPC_RAW_RLWINM(dst_reg, dst_reg, 0, 0, 31));
+		break;
+
+		/*
+		 * BPF_FROM_BE/LE
+		 */
+		case BPF_ALU | BPF_END | BPF_FROM_LE:
+		case BPF_ALU | BPF_END | BPF_FROM_BE:
+		case BPF_ALU64 | BPF_END | BPF_FROM_LE:
+#ifdef __BIG_ENDIAN__
+			if (BPF_SRC(code) == BPF_FROM_BE)
+				goto emit_clear;
+#else /* !__BIG_ENDIAN__ */
+			if (BPF_CLASS(code) == BPF_ALU && BPF_SRC(code) == BPF_FROM_LE)
+				goto emit_clear;
+#endif
+			switch (imm) {
+			case 16:
+				/* Rotate 8 bits left & mask with 0x0000ff00 */
+				EMIT(PPC_RAW_RLWINM(tmp1_reg, dst_reg, 8, 16, 23));
+				/* Rotate 8 bits right & insert LSB to reg */
+				EMIT(PPC_RAW_RLWIMI(tmp1_reg, dst_reg, 24, 24, 31));
+				/* Move result back to dst_reg */
+				EMIT(PPC_RAW_MR(dst_reg, tmp1_reg));
+				break;
+			case 32:
+				/*
+				 * Rotate word left by 8 bits:
+				 * 2 bytes are already in their final position
+				 * -- byte 2 and 4 (of bytes 1, 2, 3 and 4)
+				 */
+				EMIT(PPC_RAW_RLWINM(tmp1_reg, dst_reg, 8, 0, 31));
+				/* Rotate 24 bits and insert byte 1 */
+				EMIT(PPC_RAW_RLWIMI(tmp1_reg, dst_reg, 24, 0, 7));
+				/* Rotate 24 bits and insert byte 3 */
+				EMIT(PPC_RAW_RLWIMI(tmp1_reg, dst_reg, 24, 16, 23));
+				EMIT(PPC_RAW_MR(dst_reg, tmp1_reg));
+				break;
+			case 64:
+				/* Store the value to stack and then use byte-reverse loads */
+				EMIT(PPC_RAW_STD(dst_reg, _R1, bpf_jit_stack_local(ctx)));
+				EMIT(PPC_RAW_ADDI(tmp1_reg, _R1, bpf_jit_stack_local(ctx)));
+				if (cpu_has_feature(CPU_FTR_ARCH_206)) {
+					EMIT(PPC_RAW_LDBRX(dst_reg, 0, tmp1_reg));
+				} else {
+					EMIT(PPC_RAW_LWBRX(dst_reg, 0, tmp1_reg));
+					if (IS_ENABLED(CONFIG_CPU_LITTLE_ENDIAN))
+						EMIT(PPC_RAW_SLDI(dst_reg, dst_reg, 32));
+					EMIT(PPC_RAW_LI(tmp2_reg, 4));
+					EMIT(PPC_RAW_LWBRX(tmp2_reg, tmp2_reg, tmp1_reg));
+					if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))
+						EMIT(PPC_RAW_SLDI(tmp2_reg, tmp2_reg, 32));
+					EMIT(PPC_RAW_OR(dst_reg, dst_reg, tmp2_reg));
+				}
+				break;
+			}
+			break;
+
+emit_clear:
+			switch (imm) {
+			case 16:
+				/* zero-extend 16 bits into 64 bits */
+				EMIT(PPC_RAW_RLDICL(dst_reg, dst_reg, 0, 48));
+				if (insn_is_zext(&insn[i + 1]))
+					addrs[++i] = ctx->idx * 4;
+				break;
+			case 32:
+				if (!fp->aux->verifier_zext)
+					/* zero-extend 32 bits into 64 bits */
+					EMIT(PPC_RAW_RLDICL(dst_reg, dst_reg, 0, 32));
+				break;
+			case 64:
+				/* nop */
+				break;
+			}
+			break;
+
+		/*
+		 * BPF_ST NOSPEC (speculation barrier)
+		 *
+		 * The following must act as a barrier against both Spectre v1
+		 * and v4 if we requested both mitigations. Therefore, also emit
+		 * 'isync; sync' on E500 or 'ori31' on BOOK3S_64 in addition to
+		 * the insns needed for a Spectre v4 barrier.
+		 *
+		 * If we requested only !bypass_spec_v1 OR only !bypass_spec_v4,
+		 * we can skip the respective other barrier type as an
+		 * optimization.
+		 */
+		case BPF_ST | BPF_NOSPEC:
+			sync_emitted = false;
+			ori31_emitted = false;
+			if (IS_ENABLED(CONFIG_PPC_E500) &&
+			    !bpf_jit_bypass_spec_v1()) {
+				EMIT(PPC_RAW_ISYNC());
+				EMIT(PPC_RAW_SYNC());
+				sync_emitted = true;
+			}
+			if (!bpf_jit_bypass_spec_v4()) {
+				switch (stf_barrier) {
+				case STF_BARRIER_EIEIO:
+					EMIT(PPC_RAW_EIEIO() | 0x02000000);
+					break;
+				case STF_BARRIER_SYNC_ORI:
+					if (!sync_emitted)
+						EMIT(PPC_RAW_SYNC());
+					EMIT(PPC_RAW_LD(tmp1_reg, _R13, 0));
+					EMIT(PPC_RAW_ORI(_R31, _R31, 0));
+					ori31_emitted = true;
+					break;
+				case STF_BARRIER_FALLBACK:
+					ctx->seen |= SEEN_FUNC;
+					PPC_LI64(_R12, dereference_kernel_function_descriptor(bpf_stf_barrier));
+					EMIT(PPC_RAW_MTCTR(_R12));
+					EMIT(PPC_RAW_BCTRL());
+					break;
+				case STF_BARRIER_NONE:
+					break;
+				}
+			}
+			if (IS_ENABLED(CONFIG_PPC_BOOK3S_64) &&
+			    !bpf_jit_bypass_spec_v1() &&
+			    !ori31_emitted)
+				EMIT(PPC_RAW_ORI(_R31, _R31, 0));
+			break;
+
+		/*
+		 * BPF_ST(X)
+		 */
+		case BPF_STX | BPF_MEM | BPF_B: /* *(u8 *)(dst + off) = src */
+		case BPF_ST | BPF_MEM | BPF_B: /* *(u8 *)(dst + off) = imm */
+			if (BPF_CLASS(code) == BPF_ST) {
+				EMIT(PPC_RAW_LI(tmp1_reg, imm));
+				src_reg = tmp1_reg;
+			}
+			EMIT(PPC_RAW_STB(src_reg, dst_reg, off));
+			break;
+		case BPF_STX | BPF_MEM | BPF_H: /* (u16 *)(dst + off) = src */
+		case BPF_ST | BPF_MEM | BPF_H: /* (u16 *)(dst + off) = imm */
+			if (BPF_CLASS(code) == BPF_ST) {
+				EMIT(PPC_RAW_LI(tmp1_reg, imm));
+				src_reg = tmp1_reg;
+			}
+			EMIT(PPC_RAW_STH(src_reg, dst_reg, off));
+			break;
+		case BPF_STX | BPF_MEM | BPF_W: /* *(u32 *)(dst + off) = src */
+		case BPF_ST | BPF_MEM | BPF_W: /* *(u32 *)(dst + off) = imm */
+			if (BPF_CLASS(code) == BPF_ST) {
+				PPC_LI32(tmp1_reg, imm);
+				src_reg = tmp1_reg;
+			}
+			EMIT(PPC_RAW_STW(src_reg, dst_reg, off));
+			break;
+		case BPF_STX | BPF_MEM | BPF_DW: /* (u64 *)(dst + off) = src */
+		case BPF_ST | BPF_MEM | BPF_DW: /* *(u64 *)(dst + off) = imm */
+			if (BPF_CLASS(code) == BPF_ST) {
+				PPC_LI32(tmp1_reg, imm);
+				src_reg = tmp1_reg;
+			}
+			if (off % 4) {
+				EMIT(PPC_RAW_LI(tmp2_reg, off));
+				EMIT(PPC_RAW_STDX(src_reg, dst_reg, tmp2_reg));
+			} else {
+				EMIT(PPC_RAW_STD(src_reg, dst_reg, off));
+			}
+			break;
+
+		case BPF_STX | BPF_PROBE_MEM32 | BPF_B:
+		case BPF_STX | BPF_PROBE_MEM32 | BPF_H:
+		case BPF_STX | BPF_PROBE_MEM32 | BPF_W:
+		case BPF_STX | BPF_PROBE_MEM32 | BPF_DW:
+
+			EMIT(PPC_RAW_ADD(tmp1_reg, dst_reg, bpf_to_ppc(ARENA_VM_START)));
+
+			ret = bpf_jit_emit_probe_mem_store(ctx, src_reg, off, code, image);
+			if (ret)
+				return ret;
+
+			ret = bpf_add_extable_entry(fp, image, fimage, pass, ctx,
+						    ctx->idx - 1, 4, -1, code);
+			if (ret)
+				return ret;
+
+			break;
+
+		case BPF_ST | BPF_PROBE_MEM32 | BPF_B:
+		case BPF_ST | BPF_PROBE_MEM32 | BPF_H:
+		case BPF_ST | BPF_PROBE_MEM32 | BPF_W:
+		case BPF_ST | BPF_PROBE_MEM32 | BPF_DW:
+
+			EMIT(PPC_RAW_ADD(tmp1_reg, dst_reg, bpf_to_ppc(ARENA_VM_START)));
+
+			if (BPF_SIZE(code) == BPF_W || BPF_SIZE(code) == BPF_DW) {
+				PPC_LI32(tmp2_reg, imm);
+				src_reg = tmp2_reg;
+			} else {
+				EMIT(PPC_RAW_LI(tmp2_reg, imm));
+				src_reg = tmp2_reg;
+			}
+
+			ret = bpf_jit_emit_probe_mem_store(ctx, src_reg, off, code, image);
+			if (ret)
+				return ret;
+
+			ret = bpf_add_extable_entry(fp, image, fimage, pass, ctx,
+						    ctx->idx - 1, 4, -1, code);
+			if (ret)
+				return ret;
+
+			break;
+
+		/*
+		 * BPF_STX PROBE_ATOMIC (arena atomic ops)
+		 */
+		case BPF_STX | BPF_PROBE_ATOMIC | BPF_W:
+		case BPF_STX | BPF_PROBE_ATOMIC | BPF_DW:
+			EMIT(PPC_RAW_ADD(dst_reg, dst_reg, bpf_to_ppc(ARENA_VM_START)));
+			ret = bpf_jit_emit_atomic_ops(image, ctx, &insn[i],
+						      &jmp_off, &tmp_idx, &addrs[i + 1]);
+			if (ret) {
+				if (ret == -EOPNOTSUPP) {
+					pr_err_ratelimited(
+						"eBPF filter atomic op code %02x (@%d) unsupported\n",
+						code, i);
+				}
+				return ret;
+			}
+			/* LDARX/LWARX should land here on exception. */
+			ret = bpf_add_extable_entry(fp, image, fimage, pass, ctx,
+						    tmp_idx, jmp_off, dst_reg, code);
+			if (ret)
+				return ret;
+
+			/* Retrieve the dst_reg */
+			EMIT(PPC_RAW_SUB(dst_reg, dst_reg, bpf_to_ppc(ARENA_VM_START)));
+			break;
+
+		/*
+		 * BPF_STX ATOMIC (atomic ops)
+		 */
+		case BPF_STX | BPF_ATOMIC | BPF_B:
+		case BPF_STX | BPF_ATOMIC | BPF_H:
+		case BPF_STX | BPF_ATOMIC | BPF_W:
+		case BPF_STX | BPF_ATOMIC | BPF_DW:
+			if (bpf_atomic_is_load_store(&insn[i])) {
+				ret = emit_atomic_ld_st(insn[i], ctx, image);
+				if (ret)
+					return ret;
+
+				if (size != BPF_DW && insn_is_zext(&insn[i + 1]))
+					addrs[++i] = ctx->idx * 4;
+				break;
+			} else if (size == BPF_B || size == BPF_H) {
+				pr_err_ratelimited(
+					"eBPF filter atomic op code %02x (@%d) unsupported\n",
+					code, i);
+				return -EOPNOTSUPP;
+			}
+
+			ret = bpf_jit_emit_atomic_ops(image, ctx, &insn[i],
+						      &jmp_off, &tmp_idx, &addrs[i + 1]);
+			if (ret) {
+				if (ret == -EOPNOTSUPP) {
+					pr_err_ratelimited(
+						"eBPF filter atomic op code %02x (@%d) unsupported\n",
+						code, i);
+				}
+				return ret;
+			}
+			break;
+
+		/*
+		 * BPF_LDX
+		 */
+		/* dst = *(u8 *)(ul) (src + off) */
+		case BPF_LDX | BPF_MEM | BPF_B:
+		case BPF_LDX | BPF_MEMSX | BPF_B:
+		case BPF_LDX | BPF_PROBE_MEM | BPF_B:
+		case BPF_LDX | BPF_PROBE_MEMSX | BPF_B:
+		/* dst = *(u16 *)(ul) (src + off) */
+		case BPF_LDX | BPF_MEM | BPF_H:
+		case BPF_LDX | BPF_MEMSX | BPF_H:
+		case BPF_LDX | BPF_PROBE_MEM | BPF_H:
+		case BPF_LDX | BPF_PROBE_MEMSX | BPF_H:
+		/* dst = *(u32 *)(ul) (src + off) */
+		case BPF_LDX | BPF_MEM | BPF_W:
+		case BPF_LDX | BPF_MEMSX | BPF_W:
+		case BPF_LDX | BPF_PROBE_MEM | BPF_W:
+		case BPF_LDX | BPF_PROBE_MEMSX | BPF_W:
+		/* dst = *(u64 *)(ul) (src + off) */
+		case BPF_LDX | BPF_MEM | BPF_DW:
+		case BPF_LDX | BPF_PROBE_MEM | BPF_DW:
+			/*
+			 * As PTR_TO_BTF_ID that uses BPF_PROBE_MEM mode could either be a valid
+			 * kernel pointer or NULL but not a userspace address, execute BPF_PROBE_MEM
+			 * load only if addr is kernel address (see is_kernel_addr()), otherwise
+			 * set dst_reg=0 and move on.
+			 */
+			if (BPF_MODE(code) == BPF_PROBE_MEM || BPF_MODE(code) == BPF_PROBE_MEMSX) {
+				EMIT(PPC_RAW_ADDI(tmp1_reg, src_reg, off));
+				if (IS_ENABLED(CONFIG_PPC_BOOK3E_64))
+					PPC_LI64(tmp2_reg, 0x8000000000000000ul);
+				else /* BOOK3S_64 */
+					PPC_LI64(tmp2_reg, PAGE_OFFSET);
+				EMIT(PPC_RAW_CMPLD(tmp1_reg, tmp2_reg));
+				PPC_BCC_SHORT(COND_GT, (ctx->idx + 3) * 4);
+				EMIT(PPC_RAW_LI(dst_reg, 0));
+				/*
+				 * Check if 'off' is word aligned for BPF_DW, because
+				 * we might generate two instructions.
+				 */
+				if ((BPF_SIZE(code) == BPF_DW && (off & 3)) ||
+				    (BPF_SIZE(code) == BPF_B &&
+				     BPF_MODE(code) == BPF_PROBE_MEMSX) ||
+				    (BPF_SIZE(code) == BPF_B && BPF_MODE(code) == BPF_MEMSX))
+					PPC_JMP((ctx->idx + 3) * 4);
+				else
+					PPC_JMP((ctx->idx + 2) * 4);
+			}
+
+			if (BPF_MODE(code) == BPF_MEMSX || BPF_MODE(code) == BPF_PROBE_MEMSX) {
+				switch (size) {
+				case BPF_B:
+					EMIT(PPC_RAW_LBZ(dst_reg, src_reg, off));
+					EMIT(PPC_RAW_EXTSB(dst_reg, dst_reg));
+					break;
+				case BPF_H:
+					EMIT(PPC_RAW_LHA(dst_reg, src_reg, off));
+					break;
+				case BPF_W:
+					EMIT(PPC_RAW_LWA(dst_reg, src_reg, off));
+					break;
+				}
+			} else {
+				switch (size) {
+				case BPF_B:
+					EMIT(PPC_RAW_LBZ(dst_reg, src_reg, off));
+					break;
+				case BPF_H:
+					EMIT(PPC_RAW_LHZ(dst_reg, src_reg, off));
+					break;
+				case BPF_W:
+					EMIT(PPC_RAW_LWZ(dst_reg, src_reg, off));
+					break;
+				case BPF_DW:
+					if (off % 4) {
+						EMIT(PPC_RAW_LI(tmp1_reg, off));
+						EMIT(PPC_RAW_LDX(dst_reg, src_reg, tmp1_reg));
+					} else {
+						EMIT(PPC_RAW_LD(dst_reg, src_reg, off));
+					}
+					break;
+				}
+			}
+
+			if (size != BPF_DW && insn_is_zext(&insn[i + 1]))
+				addrs[++i] = ctx->idx * 4;
+
+			if (BPF_MODE(code) == BPF_PROBE_MEM) {
+				ret = bpf_add_extable_entry(fp, image, fimage, pass, ctx,
+							    ctx->idx - 1, 4, dst_reg, code);
+				if (ret)
+					return ret;
+			}
+			break;
+
+		/* dst = *(u64 *)(ul) (src + ARENA_VM_START + off) */
+		case BPF_LDX | BPF_PROBE_MEM32 | BPF_B:
+		case BPF_LDX | BPF_PROBE_MEM32 | BPF_H:
+		case BPF_LDX | BPF_PROBE_MEM32 | BPF_W:
+		case BPF_LDX | BPF_PROBE_MEM32 | BPF_DW:
+
+			EMIT(PPC_RAW_ADD(tmp1_reg, src_reg, bpf_to_ppc(ARENA_VM_START)));
+
+			switch (size) {
+			case BPF_B:
+				EMIT(PPC_RAW_LBZ(dst_reg, tmp1_reg, off));
+				break;
+			case BPF_H:
+				EMIT(PPC_RAW_LHZ(dst_reg, tmp1_reg, off));
+				break;
+			case BPF_W:
+				EMIT(PPC_RAW_LWZ(dst_reg, tmp1_reg, off));
+				break;
+			case BPF_DW:
+				if (off % 4) {
+					EMIT(PPC_RAW_LI(tmp2_reg, off));
+					EMIT(PPC_RAW_LDX(dst_reg, tmp1_reg, tmp2_reg));
+				} else {
+					EMIT(PPC_RAW_LD(dst_reg, tmp1_reg, off));
+				}
+				break;
+			}
+
+			if (size != BPF_DW && insn_is_zext(&insn[i + 1]))
+				addrs[++i] = ctx->idx * 4;
+
+			ret = bpf_add_extable_entry(fp, image, fimage, pass, ctx,
+						    ctx->idx - 1, 4, dst_reg, code);
+			if (ret)
+				return ret;
+			break;
+
+		/*
+		 * Doubleword load
+		 * 16 byte instruction that uses two 'struct bpf_insn'
+		 */
+		case BPF_LD | BPF_IMM | BPF_DW: /* dst = (u64) imm */
+			imm64 = ((u64)(u32) insn[i].imm) |
+				    (((u64)(u32) insn[i+1].imm) << 32);
+			PPC_LI64(dst_reg, imm64);
+			/* Adjust for two bpf instructions */
+			addrs[++i] = ctx->idx * 4;
+			break;
+
+		/*
+		 * JUMP reg
+		 */
+		case BPF_JMP | BPF_JA | BPF_X:
+			EMIT(PPC_RAW_MTCTR(dst_reg));
+			EMIT(PPC_RAW_BCTR());
+			break;
+
+		/*
+		 * Return/Exit
+		 */
+		case BPF_JMP | BPF_EXIT:
+			/*
+			 * If this isn't the very last instruction, branch to
+			 * the epilogue. If we _are_ the last instruction,
+			 * we'll just fall through to the epilogue.
+			 */
+			if (i != flen - 1) {
+				ret = bpf_jit_emit_exit_insn(image, ctx, tmp1_reg, exit_addr);
+				if (ret)
+					return ret;
+			}
+			/* else fall through to the epilogue */
+			break;
+
+		/*
+		 * Call kernel helper or bpf function
+		 */
+		case BPF_JMP | BPF_CALL:
+			ctx->seen |= SEEN_FUNC;
+
+			if (src_reg == bpf_to_ppc(BPF_REG_0)) {
+				if (imm == BPF_FUNC_get_smp_processor_id) {
+					EMIT(PPC_RAW_LHZ(src_reg, _R13, offsetof(struct paca_struct, paca_index)));
+					break;
+				} else if (imm == BPF_FUNC_get_current_task ||
+					   imm == BPF_FUNC_get_current_task_btf) {
+					EMIT(PPC_RAW_LD(src_reg, _R13, offsetof(struct paca_struct, __current)));
+					break;
+				}
+			}
+
+			ret = bpf_jit_get_func_addr(fp, &insn[i], extra_pass,
+						    &func_addr, &func_addr_fixed);
+			if (ret < 0)
+				return ret;
+
+			/*
+			 * Call to arch_bpf_timed_may_goto() is emitted by the
+			 * verifier and called with custom calling convention with
+			 * first argument and return value in BPF_REG_AX (_R12).
+			 *
+			 * The generic helper or bpf function call emission path
+			 * may use the same scratch register as BPF_REG_AX to
+			 * materialize the target address. This would clobber AX
+			 * and break timed may_goto semantics.
+			 *
+			 * Emit a minimal indirect call sequence here using a temp
+			 * register and skip the normal post-call return-value move.
+			 */
+
+			if (func_addr == (u64)arch_bpf_timed_may_goto) {
+				ret = 0;
+				if (!IS_ENABLED(CONFIG_PPC_KERNEL_PCREL))
+					ret = bpf_jit_emit_func_call(image, ctx, func_addr,
+								     tmp1_reg);
+
+				if (ret || IS_ENABLED(CONFIG_PPC_KERNEL_PCREL)) {
+					PPC_LI_ADDR(tmp1_reg, func_addr);
+					EMIT(PPC_RAW_MTCTR(tmp1_reg));
+					EMIT(PPC_RAW_BCTRL());
+				}
+
+				break;
+			}
+
+			/* Take care of powerpc ABI requirements before kfunc call */
+			if (insn[i].src_reg == BPF_PSEUDO_KFUNC_CALL) {
+				if (prepare_for_kfunc_call(fp, image, ctx, &insn[i]))
+					return -1;
+			}
+
+			ret = bpf_jit_emit_func_call_rel(image, fimage, ctx, func_addr);
+			if (ret)
+				return ret;
+
+			/* move return value from r3 to BPF_REG_0 */
+			EMIT(PPC_RAW_MR(bpf_to_ppc(BPF_REG_0), _R3));
+			break;
+
+		/*
+		 * Jumps and branches
+		 */
+		case BPF_JMP | BPF_JA:
+			PPC_JMP(addrs[i + 1 + off]);
+			break;
+		case BPF_JMP32 | BPF_JA:
+			PPC_JMP(addrs[i + 1 + imm]);
+			break;
+
+		case BPF_JMP | BPF_JGT | BPF_K:
+		case BPF_JMP | BPF_JGT | BPF_X:
+		case BPF_JMP | BPF_JSGT | BPF_K:
+		case BPF_JMP | BPF_JSGT | BPF_X:
+		case BPF_JMP32 | BPF_JGT | BPF_K:
+		case BPF_JMP32 | BPF_JGT | BPF_X:
+		case BPF_JMP32 | BPF_JSGT | BPF_K:
+		case BPF_JMP32 | BPF_JSGT | BPF_X:
+			true_cond = COND_GT;
+			goto cond_branch;
+		case BPF_JMP | BPF_JLT | BPF_K:
+		case BPF_JMP | BPF_JLT | BPF_X:
+		case BPF_JMP | BPF_JSLT | BPF_K:
+		case BPF_JMP | BPF_JSLT | BPF_X:
+		case BPF_JMP32 | BPF_JLT | BPF_K:
+		case BPF_JMP32 | BPF_JLT | BPF_X:
+		case BPF_JMP32 | BPF_JSLT | BPF_K:
+		case BPF_JMP32 | BPF_JSLT | BPF_X:
+			true_cond = COND_LT;
+			goto cond_branch;
+		case BPF_JMP | BPF_JGE | BPF_K:
+		case BPF_JMP | BPF_JGE | BPF_X:
+		case BPF_JMP | BPF_JSGE | BPF_K:
+		case BPF_JMP | BPF_JSGE | BPF_X:
+		case BPF_JMP32 | BPF_JGE | BPF_K:
+		case BPF_JMP32 | BPF_JGE | BPF_X:
+		case BPF_JMP32 | BPF_JSGE | BPF_K:
+		case BPF_JMP32 | BPF_JSGE | BPF_X:
+			true_cond = COND_GE;
+			goto cond_branch;
+		case BPF_JMP | BPF_JLE | BPF_K:
+		case BPF_JMP | BPF_JLE | BPF_X:
+		case BPF_JMP | BPF_JSLE | BPF_K:
+		case BPF_JMP | BPF_JSLE | BPF_X:
+		case BPF_JMP32 | BPF_JLE | BPF_K:
+		case BPF_JMP32 | BPF_JLE | BPF_X:
+		case BPF_JMP32 | BPF_JSLE | BPF_K:
+		case BPF_JMP32 | BPF_JSLE | BPF_X:
+			true_cond = COND_LE;
+			goto cond_branch;
+		case BPF_JMP | BPF_JEQ | BPF_K:
+		case BPF_JMP | BPF_JEQ | BPF_X:
+		case BPF_JMP32 | BPF_JEQ | BPF_K:
+		case BPF_JMP32 | BPF_JEQ | BPF_X:
+			true_cond = COND_EQ;
+			goto cond_branch;
+		case BPF_JMP | BPF_JNE | BPF_K:
+		case BPF_JMP | BPF_JNE | BPF_X:
+		case BPF_JMP32 | BPF_JNE | BPF_K:
+		case BPF_JMP32 | BPF_JNE | BPF_X:
+			true_cond = COND_NE;
+			goto cond_branch;
+		case BPF_JMP | BPF_JSET | BPF_K:
+		case BPF_JMP | BPF_JSET | BPF_X:
+		case BPF_JMP32 | BPF_JSET | BPF_K:
+		case BPF_JMP32 | BPF_JSET | BPF_X:
+			true_cond = COND_NE;
+			/* Fall through */
+
+cond_branch:
+			switch (code) {
+			case BPF_JMP | BPF_JGT | BPF_X:
+			case BPF_JMP | BPF_JLT | BPF_X:
+			case BPF_JMP | BPF_JGE | BPF_X:
+			case BPF_JMP | BPF_JLE | BPF_X:
+			case BPF_JMP | BPF_JEQ | BPF_X:
+			case BPF_JMP | BPF_JNE | BPF_X:
+			case BPF_JMP32 | BPF_JGT | BPF_X:
+			case BPF_JMP32 | BPF_JLT | BPF_X:
+			case BPF_JMP32 | BPF_JGE | BPF_X:
+			case BPF_JMP32 | BPF_JLE | BPF_X:
+			case BPF_JMP32 | BPF_JEQ | BPF_X:
+			case BPF_JMP32 | BPF_JNE | BPF_X:
+				/* unsigned comparison */
+				if (BPF_CLASS(code) == BPF_JMP32)
+					EMIT(PPC_RAW_CMPLW(dst_reg, src_reg));
+				else
+					EMIT(PPC_RAW_CMPLD(dst_reg, src_reg));
+				break;
+			case BPF_JMP | BPF_JSGT | BPF_X:
+			case BPF_JMP | BPF_JSLT | BPF_X:
+			case BPF_JMP | BPF_JSGE | BPF_X:
+			case BPF_JMP | BPF_JSLE | BPF_X:
+			case BPF_JMP32 | BPF_JSGT | BPF_X:
+			case BPF_JMP32 | BPF_JSLT | BPF_X:
+			case BPF_JMP32 | BPF_JSGE | BPF_X:
+			case BPF_JMP32 | BPF_JSLE | BPF_X:
+				/* signed comparison */
+				if (BPF_CLASS(code) == BPF_JMP32)
+					EMIT(PPC_RAW_CMPW(dst_reg, src_reg));
+				else
+					EMIT(PPC_RAW_CMPD(dst_reg, src_reg));
+				break;
+			case BPF_JMP | BPF_JSET | BPF_X:
+			case BPF_JMP32 | BPF_JSET | BPF_X:
+				if (BPF_CLASS(code) == BPF_JMP) {
+					EMIT(PPC_RAW_AND_DOT(tmp1_reg, dst_reg, src_reg));
+				} else {
+					EMIT(PPC_RAW_AND(tmp1_reg, dst_reg, src_reg));
+					EMIT(PPC_RAW_RLWINM_DOT(tmp1_reg, tmp1_reg, 0, 0, 31));
+				}
+				break;
+			case BPF_JMP | BPF_JNE | BPF_K:
+			case BPF_JMP | BPF_JEQ | BPF_K:
+			case BPF_JMP | BPF_JGT | BPF_K:
+			case BPF_JMP | BPF_JLT | BPF_K:
+			case BPF_JMP | BPF_JGE | BPF_K:
+			case BPF_JMP | BPF_JLE | BPF_K:
+			case BPF_JMP32 | BPF_JNE | BPF_K:
+			case BPF_JMP32 | BPF_JEQ | BPF_K:
+			case BPF_JMP32 | BPF_JGT | BPF_K:
+			case BPF_JMP32 | BPF_JLT | BPF_K:
+			case BPF_JMP32 | BPF_JGE | BPF_K:
+			case BPF_JMP32 | BPF_JLE | BPF_K:
+			{
+				bool is_jmp32 = BPF_CLASS(code) == BPF_JMP32;
+
+				/*
+				 * Need sign-extended load, so only positive
+				 * values can be used as imm in cmpldi
+				 */
+				if (imm >= 0 && imm < 32768) {
+					if (is_jmp32)
+						EMIT(PPC_RAW_CMPLWI(dst_reg, imm));
+					else
+						EMIT(PPC_RAW_CMPLDI(dst_reg, imm));
+				} else {
+					/* sign-extending load */
+					PPC_LI32(tmp1_reg, imm);
+					/* ... but unsigned comparison */
+					if (is_jmp32)
+						EMIT(PPC_RAW_CMPLW(dst_reg, tmp1_reg));
+					else
+						EMIT(PPC_RAW_CMPLD(dst_reg, tmp1_reg));
+				}
+				break;
+			}
+			case BPF_JMP | BPF_JSGT | BPF_K:
+			case BPF_JMP | BPF_JSLT | BPF_K:
+			case BPF_JMP | BPF_JSGE | BPF_K:
+			case BPF_JMP | BPF_JSLE | BPF_K:
+			case BPF_JMP32 | BPF_JSGT | BPF_K:
+			case BPF_JMP32 | BPF_JSLT | BPF_K:
+			case BPF_JMP32 | BPF_JSGE | BPF_K:
+			case BPF_JMP32 | BPF_JSLE | BPF_K:
+			{
+				bool is_jmp32 = BPF_CLASS(code) == BPF_JMP32;
+
+				/*
+				 * signed comparison, so any 16-bit value
+				 * can be used in cmpdi
+				 */
+				if (imm >= -32768 && imm < 32768) {
+					if (is_jmp32)
+						EMIT(PPC_RAW_CMPWI(dst_reg, imm));
+					else
+						EMIT(PPC_RAW_CMPDI(dst_reg, imm));
+				} else {
+					PPC_LI32(tmp1_reg, imm);
+					if (is_jmp32)
+						EMIT(PPC_RAW_CMPW(dst_reg, tmp1_reg));
+					else
+						EMIT(PPC_RAW_CMPD(dst_reg, tmp1_reg));
+				}
+				break;
+			}
+			case BPF_JMP | BPF_JSET | BPF_K:
+			case BPF_JMP32 | BPF_JSET | BPF_K:
+				/* andi does not sign-extend the immediate */
+				if (imm >= 0 && imm < 32768)
+					/* PPC_ANDI is _only/always_ dot-form */
+					EMIT(PPC_RAW_ANDI(tmp1_reg, dst_reg, imm));
+				else {
+					PPC_LI32(tmp1_reg, imm);
+					if (BPF_CLASS(code) == BPF_JMP) {
+						EMIT(PPC_RAW_AND_DOT(tmp1_reg, dst_reg,
+								     tmp1_reg));
+					} else {
+						EMIT(PPC_RAW_AND(tmp1_reg, dst_reg, tmp1_reg));
+						EMIT(PPC_RAW_RLWINM_DOT(tmp1_reg, tmp1_reg,
+									0, 0, 31));
+					}
+				}
+				break;
+			}
+			PPC_BCC(true_cond, addrs[i + 1 + off]);
+			break;
+
+		/*
+		 * Tail call
+		 */
+		case BPF_JMP | BPF_TAIL_CALL:
+			ctx->seen |= SEEN_TAILCALL;
+			ret = bpf_jit_emit_tail_call(image, ctx, addrs[i + 1]);
+			if (ret < 0)
+				return ret;
+			break;
+
+		default:
+			/*
+			 * The filter contains something cruel & unusual.
+			 * We don't handle it, but also there shouldn't be
+			 * anything missing from our list.
+			 */
+			pr_err_ratelimited("eBPF filter opcode %04x (@%d) unsupported\n",
+					code, i);
+			return -ENOTSUPP;
+		}
+	}
+
+	/* Set end-of-body-code address for exit. */
+	addrs[i] = ctx->idx * 4;
+
+	return 0;
+}

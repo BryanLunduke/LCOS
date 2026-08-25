@@ -1,0 +1,61 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Copyright 2021 Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: AMD
+ *
+ */
+
+#ifndef __DC_FPU_H__
+#define __DC_FPU_H__
+
+void dc_assert_fp_enabled(void);
+bool dc_is_fp_enabled(void);
+void dc_fpu_begin(const char *function_name, const int line);
+void dc_fpu_end(const char *function_name, const int line);
+
+#ifndef _LINUX_FPU_COMPILATION_UNIT
+#define DC_FP_START()	dc_fpu_begin(__func__, __LINE__)
+#define DC_FP_END()	dc_fpu_end(__func__, __LINE__)
+#ifdef CONFIG_DRM_AMD_DC_FP
+#define DC_RUN_WITH_PREEMPTION_ENABLED(code) \
+	do { \
+		bool dc_fp_enabled = dc_is_fp_enabled(); \
+		if (dc_fp_enabled) \
+			DC_FP_END(); \
+		code; \
+		if (dc_fp_enabled) \
+			DC_FP_START(); \
+	} while (0)
+#else
+#define DC_RUN_WITH_PREEMPTION_ENABLED(code) code
+#endif // !CONFIG_DRM_AMD_DC_FP
+#else
+#define DC_FP_START()	BUILD_BUG()
+#define DC_FP_END()	BUILD_BUG()
+#define DC_RUN_WITH_PREEMPTION_ENABLED(code) \
+	do { \
+		BUILD_BUG(); \
+		code; \
+	} while (0)
+#endif // !_LINUX_FPU_COMPILATION_UNIT
+
+#endif /* __DC_FPU_H__ */

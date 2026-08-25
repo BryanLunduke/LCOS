@@ -1,0 +1,479 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Copyright (c) 2018, Intel Corporation. */
+
+#ifndef _ICE_TXRX_H_
+#define _ICE_TXRX_H_
+
+#include <net/libeth/types.h>
+
+#include "ice_type.h"
+
+#define ICE_DFLT_IRQ_WORK	256
+#define ICE_RXBUF_3072		3072
+#define ICE_RXBUF_2048		2048
+#define ICE_RXBUF_1664		1664
+#define ICE_RXBUF_1536		1536
+#define ICE_MAX_CHAINED_RX_BUFS	5
+#define ICE_MAX_BUF_TXD		8
+#define ICE_MIN_TX_LEN		17
+#define ICE_MAX_FRAME_LEGACY_RX 8320
+
+/* The size limit for a transmit buffer in a descriptor is (16K - 1).
+ * In order to align with the read requests we will align the value to
+ * the nearest 4K which represents our maximum read request size.
+ */
+#define ICE_MAX_READ_REQ_SIZE	4096
+#define ICE_MAX_DATA_PER_TXD	(16 * 1024 - 1)
+#define ICE_MAX_DATA_PER_TXD_ALIGNED \
+	(~(ICE_MAX_READ_REQ_SIZE - 1) & ICE_MAX_DATA_PER_TXD)
+
+#define ICE_MAX_TXQ_PER_TXQG	128
+
+/* We are assuming that the cache line is always 64 Bytes here for ice.
+ * In order to make sure that is a correct assumption there is a check in probe
+ * to print a warning if the read from GLPCI_CNF2 tells us that the cache line
+ * size is 128 bytes. We do it this way because we do not want to read the
+ * GLPCI_CNF2 register or a variable containing the value on every pass through
+ * the Tx path.
+ */
+#define ICE_CACHE_LINE_BYTES		64
+#define ICE_DESCS_PER_CACHE_LINE	(ICE_CACHE_LINE_BYTES / \
+					 sizeof(struct ice_tx_desc))
+#define ICE_DESCS_FOR_CTX_DESC		1
+#define ICE_DESCS_FOR_SKB_DATA_PTR	1
+/* Tx descriptors needed, worst case */
+#define DESC_NEEDED (MAX_SKB_FRAGS + ICE_DESCS_FOR_CTX_DESC + \
+		     ICE_DESCS_PER_CACHE_LINE + ICE_DESCS_FOR_SKB_DATA_PTR)
+#define ICE_DESC_UNUSED(R)	\
+	(u16)((((R)->next_to_clean > (R)->next_to_use) ? 0 : (R)->count) + \
+	      (R)->next_to_clean - (R)->next_to_use - 1)
+
+#define ICE_RING_QUARTER(R) ((R)->count >> 2)
+
+#define ICE_TX_FLAGS_TSO	BIT(0)
+#define ICE_TX_FLAGS_HW_VLAN	BIT(1)
+#define ICE_TX_FLAGS_SW_VLAN	BIT(2)
+/* Free, was ICE_TX_FLAGS_DUMMY_PKT */
+#define ICE_TX_FLAGS_TSYN	BIT(4)
+#define ICE_TX_FLAGS_IPV4	BIT(5)
+#define ICE_TX_FLAGS_IPV6	BIT(6)
+#define ICE_TX_FLAGS_TUNNEL	BIT(7)
+#define ICE_TX_FLAGS_HW_OUTER_SINGLE_VLAN	BIT(8)
+
+#define ICE_XDP_PASS		0
+#define ICE_XDP_CONSUMED	BIT(0)
+#define ICE_XDP_TX		BIT(1)
+#define ICE_XDP_REDIR		BIT(2)
+#define ICE_XDP_EXIT		BIT(3)
+#define ICE_SKB_CONSUMED	ICE_XDP_CONSUMED
+
+#define ICE_RX_DMA_ATTR \
+	(DMA_ATTR_SKIP_CPU_SYNC | DMA_ATTR_WEAK_ORDERING)
+
+#define ICE_ETH_PKT_HDR_PAD	(ETH_HLEN + ETH_FCS_LEN + (VLAN_HLEN * 2))
+
+#define ICE_TXD_LAST_DESC_CMD (ICE_TX_DESC_CMD_EOP | ICE_TX_DESC_CMD_RS)
+
+/**
+ * enum ice_tx_buf_type - type of &ice_tx_buf to act on Tx completion
+ * @ICE_TX_BUF_EMPTY: unused OR XSk frame, no action required
+ * @ICE_TX_BUF_DUMMY: dummy Flow Director packet, unmap and kfree()
+ * @ICE_TX_BUF_FRAG: mapped skb OR &xdp_buff frag, only unmap DMA
+ * @ICE_TX_BUF_SKB: &sk_buff, unmap and consume_skb(), update stats
+ * @ICE_TX_BUF_XDP_TX: &xdp_buff, unmap and page_frag_free(), stats
+ * @ICE_TX_BUF_XDP_XMIT: &xdp_frame, unmap and xdp_return_frame(), stats
+ * @ICE_TX_BUF_XSK_TX: &xdp_buff on XSk queue, xsk_buff_free(), stats
+ */
+enum ice_tx_buf_type {
+	ICE_TX_BUF_EMPTY	= 0U,
+	ICE_TX_BUF_DUMMY,
+	ICE_TX_BUF_FRAG,
+	ICE_TX_BUF_SKB,
+	ICE_TX_BUF_XDP_TX,
+	ICE_TX_BUF_XDP_XMIT,
+	ICE_TX_BUF_XSK_TX,
+};
+
+struct ice_tx_buf {
+	union {
+		struct ice_tx_desc *next_to_watch;
+		u32 rs_idx;
+	};
+	union {
+		void *raw_buf;		/* used for XDP_TX and FDir rules */
+		struct sk_buff *skb;	/* used for .ndo_start_xmit() */
+		struct xdp_frame *xdpf;	/* used for .ndo_xdp_xmit() */
+		struct xdp_buff *xdp;	/* used for XDP_TX ZC */
+	};
+	unsigned int bytecount;
+	union {
+		unsigned int gso_segs;
+		unsigned int nr_frags;	/* used for mbuf XDP */
+	};
+	u32 tx_flags:12;
+	u32 type:4;			/* &ice_tx_buf_type */
+	u32 vid:16;
+	DEFINE_DMA_UNMAP_LEN(len);
+	DEFINE_DMA_UNMAP_ADDR(dma);
+};
+
+struct ice_tx_offload_params {
+	u64 cd_qw1;
+	struct ice_tx_ring *tx_ring;
+	u32 td_cmd;
+	u32 td_offset;
+	u32 td_l2tag1;
+	u32 cd_tunnel_params;
+	u16 cd_l2tag2;
+	u16 cd_gcs_params;
+	u8 header_len;
+};
+
+struct ice_ring_stats {
+	struct rcu_head rcu;	/* to avoid race on free */
+	struct u64_stats_sync syncp;
+	struct_group(stats,
+		u64_stats_t pkts;
+		u64_stats_t bytes;
+		union {
+			struct_group(tx,
+				u64_stats_t tx_restart_q;
+				u64_stats_t tx_busy;
+				u64_stats_t tx_linearize;
+				/* negative if no pending Tx descriptors */
+				int prev_pkt;
+			);
+			struct_group(rx,
+				u64_stats_t rx_non_eop_descs;
+				u64_stats_t rx_page_failed;
+				u64_stats_t rx_buf_failed;
+			);
+		};
+	);
+};
+
+/**
+ * ice_stats_read - Read a single ring stat value
+ * @stats: pointer to ring_stats structure for a queue
+ * @member: the ice_ring_stats member to read
+ *
+ * Shorthand for reading a single 64-bit stat value from struct
+ * ice_ring_stats.
+ *
+ * Return: the value of the requested stat.
+ */
+#define ice_stats_read(stats, member) ({				\
+	struct ice_ring_stats *__stats = (stats);			\
+	unsigned int start;						\
+	u64 val;							\
+	do {								\
+		start = u64_stats_fetch_begin(&__stats->syncp);		\
+		val = u64_stats_read(&__stats->member);			\
+	} while (u64_stats_fetch_retry(&__stats->syncp, start));	\
+	val;								\
+})
+
+/**
+ * ice_stats_inc - Increment a single ring stat value
+ * @stats: pointer to the ring_stats structure for a queue
+ * @member: the ice_ring_stats member to increment
+ *
+ * Shorthand for incrementing a single 64-bit stat value in struct
+ * ice_ring_stats.
+ */
+#define ice_stats_inc(stats, member) do {				\
+	struct ice_ring_stats *__stats = (stats);			\
+	u64_stats_update_begin(&__stats->syncp);			\
+	u64_stats_inc(&__stats->member);				\
+	u64_stats_update_end(&__stats->syncp);				\
+} while (0)
+
+enum ice_ring_state_t {
+	ICE_TX_XPS_INIT_DONE,
+	ICE_TX_NBITS,
+};
+
+/* this enum matches hardware bits and is meant to be used by DYN_CTLN
+ * registers and QINT registers or more generally anywhere in the manual
+ * mentioning ITR_INDX, ITR_NONE cannot be used as an index 'n' into any
+ * register but instead is a special value meaning "don't update" ITR0/1/2.
+ */
+enum ice_dyn_idx_t {
+	ICE_IDX_ITR0 = 0,
+	ICE_IDX_ITR1 = 1,
+	ICE_IDX_ITR2 = 2,
+	ICE_ITR_NONE = 3	/* ITR_NONE must not be used as an index */
+};
+
+/* Header split modes defined by DTYPE field of Rx RLAN context */
+enum ice_rx_dtype {
+	ICE_RX_DTYPE_NO_SPLIT		= 0,
+	ICE_RX_DTYPE_HEADER_SPLIT	= 1,
+	ICE_RX_DTYPE_SPLIT_ALWAYS	= 2,
+};
+
+enum ice_tx_ring_flags {
+	ICE_TX_RING_FLAGS_XDP,
+	ICE_TX_RING_FLAGS_VLAN_L2TAG1,
+	ICE_TX_RING_FLAGS_VLAN_L2TAG2,
+	ICE_TX_RING_FLAGS_TXTIME,
+	ICE_TX_RING_FLAGS_NBITS,
+};
+
+struct ice_pkt_ctx {
+	u64 cached_phctime;
+	__be16 vlan_proto;
+};
+
+/* indices into GLINT_ITR registers */
+#define ICE_RX_ITR	ICE_IDX_ITR0
+#define ICE_TX_ITR	ICE_IDX_ITR1
+#define ICE_ITR_8K	124
+#define ICE_ITR_20K	50
+#define ICE_ITR_MAX	8160 /* 0x1FE0 */
+#define ICE_DFLT_TX_ITR	ICE_ITR_20K
+#define ICE_DFLT_RX_ITR	ICE_ITR_20K
+enum ice_dynamic_itr {
+	ITR_STATIC = 0,
+	ITR_DYNAMIC = 1
+};
+
+#define ITR_IS_DYNAMIC(rc) ((rc)->itr_mode == ITR_DYNAMIC)
+#define ICE_ITR_GRAN_S		1	/* ITR granularity is always 2us */
+#define ICE_ITR_GRAN_US		BIT(ICE_ITR_GRAN_S)
+#define ICE_ITR_MASK		0x1FFE	/* ITR register value alignment mask */
+#define ITR_REG_ALIGN(setting)	((setting) & ICE_ITR_MASK)
+
+#define ICE_DFLT_INTRL	0
+#define ICE_MAX_INTRL	236
+
+#define ICE_IN_WB_ON_ITR_MODE	255
+/* Sets WB_ON_ITR and assumes INTENA bit is already cleared, which allows
+ * setting the MSK_M bit to tell hardware to ignore the INTENA_M bit. Also,
+ * set the write-back latency to the usecs passed in.
+ */
+#define ICE_GLINT_DYN_CTL_WB_ON_ITR(usecs, itr_idx)	\
+	((((usecs) << (GLINT_DYN_CTL_INTERVAL_S - ICE_ITR_GRAN_S)) & \
+	  GLINT_DYN_CTL_INTERVAL_M) | \
+	 (((itr_idx) << GLINT_DYN_CTL_ITR_INDX_S) & \
+	  GLINT_DYN_CTL_ITR_INDX_M) | GLINT_DYN_CTL_INTENA_MSK_M | \
+	 GLINT_DYN_CTL_WB_ON_ITR_M)
+
+/* Legacy or Advanced Mode Queue */
+#define ICE_TX_ADVANCED	0
+#define ICE_TX_LEGACY	1
+
+/* descriptor ring, associated with a VSI */
+struct ice_tstamp_ring {
+	struct ice_tx_ring *tx_ring;	/* Backreference to associated Tx ring */
+	dma_addr_t dma;			/* physical address of ring */
+	struct rcu_head rcu;            /* to avoid race on free */
+	u8 __iomem *tail;
+	void *desc;
+	u16 next_to_use;
+	u16 count;
+} ____cacheline_internodealigned_in_smp;
+
+struct ice_rx_ring {
+	__cacheline_group_begin_aligned(read_mostly);
+	void *desc;			/* Descriptor ring memory */
+	struct page_pool *pp;
+	struct net_device *netdev;	/* netdev ring maps to */
+	struct ice_q_vector *q_vector;	/* Backreference to associated vector */
+	u8 __iomem *tail;
+
+	union {
+		struct libeth_fqe *rx_fqes;
+		struct xdp_buff **xdp_buf;
+	};
+
+	u16 count;			/* Number of descriptors */
+	u8 ptp_rx;
+
+	u8 flags;
+#define ICE_RX_FLAGS_CRC_STRIP_DIS	BIT(2)
+#define ICE_RX_FLAGS_MULTIDEV		BIT(3)
+#define ICE_RX_FLAGS_RING_GCS		BIT(4)
+
+	u32 truesize;
+
+	struct page_pool *hdr_pp;
+	struct libeth_fqe *hdr_fqes;
+
+	struct bpf_prog *xdp_prog;
+	struct ice_tx_ring *xdp_ring;
+	struct xsk_buff_pool *xsk_pool;
+
+	/* stats structs */
+	struct ice_ring_stats *ring_stats;
+	struct ice_rx_ring *next;	/* pointer to next ring in q_vector */
+
+	u32 hdr_truesize;
+
+	struct xdp_rxq_info xdp_rxq;
+	__cacheline_group_end_aligned(read_mostly);
+
+	__cacheline_group_begin_aligned(read_write);
+	union {
+		struct libeth_xdp_buff_stash xdp;
+		struct libeth_xdp_buff *xsk;
+	};
+	union {
+		struct ice_pkt_ctx pkt_ctx;
+		struct {
+			u64 cached_phctime;
+			__be16 vlan_proto;
+		};
+	};
+
+	/* used in interrupt processing */
+	u16 next_to_use;
+	u16 next_to_clean;
+	__cacheline_group_end_aligned(read_write);
+
+	__cacheline_group_begin_aligned(cold);
+	struct rcu_head rcu;		/* to avoid race on free */
+	struct ice_vsi *vsi;		/* Backreference to associated VSI */
+	struct ice_channel *ch;
+
+	dma_addr_t dma;			/* physical address of ring */
+	u16 q_index;			/* Queue number of ring */
+	u16 reg_idx;			/* HW register index of the ring */
+	u8 dcb_tc;			/* Traffic class of ring */
+
+	u16 rx_hdr_len;
+	u16 rx_buf_len;
+	__cacheline_group_end_aligned(cold);
+} ____cacheline_internodealigned_in_smp;
+
+struct ice_tx_ring {
+	__cacheline_group_begin_aligned(read_mostly);
+	void *desc;			/* Descriptor ring memory */
+	struct device *dev;		/* Used for DMA mapping */
+	u8 __iomem *tail;
+	struct ice_tx_buf *tx_buf;
+
+	struct ice_q_vector *q_vector;	/* Backreference to associated vector */
+	struct net_device *netdev;	/* netdev ring maps to */
+	struct ice_vsi *vsi;		/* Backreference to associated VSI */
+
+	u16 count;			/* Number of descriptors */
+	u16 q_index;			/* Queue number of ring */
+
+	DECLARE_BITMAP(flags, ICE_TX_RING_FLAGS_NBITS);
+
+	struct xsk_buff_pool *xsk_pool;
+
+	/* stats structs */
+	struct ice_ring_stats *ring_stats;
+	struct ice_tx_ring *next;	/* pointer to next ring in q_vector */
+
+	struct ice_tstamp_ring *tstamp_ring;
+	struct ice_ptp_tx *tx_tstamps;
+	__cacheline_group_end_aligned(read_mostly);
+
+	__cacheline_group_begin_aligned(read_write);
+	u16 next_to_use;
+	u16 next_to_clean;
+
+	u16 xdp_tx_active;
+	spinlock_t tx_lock;
+	__cacheline_group_end_aligned(read_write);
+
+	__cacheline_group_begin_aligned(cold);
+	struct rcu_head rcu;		/* to avoid race on free */
+	DECLARE_BITMAP(xps_state, ICE_TX_NBITS);	/* XPS Config State */
+	struct ice_channel *ch;
+
+	dma_addr_t dma;			/* physical address of ring */
+	u16 q_handle;			/* Queue handle per TC */
+	u16 reg_idx;			/* HW register index of the ring */
+	u8 dcb_tc;			/* Traffic class of ring */
+
+	u16 quanta_prof_id;
+	u32 txq_teid;			/* Added Tx queue TEID */
+	__cacheline_group_end_aligned(cold);
+} ____cacheline_internodealigned_in_smp;
+
+static inline bool ice_ring_ch_enabled(struct ice_tx_ring *ring)
+{
+	return !!ring->ch;
+}
+
+static inline bool ice_ring_is_xdp(struct ice_tx_ring *ring)
+{
+	return test_bit(ICE_TX_RING_FLAGS_XDP, ring->flags);
+}
+
+enum ice_container_type {
+	ICE_RX_CONTAINER,
+	ICE_TX_CONTAINER,
+};
+
+struct ice_ring_container {
+	/* head of linked-list of rings */
+	union {
+		struct ice_rx_ring *rx_ring;
+		struct ice_tx_ring *tx_ring;
+	};
+	struct dim dim;		/* data for net_dim algorithm */
+	u16 itr_idx;		/* index in the interrupt vector */
+	/* this matches the maximum number of ITR bits, but in usec
+	 * values, so it is shifted left one bit (bit zero is ignored)
+	 */
+	union {
+		struct {
+			u16 itr_setting:13;
+			u16 itr_reserved:2;
+			u16 itr_mode:1;
+		};
+		u16 itr_settings;
+	};
+	enum ice_container_type type;
+};
+
+struct ice_coalesce_stored {
+	u16 itr_tx;
+	u16 itr_rx;
+	u8 intrl;
+	u8 tx_valid;
+	u8 rx_valid;
+};
+
+/* iterator for handling rings in ring container */
+#define ice_for_each_rx_ring(pos, head) \
+	for (pos = (head).rx_ring; pos; pos = pos->next)
+
+#define ice_for_each_tx_ring(pos, head) \
+	for (pos = (head).tx_ring; pos; pos = pos->next)
+
+static inline unsigned int ice_rx_pg_order(struct ice_rx_ring *ring)
+{
+	return 0;
+}
+
+union ice_32b_rx_flex_desc;
+
+void ice_init_ctrl_rx_descs(struct ice_rx_ring *rx_ring, u32 num_descs);
+void ice_rxq_pp_destroy(struct ice_rx_ring *rq);
+bool ice_alloc_rx_bufs(struct ice_rx_ring *rxr, unsigned int cleaned_count);
+netdev_tx_t ice_start_xmit(struct sk_buff *skb, struct net_device *netdev);
+u16
+ice_select_queue(struct net_device *dev, struct sk_buff *skb,
+		 struct net_device *sb_dev);
+void ice_clean_tx_ring(struct ice_tx_ring *tx_ring);
+void ice_clean_rx_ring(struct ice_rx_ring *rx_ring);
+int ice_setup_tx_ring(struct ice_tx_ring *tx_ring);
+int ice_setup_rx_ring(struct ice_rx_ring *rx_ring);
+int ice_alloc_setup_tstamp_ring(struct ice_tx_ring *tx_ring);
+void ice_free_tx_ring(struct ice_tx_ring *tx_ring);
+void ice_free_rx_ring(struct ice_rx_ring *rx_ring);
+int ice_napi_poll(struct napi_struct *napi, int budget);
+int
+ice_prgm_fdir_fltr(struct ice_vsi *vsi, struct ice_fltr_desc *fdir_desc,
+		   u8 *raw_packet);
+void ice_clean_ctrl_tx_irq(struct ice_tx_ring *tx_ring);
+void ice_clean_ctrl_rx_irq(struct ice_rx_ring *rx_ring);
+void ice_free_tx_tstamp_ring(struct ice_tx_ring *tx_ring);
+void ice_free_tstamp_ring(struct ice_tx_ring *tx_ring);
+#endif /* _ICE_TXRX_H_ */

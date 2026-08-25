@@ -1,0 +1,274 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright © 2022 Intel Corporation
+ */
+
+#include "xe_tuning.h"
+
+#include <kunit/visibility.h>
+
+#include <drm/drm_managed.h>
+#include <drm/drm_print.h>
+
+#include "regs/xe_engine_regs.h"
+#include "regs/xe_gt_regs.h"
+#include "xe_gt_types.h"
+#include "xe_platform_types.h"
+#include "xe_rtp.h"
+#include "xe_sriov.h"
+
+#undef XE_REG_MCR
+#define XE_REG_MCR(...)     XE_REG(__VA_ARGS__, .mcr = 1)
+
+VISIBLE_IF_KUNIT const struct xe_rtp_table_sr gt_tunings = XE_RTP_TABLE_SR(
+	{ XE_RTP_NAME("Tuning: Blend Fill Caching Optimization Disable"),
+	  XE_RTP_RULES(PLATFORM(DG2)),
+	  XE_RTP_ACTIONS(SET(XEHP_L3SCQREG7, BLEND_FILL_CACHING_OPT_DIS))
+	},
+	{ XE_RTP_NAME("Tuning: 32B Access Enable"),
+	  XE_RTP_RULES(PLATFORM(DG2)),
+	  XE_RTP_ACTIONS(SET(XEHP_SQCM, EN_32B_ACCESS))
+	},
+
+	/* Xe2 */
+
+	{ XE_RTP_NAME("Tuning: L3 cache"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, 3499)),
+	  XE_RTP_ACTIONS(FIELD_SET(XEHP_L3SQCREG5, L3_PWM_TIMER_INIT_VAL_MASK,
+				   REG_FIELD_PREP(L3_PWM_TIMER_INIT_VAL_MASK, 0x7f)))
+	},
+	{ XE_RTP_NAME("Tuning: L3 cache - media"),
+	  XE_RTP_RULES(MEDIA_VERSION_RANGE(2000, 3499)),
+	  XE_RTP_ACTIONS(FIELD_SET(XE2LPM_L3SQCREG5, L3_PWM_TIMER_INIT_VAL_MASK,
+				   REG_FIELD_PREP(L3_PWM_TIMER_INIT_VAL_MASK, 0x7f)))
+	},
+	{ XE_RTP_NAME("Tuning: Compression Overfetch"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, 3499),
+		       FUNC(xe_rtp_match_has_flat_ccs)),
+	  XE_RTP_ACTIONS(CLR(CCCHKNREG1, ENCOMPPERFFIX),
+			 SET(CCCHKNREG1, L3CMPCTRL))
+	},
+	{ XE_RTP_NAME("Tuning: Compression Overfetch - media"),
+	  XE_RTP_RULES(MEDIA_VERSION_RANGE(2000, XE_RTP_END_VERSION_UNDEFINED)),
+	  XE_RTP_ACTIONS(CLR(XE2LPM_CCCHKNREG1, ENCOMPPERFFIX),
+			 SET(XE2LPM_CCCHKNREG1, L3CMPCTRL))
+	},
+	{ XE_RTP_NAME("Tuning: Enable compressible partial write overfetch in L3"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, 3499)),
+	  XE_RTP_ACTIONS(SET(L3SQCREG3, COMPPWOVERFETCHEN))
+	},
+	{ XE_RTP_NAME("Tuning: Enable compressible partial write overfetch in L3 - media"),
+	  XE_RTP_RULES(MEDIA_VERSION_RANGE(2000, XE_RTP_END_VERSION_UNDEFINED)),
+	  XE_RTP_ACTIONS(SET(XE2LPM_L3SQCREG3, COMPPWOVERFETCHEN))
+	},
+	{ XE_RTP_NAME("Tuning: L2 Overfetch Compressible Only"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, XE_RTP_END_VERSION_UNDEFINED),
+		       FUNC(xe_rtp_match_has_flat_ccs)),
+	  XE_RTP_ACTIONS(SET(L3SQCREG2,
+			     COMPMEMRD256BOVRFETCHEN))
+	},
+	{ XE_RTP_NAME("Tuning: L2 Overfetch Compressible Only - media"),
+	  XE_RTP_RULES(MEDIA_VERSION_RANGE(2000, XE_RTP_END_VERSION_UNDEFINED),
+		       FUNC(xe_rtp_match_has_flat_ccs)),
+	  XE_RTP_ACTIONS(SET(XE2LPM_L3SQCREG2,
+			     COMPMEMRD256BOVRFETCHEN))
+	},
+	{ XE_RTP_NAME("Tuning: Stateless compression control"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, XE_RTP_END_VERSION_UNDEFINED)),
+	  XE_RTP_ACTIONS(FIELD_SET(STATELESS_COMPRESSION_CTRL, UNIFIED_COMPRESSION_FORMAT,
+				   REG_FIELD_PREP(UNIFIED_COMPRESSION_FORMAT, 0)))
+	},
+	{ XE_RTP_NAME("Tuning: Stateless compression control - media"),
+	  XE_RTP_RULES(MEDIA_VERSION_RANGE(1301, XE_RTP_END_VERSION_UNDEFINED)),
+	  XE_RTP_ACTIONS(FIELD_SET(STATELESS_COMPRESSION_CTRL, UNIFIED_COMPRESSION_FORMAT,
+				   REG_FIELD_PREP(UNIFIED_COMPRESSION_FORMAT, 0)))
+	},
+	{ XE_RTP_NAME("Tuning: L3 RW flush all Cache"),
+	  XE_RTP_RULES(GRAPHICS_VERSION(2004)),
+	  XE_RTP_ACTIONS(SET(SCRATCH3_LBCF, RWFLUSHALLEN))
+	},
+	{ XE_RTP_NAME("Tuning: L3 RW flush all cache - media"),
+	  XE_RTP_RULES(MEDIA_VERSION(2000)),
+	  XE_RTP_ACTIONS(SET(XE2LPM_SCRATCH3_LBCF, RWFLUSHALLEN))
+	},
+
+	/* Xe3p */
+
+	{ XE_RTP_NAME("Tuning: Set STLB Bank Hash Mode to 4KB"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(3510, XE_RTP_END_VERSION_UNDEFINED),
+		       IS_INTEGRATED),
+	  XE_RTP_ACTIONS(FIELD_SET(GAMSTLB_CTRL, BANK_HASH_MODE,
+				   BANK_HASH_4KB_MODE))
+	},
+);
+EXPORT_SYMBOL_IF_KUNIT(gt_tunings);
+
+static const struct xe_rtp_table_sr engine_tunings = XE_RTP_TABLE_SR(
+	{ XE_RTP_NAME("Tuning: L3 Hashing Mask"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1210),
+		       FUNC(xe_rtp_match_first_render_or_compute)),
+	  XE_RTP_ACTIONS(CLR(XELP_GARBCNTL, XELP_BUS_HASH_CTL_BIT_EXC))
+	},
+	{ XE_RTP_NAME("Tuning: Set Indirect State Override"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1274),
+		       ENGINE_CLASS(RENDER)),
+	  XE_RTP_ACTIONS(SET(SAMPLER_MODE, INDIRECT_STATE_BASE_ADDR_OVERRIDE))
+	},
+	{ XE_RTP_NAME("Tuning: Disable NULL query for Anyhit Shader"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2000, XE_RTP_END_VERSION_UNDEFINED),
+		       FUNC(xe_rtp_match_first_render_or_compute)),
+	  XE_RTP_ACTIONS(SET(RT_CTRL, DIS_NULL_QUERY))
+	},
+	{ XE_RTP_NAME("Tuning: disable HW reporting of ctx switch to GHWSP"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(3500, XE_RTP_END_VERSION_UNDEFINED)),
+	  XE_RTP_ACTIONS(SET(CSFE_CHICKEN1(0),
+			     GHWSP_CSB_REPORT_DIS,
+			     XE_RTP_ACTION_FLAG(ENGINE_BASE)))
+	},
+	{ XE_RTP_NAME("Tuning: TileY 2x2 Walk"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(3510, XE_RTP_END_VERSION_UNDEFINED),
+		       FUNC(xe_rtp_match_first_render_or_compute)),
+	  XE_RTP_ACTIONS(SET(TDL_TSL_CHICKEN2, TILEY_LOCALID))
+	},
+);
+
+static const struct xe_rtp_table_sr lrc_tunings = XE_RTP_TABLE_SR(
+	{ XE_RTP_NAME("Tuning: Windower HW Filtering"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(3000, 3599), ENGINE_CLASS(RENDER)),
+	  XE_RTP_ACTIONS(SET(XEHP_COMMON_SLICE_CHICKEN4, HW_FILTERING))
+	},
+
+	/* DG2 */
+
+	{ XE_RTP_NAME("Tuning: L3 cache"),
+	  XE_RTP_RULES(PLATFORM(DG2), ENGINE_CLASS(RENDER)),
+	  XE_RTP_ACTIONS(FIELD_SET(XEHP_L3SQCREG5, L3_PWM_TIMER_INIT_VAL_MASK,
+				   REG_FIELD_PREP(L3_PWM_TIMER_INIT_VAL_MASK, 0x7f)))
+	},
+	{ XE_RTP_NAME("Tuning: TDS gang timer"),
+	  XE_RTP_RULES(PLATFORM(DG2), ENGINE_CLASS(RENDER)),
+	  /* read verification is ignored as in i915 - need to check enabling */
+	  XE_RTP_ACTIONS(FIELD_SET_NO_READ_MASK(XEHP_FF_MODE2,
+						FF_MODE2_TDS_TIMER_MASK,
+						FF_MODE2_TDS_TIMER_128))
+	},
+	{ XE_RTP_NAME("Tuning: TBIMR fast clip"),
+	  XE_RTP_RULES(PLATFORM(DG2), ENGINE_CLASS(RENDER)),
+	  XE_RTP_ACTIONS(SET(CHICKEN_RASTER_2, TBIMR_FAST_CLIP))
+	},
+
+	/* Xe_LPG */
+
+	{ XE_RTP_NAME("Tuning: L3 cache"),
+	  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1270, 1274), ENGINE_CLASS(RENDER)),
+	  XE_RTP_ACTIONS(FIELD_SET(XEHP_L3SQCREG5, L3_PWM_TIMER_INIT_VAL_MASK,
+				   REG_FIELD_PREP(L3_PWM_TIMER_INIT_VAL_MASK, 0x7f)))
+	},
+
+	/* Xe2_HPG */
+
+	{ XE_RTP_NAME("Tuning: vs hit max value"),
+	  XE_RTP_RULES(GRAPHICS_VERSION(2001), ENGINE_CLASS(RENDER)),
+	  XE_RTP_ACTIONS(FIELD_SET(FF_MODE, VS_HIT_MAX_VALUE_MASK,
+				   REG_FIELD_PREP(VS_HIT_MAX_VALUE_MASK, 0x3f)))
+	},
+);
+
+/**
+ * xe_tuning_init - initialize gt with tunings bookkeeping
+ * @gt: GT instance to initialize
+ *
+ * Returns 0 for success, negative error code otherwise.
+ */
+int xe_tuning_init(struct xe_gt *gt)
+{
+	struct xe_device *xe = gt_to_xe(gt);
+	size_t n_lrc, n_engine, n_gt, total;
+	unsigned long *p;
+
+	n_gt = BITS_TO_LONGS(gt_tunings.n_entries);
+	n_engine = BITS_TO_LONGS(engine_tunings.n_entries);
+	n_lrc = BITS_TO_LONGS(lrc_tunings.n_entries);
+	total = n_gt + n_engine + n_lrc;
+
+	p = drmm_kzalloc(&xe->drm, sizeof(*p) * total, GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	gt->tuning_active.gt = p;
+	p += n_gt;
+	gt->tuning_active.engine = p;
+	p += n_engine;
+	gt->tuning_active.lrc = p;
+
+	return 0;
+}
+ALLOW_ERROR_INJECTION(xe_tuning_init, ERRNO); /* See xe_pci_probe() */
+
+void xe_tuning_process_gt(struct xe_gt *gt)
+{
+	struct xe_rtp_process_ctx ctx = XE_RTP_PROCESS_CTX_INITIALIZER(gt);
+
+	xe_rtp_process_ctx_enable_active_tracking(&ctx,
+						  gt->tuning_active.gt,
+						  gt_tunings.n_entries);
+	xe_rtp_process_to_sr(&ctx, &gt_tunings, &gt->reg_sr, false);
+}
+EXPORT_SYMBOL_IF_KUNIT(xe_tuning_process_gt);
+
+void xe_tuning_process_engine(struct xe_hw_engine *hwe)
+{
+	struct xe_rtp_process_ctx ctx = XE_RTP_PROCESS_CTX_INITIALIZER(hwe);
+
+	xe_rtp_process_ctx_enable_active_tracking(&ctx,
+						  hwe->gt->tuning_active.engine,
+						  engine_tunings.n_entries);
+	xe_rtp_process_to_sr(&ctx, &engine_tunings, &hwe->reg_sr, false);
+}
+EXPORT_SYMBOL_IF_KUNIT(xe_tuning_process_engine);
+
+/**
+ * xe_tuning_process_lrc - process lrc tunings
+ * @hwe: engine instance to process tunings for
+ *
+ * Process LRC table for this platform, saving in @hwe all the tunings that need
+ * to be applied on context restore. These are tunings touching registers that
+ * are part of the HW context image.
+ */
+void xe_tuning_process_lrc(struct xe_hw_engine *hwe)
+{
+	struct xe_rtp_process_ctx ctx = XE_RTP_PROCESS_CTX_INITIALIZER(hwe);
+
+	xe_rtp_process_ctx_enable_active_tracking(&ctx,
+						  hwe->gt->tuning_active.lrc,
+						  lrc_tunings.n_entries);
+	xe_rtp_process_to_sr(&ctx, &lrc_tunings, &hwe->reg_lrc, true);
+}
+
+/**
+ * xe_tuning_dump() - Dump GT tuning info into a drm printer.
+ * @gt: the &xe_gt
+ * @p: the &drm_printer
+ *
+ * Return: always 0.
+ */
+int xe_tuning_dump(struct xe_gt *gt, struct drm_printer *p)
+{
+	size_t idx;
+
+	drm_printf(p, "GT Tunings\n");
+	for_each_set_bit(idx, gt->tuning_active.gt, gt_tunings.n_entries)
+		drm_printf_indent(p, 1, "%s\n", gt_tunings.entries[idx].name);
+
+	drm_puts(p, "\n");
+	drm_printf(p, "Engine Tunings\n");
+	for_each_set_bit(idx, gt->tuning_active.engine, engine_tunings.n_entries)
+		drm_printf_indent(p, 1, "%s\n", engine_tunings.entries[idx].name);
+
+	drm_puts(p, "\n");
+	drm_printf(p, "LRC Tunings\n");
+	for_each_set_bit(idx, gt->tuning_active.lrc, lrc_tunings.n_entries)
+		drm_printf_indent(p, 1, "%s\n", lrc_tunings.entries[idx].name);
+
+	return 0;
+}

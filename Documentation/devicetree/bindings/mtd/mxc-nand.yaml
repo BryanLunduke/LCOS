@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mtd/mxc-nand.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Freescale's mxc_nand
+
+maintainers:
+  - Uwe Kleine-König <u.kleine-koenig@pengutronix.de>
+
+allOf:
+  - $ref: nand-controller-legacy.yaml
+
+properties:
+  compatible:
+    oneOf:
+      - enum:
+          - fsl,imx25-nand
+          - fsl,imx27-nand
+          - fsl,imx51-nand
+          - fsl,imx53-nand
+      - items:
+          - enum:
+              - fsl,imx35-nand
+          - const: fsl,imx25-nand
+      - items:
+          - enum:
+              - fsl,imx31-nand
+          - const: fsl,imx27-nand
+  reg:
+    minItems: 1
+    items:
+      - description: IP register space
+      - description: Nand flash internal buffer space
+
+  interrupts:
+    maxItems: 1
+
+  clocks:
+    maxItems: 1
+
+  dmas:
+    maxItems: 1
+
+  dma-names:
+    items:
+      - const: rx-tx
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    nand-controller@d8000000 {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        compatible = "fsl,imx27-nand";
+        reg = <0xd8000000 0x1000>;
+        interrupts = <29>;
+    };

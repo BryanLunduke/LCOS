@@ -1,0 +1,2411 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ *   Copyright (C) 2016 Namjae Jeon <linkinjeon@kernel.org>
+ *   Copyright (C) 2018 Samsung Electronics Co., Ltd.
+ */
+
+#include <crypto/sha2.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/fs_struct.h>
+#include <linux/filelock.h>
+#include <linux/uaccess.h>
+#include <linux/backing-dev.h>
+#include <linux/writeback.h>
+#include <linux/xattr.h>
+#include <linux/falloc.h>
+#include <linux/fsnotify.h>
+#include <linux/dcache.h>
+#include <linux/slab.h>
+#include <linux/sizes.h>
+#include <linux/vmalloc.h>
+#include <linux/sched/xacct.h>
+#include <linux/crc32c.h>
+#include <linux/fileattr.h>
+
+#include "glob.h"
+#include "oplock.h"
+#include "connection.h"
+#include "vfs.h"
+#include "vfs_cache.h"
+#include "smbacl.h"
+#include "ndr.h"
+#include "auth.h"
+#include "misc.h"
+#include "stats.h"
+
+#include "smb_common.h"
+#include "mgmt/share_config.h"
+#include "mgmt/tree_connect.h"
+#include "mgmt/user_session.h"
+#include "mgmt/user_config.h"
+
+static void ksmbd_vfs_inherit_owner(struct ksmbd_work *work,
+				    struct inode *parent_inode,
+				    struct inode *inode)
+{
+	if (!test_share_config_flag(work->tcon->share_conf,
+				    KSMBD_SHARE_FLAG_INHERIT_OWNER))
+		return;
+
+	i_uid_write(inode, i_uid_read(parent_inode));
+}
+
+static int ksmbd_vfs_path_lookup(struct ksmbd_share_config *share_conf,
+				 char *pathname, unsigned int flags,
+				 struct path *path, bool for_remove)
+{
+	struct qstr last;
+	const struct path *root_share_path = &share_conf->vfs_path;
+	int err;
+	struct dentry *d;
+
+	if (pathname[0] == '\0') {
+		pathname = share_conf->path;
+		root_share_path = NULL;
+	} else {
+		flags |= LOOKUP_BENEATH;
+	}
+
+	CLASS(filename_kernel, filename)(pathname);
+	scoped_with_init_fs()
+		err = vfs_path_parent_lookup(filename, flags, path, &last,
+					     root_share_path);
+	if (err)
+		return err;
+
+	if (for_remove) {
+		err = mnt_want_write(path->mnt);
+		if (err) {
+			path_put(path);
+			return -ENOENT;
+		}
+
+		d = start_removing_noperm(path->dentry, &last);
+
+		if (!IS_ERR(d)) {
+			dput(path->dentry);
+			path->dentry = d;
+			return 0;
+		}
+		mnt_drop_write(path->mnt);
+		path_put(path);
+		return -ENOENT;
+	}
+
+	d = lookup_noperm_unlocked(&last, path->dentry);
+	if (!IS_ERR(d) && d_is_negative(d)) {
+		dput(d);
+		d = ERR_PTR(-ENOENT);
+	}
+	if (IS_ERR(d)) {
+		path_put(path);
+		return -ENOENT;
+	}
+	dput(path->dentry);
+	path->dentry = d;
+
+	if (test_share_config_flag(share_conf, KSMBD_SHARE_FLAG_CROSSMNT)) {
+		err = follow_down(path, 0);
+		if (err < 0) {
+			path_put(path);
+			return -ENOENT;
+		}
+	}
+	return 0;
+}
+
+void ksmbd_vfs_query_maximal_access(struct mnt_idmap *idmap,
+				   struct dentry *dentry, __le32 *daccess)
+{
+	*daccess = cpu_to_le32(FILE_READ_ATTRIBUTES | READ_CONTROL);
+
+	if (!inode_permission(idmap, d_inode(dentry), MAY_OPEN | MAY_WRITE))
+		*daccess |= cpu_to_le32(WRITE_DAC | WRITE_OWNER | SYNCHRONIZE |
+				FILE_WRITE_DATA | FILE_APPEND_DATA |
+				FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES |
+				FILE_DELETE_CHILD);
+
+	if (!inode_permission(idmap, d_inode(dentry), MAY_OPEN | MAY_READ))
+		*daccess |= FILE_READ_DATA_LE | FILE_READ_EA_LE;
+
+	if (!inode_permission(idmap, d_inode(dentry), MAY_OPEN | MAY_EXEC))
+		*daccess |= FILE_EXECUTE_LE;
+
+	if (!inode_permission(idmap, d_inode(dentry->d_parent), MAY_EXEC | MAY_WRITE))
+		*daccess |= FILE_DELETE_LE;
+}
+
+/**
+ * ksmbd_vfs_create() - vfs helper for smb create file
+ * @work:	work
+ * @name:	file name that is relative to share
+ * @mode:	file create mode
+ *
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode)
+{
+	struct path path;
+	struct dentry *dentry;
+	int err;
+
+	dentry = ksmbd_vfs_kern_path_create(work, name,
+					    LOOKUP_NO_SYMLINKS, &path);
+	if (IS_ERR(dentry)) {
+		err = PTR_ERR(dentry);
+		if (err != -ENOENT)
+			pr_err("path create failed for %s, err %d\n",
+			       name, err);
+		return err;
+	}
+
+	mode |= S_IFREG;
+	err = vfs_create(mnt_idmap(path.mnt), dentry, mode, NULL);
+	if (!err) {
+		ksmbd_vfs_inherit_owner(work, d_inode(path.dentry),
+					d_inode(dentry));
+	} else {
+		pr_err("File(%s): creation failed (err:%d)\n", name, err);
+	}
+
+	end_creating_path(&path, dentry);
+	return err;
+}
+
+/**
+ * ksmbd_vfs_mkdir() - vfs helper for smb create directory
+ * @work:	work
+ * @name:	directory name that is relative to share
+ * @mode:	directory create mode
+ *
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode)
+{
+	struct mnt_idmap *idmap;
+	struct path path;
+	struct dentry *dentry, *d;
+	int err = 0;
+
+	dentry = ksmbd_vfs_kern_path_create(work, name,
+					    LOOKUP_NO_SYMLINKS | LOOKUP_DIRECTORY,
+					    &path);
+	if (IS_ERR(dentry)) {
+		err = PTR_ERR(dentry);
+		if (err != -EEXIST)
+			ksmbd_debug(VFS, "path create failed for %s, err %d\n",
+				    name, err);
+		return err;
+	}
+
+	idmap = mnt_idmap(path.mnt);
+	mode |= S_IFDIR;
+	d = dentry;
+	dentry = vfs_mkdir(idmap, d_inode(path.dentry), dentry, mode, NULL);
+	if (IS_ERR(dentry))
+		err = PTR_ERR(dentry);
+	else if (d_is_negative(dentry))
+		err = -ENOENT;
+	if (!err && dentry != d)
+		ksmbd_vfs_inherit_owner(work, d_inode(path.dentry), d_inode(dentry));
+
+	end_creating_path(&path, dentry);
+	if (err)
+		pr_err("mkdir(%s): creation failed (err:%d)\n", name, err);
+	return err;
+}
+
+static ssize_t ksmbd_vfs_getcasexattr(struct mnt_idmap *idmap,
+				      struct dentry *dentry, char *attr_name,
+				      int attr_name_len, char **attr_value)
+{
+	char *name, *xattr_list = NULL;
+	ssize_t value_len = -ENOENT, xattr_list_len;
+
+	xattr_list_len = ksmbd_vfs_listxattr(dentry, &xattr_list);
+	if (xattr_list_len <= 0)
+		goto out;
+
+	for (name = xattr_list; name - xattr_list < xattr_list_len;
+			name += strlen(name) + 1) {
+		ksmbd_debug(VFS, "%s, len %zd\n", name, strlen(name));
+		if (strncasecmp(attr_name, name, attr_name_len))
+			continue;
+
+		value_len = ksmbd_vfs_getxattr(idmap,
+					       dentry,
+					       name,
+					       attr_value);
+		if (value_len < 0)
+			pr_err("failed to get xattr in file\n");
+		break;
+	}
+
+out:
+	kvfree(xattr_list);
+	return value_len;
+}
+
+static int ksmbd_vfs_stream_read(struct ksmbd_file *fp, char *buf, loff_t *pos,
+				 size_t count)
+{
+	const struct cred *saved_cred;
+	ssize_t v_len;
+	char *stream_buf = NULL;
+
+	ksmbd_debug(VFS, "read stream data pos : %llu, count : %zd\n",
+		    *pos, count);
+
+	saved_cred = override_creds(fp->filp->f_cred);
+	v_len = ksmbd_vfs_getcasexattr(file_mnt_idmap(fp->filp),
+				       fp->filp->f_path.dentry,
+				       fp->stream.name,
+				       fp->stream.size,
+				       &stream_buf);
+	revert_creds(saved_cred);
+	if ((int)v_len <= 0)
+		return (int)v_len;
+
+	if (v_len <= *pos) {
+		count = -EINVAL;
+		goto free_buf;
+	}
+
+	if (v_len - *pos < count)
+		count = v_len - *pos;
+	fp->stream.pos = v_len;
+
+	memcpy(buf, &stream_buf[*pos], count);
+
+free_buf:
+	kvfree(stream_buf);
+	return count;
+}
+
+/**
+ * check_lock_range() - vfs helper for smb byte range file locking
+ * @filp:	the file to apply the lock to
+ * @start:	lock start byte offset
+ * @end:	lock end byte offset
+ * @type:	byte range type read/write
+ *
+ * Return:	0 on success, otherwise error
+ */
+static int check_lock_range(struct file *filp, loff_t start, loff_t end,
+			    unsigned char type)
+{
+	struct file_lock *flock;
+	struct file_lock_context *ctx = locks_inode_context(file_inode(filp));
+	int error = 0;
+
+	if (!ctx || list_empty_careful(&ctx->flc_posix))
+		return 0;
+
+	spin_lock(&ctx->flc_lock);
+	for_each_file_lock(flock, &ctx->flc_posix) {
+		/* check conflict locks */
+		if (flock->fl_end >= start && end >= flock->fl_start) {
+			if (lock_is_read(flock)) {
+				if (type == WRITE) {
+					pr_err("not allow write by shared lock\n");
+					error = 1;
+					goto out;
+				}
+			} else if (lock_is_write(flock)) {
+				/* check owner in lock */
+				if (flock->c.flc_file != filp) {
+					error = 1;
+					pr_err("not allow rw access by exclusive lock from other opens\n");
+					goto out;
+				}
+			}
+		}
+	}
+out:
+	spin_unlock(&ctx->flc_lock);
+	return error;
+}
+
+/**
+ * ksmbd_vfs_read() - vfs helper for smb file read
+ * @work:	smb work
+ * @fp:		ksmbd file pointer
+ * @count:	read byte count
+ * @pos:	file pos
+ * @rbuf:	read data buffer
+ *
+ * Return:	number of read bytes on success, otherwise error
+ */
+int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
+		   loff_t *pos, char *rbuf)
+{
+	struct file *filp = fp->filp;
+	ssize_t nbytes = 0;
+	struct inode *inode = file_inode(filp);
+
+	if (S_ISDIR(inode->i_mode) && !ksmbd_stream_fd(fp))
+		return -EISDIR;
+
+	if (unlikely(count == 0))
+		return 0;
+
+	if (work->conn->connection_type) {
+		if (!(fp->daccess & (FILE_READ_DATA_LE | FILE_EXECUTE_LE))) {
+			pr_err("no right to read(%pD)\n", fp->filp);
+			return -EACCES;
+		}
+	}
+
+	if (ksmbd_stream_fd(fp))
+		return ksmbd_vfs_stream_read(fp, rbuf, pos, count);
+
+	if (!work->tcon->posix_extensions) {
+		int ret;
+
+		ret = check_lock_range(filp, *pos, *pos + count - 1, READ);
+		if (ret) {
+			pr_err("unable to read due to lock\n");
+			return -EAGAIN;
+		}
+	}
+
+	nbytes = kernel_read(filp, rbuf, count, pos);
+	if (nbytes < 0) {
+		pr_err("smb read failed, err = %zd\n", nbytes);
+		return nbytes;
+	}
+
+	filp->f_pos = *pos;
+	ksmbd_counter_add(KSMBD_COUNTER_READ_BYTES, (s64)nbytes);
+	return nbytes;
+}
+
+static int ksmbd_vfs_stream_write(struct ksmbd_file *fp, char *buf, loff_t *pos,
+				  size_t count)
+{
+	const struct cred *saved_cred;
+	char *stream_buf = NULL, *wbuf;
+	struct mnt_idmap *idmap = file_mnt_idmap(fp->filp);
+	size_t size;
+	ssize_t v_len;
+	int err = 0;
+
+	ksmbd_debug(VFS, "write stream data pos : %llu, count : %zd\n",
+		    *pos, count);
+
+	if (*pos >= XATTR_SIZE_MAX) {
+		pr_err("stream write position %lld is out of bounds\n",	*pos);
+		return -EINVAL;
+	}
+
+	size = *pos + count;
+	if (size > XATTR_SIZE_MAX) {
+		size = XATTR_SIZE_MAX;
+		count = XATTR_SIZE_MAX - *pos;
+	}
+
+	saved_cred = override_creds(fp->filp->f_cred);
+	v_len = ksmbd_vfs_getcasexattr(idmap,
+				       fp->filp->f_path.dentry,
+				       fp->stream.name,
+				       fp->stream.size,
+				       &stream_buf);
+	if (v_len < 0) {
+		pr_err("not found stream in xattr : %zd\n", v_len);
+		err = v_len;
+		goto out_revert;
+	}
+
+	if (v_len < size) {
+		wbuf = kvzalloc(size, KSMBD_DEFAULT_GFP);
+		if (!wbuf) {
+			err = -ENOMEM;
+			goto out_revert;
+		}
+
+		if (v_len > 0)
+			memcpy(wbuf, stream_buf, v_len);
+		kvfree(stream_buf);
+		stream_buf = wbuf;
+	}
+
+	memcpy(&stream_buf[*pos], buf, count);
+
+	err = ksmbd_vfs_setxattr(idmap,
+				 &fp->filp->f_path,
+				 fp->stream.name,
+				 (void *)stream_buf,
+				 size,
+				 0,
+				 true);
+out_revert:
+	revert_creds(saved_cred);
+	if (err < 0)
+		goto out;
+	else
+		fp->stream.pos = size;
+	err = 0;
+out:
+	kvfree(stream_buf);
+	return err;
+}
+
+/**
+ * ksmbd_vfs_write() - vfs helper for smb file write
+ * @work:	work
+ * @fp:		ksmbd file pointer
+ * @buf:	buf containing data for writing
+ * @count:	read byte count
+ * @pos:	file pos
+ * @sync:	fsync after write
+ * @written:	number of bytes written
+ *
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
+		    char *buf, size_t count, loff_t *pos, bool sync,
+		    ssize_t *written)
+{
+	struct file *filp;
+	loff_t	offset = *pos;
+	int err = 0;
+
+	if (work->conn->connection_type) {
+		if (!(fp->daccess & (FILE_WRITE_DATA_LE | FILE_APPEND_DATA_LE)) ||
+		    (S_ISDIR(file_inode(fp->filp)->i_mode) &&
+		     !ksmbd_stream_fd(fp))) {
+			pr_err("no right to write(%pD)\n", fp->filp);
+			err = -EACCES;
+			goto out;
+		}
+	}
+
+	filp = fp->filp;
+
+	if (ksmbd_stream_fd(fp)) {
+		err = ksmbd_vfs_stream_write(fp, buf, pos, count);
+		if (!err)
+			*written = count;
+		goto out;
+	}
+
+	if (!work->tcon->posix_extensions) {
+		err = check_lock_range(filp, *pos, *pos + count - 1, WRITE);
+		if (err) {
+			pr_err("unable to write due to lock\n");
+			err = -EAGAIN;
+			goto out;
+		}
+	}
+
+	/* Reserve lease break for parent dir at closing time */
+	fp->reserve_lease_break = true;
+
+	/* Do we need to break any of a levelII oplock? */
+	smb_break_all_levII_oplock(work, fp, 1);
+
+	err = kernel_write(filp, buf, count, pos);
+	if (err < 0) {
+		ksmbd_debug(VFS, "smb write failed, err = %d\n", err);
+		goto out;
+	}
+
+	filp->f_pos = *pos;
+	*written = err;
+	err = 0;
+	if (sync) {
+		err = vfs_fsync_range(filp, offset, offset + *written, 0);
+		if (err < 0)
+			pr_err("fsync failed for filename = %pD, err = %d\n",
+			       fp->filp, err);
+	}
+	ksmbd_counter_add(KSMBD_COUNTER_WRITE_BYTES, (s64)*written);
+
+out:
+	return err;
+}
+
+/**
+ * ksmbd_vfs_getattr() - vfs helper for smb getattr
+ * @path:	path of dentry
+ * @stat:	pointer to returned kernel stat structure
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_getattr(const struct path *path, struct kstat *stat)
+{
+	int err;
+
+	err = vfs_getattr(path, stat, STATX_BASIC_STATS | STATX_BTIME,
+			AT_STATX_SYNC_AS_STAT);
+	if (err)
+		pr_err("getattr failed, err %d\n", err);
+	return err;
+}
+
+/**
+ * ksmbd_vfs_fsync() - vfs helper for smb fsync
+ * @work:	work
+ * @fid:	file id of open file
+ * @p_id:	persistent file id
+ *
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_fsync(struct ksmbd_work *work, u64 fid, u64 p_id)
+{
+	struct ksmbd_file *fp;
+	int err;
+
+	fp = ksmbd_lookup_fd_slow(work, fid, p_id);
+	if (!fp) {
+		pr_err("failed to get filp for fid %llu\n", fid);
+		return -ENOENT;
+	}
+	err = vfs_fsync(fp->filp, 0);
+	if (err < 0)
+		pr_err("smb fsync failed, err = %d\n", err);
+	ksmbd_fd_put(work, fp);
+	return err;
+}
+
+/**
+ * ksmbd_vfs_remove_file() - vfs helper for smb rmdir or unlink
+ * @work:	work
+ * @path:	path of dentry
+ *
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_remove_file(struct ksmbd_work *work, const struct path *path)
+{
+	struct mnt_idmap *idmap;
+	struct dentry *parent = path->dentry->d_parent;
+	int err;
+
+	if (ksmbd_override_fsids(work))
+		return -ENOMEM;
+
+	if (!d_inode(path->dentry)->i_nlink) {
+		err = -ENOENT;
+		goto out_err;
+	}
+
+	idmap = mnt_idmap(path->mnt);
+	if (S_ISDIR(d_inode(path->dentry)->i_mode)) {
+		err = vfs_rmdir(idmap, d_inode(parent), path->dentry, NULL);
+		if (err && err != -ENOTEMPTY)
+			ksmbd_debug(VFS, "rmdir failed, err %d\n", err);
+	} else {
+		err = vfs_unlink(idmap, d_inode(parent), path->dentry, NULL);
+		if (err)
+			ksmbd_debug(VFS, "unlink failed, err %d\n", err);
+	}
+
+out_err:
+	ksmbd_revert_fsids(work);
+	return err;
+}
+
+/**
+ * ksmbd_vfs_link() - vfs helper for creating smb hardlink
+ * @work:	work
+ * @oldname:	source file name
+ * @newname:	hardlink name that is relative to share
+ *
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_link(struct ksmbd_work *work, const char *oldname,
+		   const char *newname)
+{
+	struct path oldpath, newpath;
+	struct dentry *dentry;
+	int err;
+
+	if (ksmbd_override_fsids(work))
+		return -ENOMEM;
+
+	scoped_with_init_fs()
+		err = kern_path(oldname, LOOKUP_NO_SYMLINKS, &oldpath);
+	if (err) {
+		pr_err("cannot get linux path for %s, err = %d\n",
+		       oldname, err);
+		goto out1;
+	}
+
+	dentry = ksmbd_vfs_kern_path_create(work, newname,
+					    LOOKUP_NO_SYMLINKS | LOOKUP_REVAL,
+					    &newpath);
+	if (IS_ERR(dentry)) {
+		err = PTR_ERR(dentry);
+		pr_err("path create err for %s, err %d\n", newname, err);
+		goto out2;
+	}
+
+	err = -EXDEV;
+	if (oldpath.mnt != newpath.mnt) {
+		pr_err("vfs_link failed err %d\n", err);
+		goto out3;
+	}
+
+	err = vfs_link(oldpath.dentry, mnt_idmap(newpath.mnt),
+		       d_inode(newpath.dentry),
+		       dentry, NULL);
+	if (err)
+		ksmbd_debug(VFS, "vfs_link failed err %d\n", err);
+
+out3:
+	end_creating_path(&newpath, dentry);
+out2:
+	path_put(&oldpath);
+out1:
+	ksmbd_revert_fsids(work);
+	return err;
+}
+
+int ksmbd_vfs_check_rename_share(struct ksmbd_work *work,
+				 const struct path *old_path)
+{
+	struct ksmbd_file *parent_fp;
+	int err = 0;
+
+	parent_fp = ksmbd_lookup_fd_inode(old_path->dentry->d_parent);
+	if (!parent_fp)
+		return 0;
+
+	if ((parent_fp->daccess & FILE_DELETE_LE) ||
+	    (!parent_fp->attrib_only &&
+	     !(parent_fp->saccess & FILE_SHARE_DELETE_LE))) {
+		ksmbd_debug(VFS, "parent dir blocks delete sharing\n");
+		err = -ESHARE;
+	}
+	ksmbd_fd_put(work, parent_fp);
+	return err;
+}
+
+int ksmbd_vfs_rename(struct ksmbd_work *work, struct ksmbd_file *old_fp,
+			     char *newname, int flags)
+{
+	const struct path *old_path = &old_fp->filp->f_path;
+	struct dentry *old_child = old_path->dentry;
+	struct path new_path;
+	struct qstr new_last;
+	struct renamedata rd;
+	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	int err, lookup_flags = LOOKUP_NO_SYMLINKS;
+
+	if (ksmbd_override_fsids(work))
+		return -ENOMEM;
+
+	CLASS(filename_kernel, to)(newname);
+
+retry:
+	err = vfs_path_parent_lookup(to, lookup_flags | LOOKUP_BENEATH,
+				     &new_path, &new_last, &share_conf->vfs_path);
+	if (err)
+		goto out1;
+
+	if (old_path->mnt != new_path.mnt) {
+		err = -EXDEV;
+		goto out2;
+	}
+
+	err = mnt_want_write(old_path->mnt);
+	if (err)
+		goto out2;
+
+	rd.mnt_idmap		= mnt_idmap(old_path->mnt);
+	rd.old_parent		= NULL;
+	rd.new_parent		= new_path.dentry;
+	rd.flags		= flags;
+	rd.delegated_inode	= NULL;
+	err = start_renaming_dentry(&rd, lookup_flags, old_child, &new_last);
+	if (err)
+		goto out_drop_write;
+
+	if (d_is_dir(old_child) && ksmbd_has_nonposix_open_child(old_fp)) {
+		err = -EACCES;
+		goto out3;
+	}
+
+	/*
+	 * See MS-FSA 2.1.5.15.12.
+	 * An overwrite rename must fail with STATUS_ACCESS_DENIED if the
+	 * existing target still has a non-POSIX open.
+	 */
+	if (!(flags & (RENAME_NOREPLACE | RENAME_EXCHANGE)) &&
+	    d_inode(rd.new_dentry) &&
+	    d_inode(rd.new_dentry) != d_inode(old_child) &&
+	    ksmbd_has_other_nonposix_open(rd.new_dentry)) {
+		err = -EACCES;
+		goto out3;
+	}
+
+	err = ksmbd_vfs_check_rename_share(work, old_path);
+	if (err)
+		goto out3;
+
+	if (d_is_symlink(rd.new_dentry)) {
+		err = -EACCES;
+		goto out3;
+	}
+
+	err = vfs_rename(&rd);
+	if (err)
+		ksmbd_debug(VFS, "vfs_rename failed err %d\n", err);
+
+out3:
+	end_renaming(&rd);
+out_drop_write:
+	mnt_drop_write(old_path->mnt);
+out2:
+	path_put(&new_path);
+
+	if (retry_estale(err, lookup_flags)) {
+		lookup_flags |= LOOKUP_REVAL;
+		goto retry;
+	}
+out1:
+	ksmbd_revert_fsids(work);
+	return err;
+}
+
+/**
+ * ksmbd_vfs_truncate() - vfs helper for smb file truncate
+ * @work:	work
+ * @fp:		ksmbd file pointer
+ * @size:	truncate to given size
+ *
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_truncate(struct ksmbd_work *work,
+		       struct ksmbd_file *fp, loff_t size)
+{
+	int err = 0;
+	struct file *filp;
+
+	filp = fp->filp;
+
+	/* Do we need to break any of a levelII oplock? */
+	smb_break_all_levII_oplock(work, fp, 1);
+
+	if (!work->tcon->posix_extensions) {
+		struct inode *inode = file_inode(filp);
+
+		if (size < inode->i_size) {
+			err = check_lock_range(filp, size,
+					       inode->i_size - 1, WRITE);
+		} else if (size > inode->i_size) {
+			err = check_lock_range(filp, inode->i_size,
+					       size - 1, WRITE);
+		}
+
+		if (err) {
+			pr_err("failed due to lock\n");
+			return -EAGAIN;
+		}
+	}
+
+	err = vfs_truncate(&filp->f_path, size);
+	if (err)
+		pr_err("truncate failed, err %d\n", err);
+	return err;
+}
+
+/**
+ * ksmbd_vfs_listxattr() - vfs helper for smb list extended attributes
+ * @dentry:	dentry of file for listing xattrs
+ * @list:	destination buffer
+ *
+ * Return:	xattr list length on success, otherwise error
+ */
+ssize_t ksmbd_vfs_listxattr(struct dentry *dentry, char **list)
+{
+	ssize_t size;
+	char *vlist = NULL;
+
+	size = vfs_listxattr(dentry, NULL, 0);
+	if (size <= 0)
+		return size;
+
+	vlist = kvzalloc(size, KSMBD_DEFAULT_GFP);
+	if (!vlist)
+		return -ENOMEM;
+
+	*list = vlist;
+	size = vfs_listxattr(dentry, vlist, size);
+	if (size < 0) {
+		ksmbd_debug(VFS, "listxattr failed\n");
+		kvfree(vlist);
+		*list = NULL;
+	}
+
+	return size;
+}
+
+static ssize_t ksmbd_vfs_xattr_len(struct mnt_idmap *idmap,
+				   struct dentry *dentry, char *xattr_name)
+{
+	return vfs_getxattr(idmap, dentry, xattr_name, NULL, 0);
+}
+
+/**
+ * ksmbd_vfs_getxattr() - vfs helper for smb get extended attributes value
+ * @idmap:	idmap
+ * @dentry:	dentry of file for getting xattrs
+ * @xattr_name:	name of xattr name to query
+ * @xattr_buf:	destination buffer xattr value
+ *
+ * Return:	read xattr value length on success, otherwise error
+ */
+ssize_t ksmbd_vfs_getxattr(struct mnt_idmap *idmap,
+			   struct dentry *dentry,
+			   char *xattr_name, char **xattr_buf)
+{
+	ssize_t xattr_len;
+	char *buf;
+
+	*xattr_buf = NULL;
+	xattr_len = ksmbd_vfs_xattr_len(idmap, dentry, xattr_name);
+	if (xattr_len < 0)
+		return xattr_len;
+
+	buf = kmalloc(xattr_len + 1, KSMBD_DEFAULT_GFP);
+	if (!buf)
+		return -ENOMEM;
+
+	xattr_len = vfs_getxattr(idmap, dentry, xattr_name,
+				 (void *)buf, xattr_len);
+	if (xattr_len > 0)
+		*xattr_buf = buf;
+	else
+		kfree(buf);
+	return xattr_len;
+}
+
+/**
+ * ksmbd_vfs_setxattr() - vfs helper for smb set extended attributes value
+ * @idmap:	idmap of the relevant mount
+ * @path:	path of dentry to set XATTR at
+ * @attr_name:	xattr name for setxattr
+ * @attr_value:	xattr value to set
+ * @attr_size:	size of xattr value
+ * @flags:	destination buffer length
+ * @get_write:	get write access to a mount
+ *
+ * Return:	0 on success, otherwise error
+ */
+int ksmbd_vfs_setxattr(struct mnt_idmap *idmap,
+		       const struct path *path, const char *attr_name,
+		       void *attr_value, size_t attr_size, int flags,
+		       bool get_write)
+{
+	int err;
+
+	if (get_write == true) {
+		err = mnt_want_write(path->mnt);
+		if (err)
+			return err;
+	}
+
+	err = vfs_setxattr(idmap,
+			   path->dentry,
+			   attr_name,
+			   attr_value,
+			   attr_size,
+			   flags);
+	if (err)
+		ksmbd_debug(VFS, "setxattr failed, err %d\n", err);
+	if (get_write == true)
+		mnt_drop_write(path->mnt);
+	return err;
+}
+
+/**
+ * ksmbd_vfs_set_fadvise() - convert smb IO caching options to linux options
+ * @filp:	file pointer for IO
+ * @option:	smb IO options
+ */
+void ksmbd_vfs_set_fadvise(struct file *filp, __le32 option)
+{
+	struct address_space *mapping;
+
+	mapping = filp->f_mapping;
+
+	if (!option || !mapping)
+		return;
+
+	if (option & FILE_WRITE_THROUGH_LE) {
+		filp->f_flags |= O_SYNC;
+	} else if (option & FILE_SEQUENTIAL_ONLY_LE) {
+		filp->f_ra.ra_pages = inode_to_bdi(mapping->host)->ra_pages * 2;
+		spin_lock(&filp->f_lock);
+		filp->f_mode &= ~FMODE_RANDOM;
+		spin_unlock(&filp->f_lock);
+	} else if (option & FILE_RANDOM_ACCESS_LE) {
+		spin_lock(&filp->f_lock);
+		filp->f_mode |= FMODE_RANDOM;
+		spin_unlock(&filp->f_lock);
+	}
+}
+
+int ksmbd_vfs_zero_data(struct ksmbd_work *work, struct ksmbd_file *fp,
+			loff_t off, loff_t len)
+{
+	const struct cred *saved_cred;
+	loff_t pos = off, size;
+	char *zero_buf = NULL;
+	int err;
+
+	smb_break_all_levII_oplock(work, fp, 1);
+	if (!work->tcon->posix_extensions) {
+		loff_t size = i_size_read(file_inode(fp->filp));
+
+		if (off < size) {
+			err = check_lock_range(fp->filp, off,
+					       min(off + len, size) - 1,
+					       WRITE);
+			if (err)
+				return -EAGAIN;
+		}
+	}
+
+	saved_cred = override_creds(fp->filp->f_cred);
+	if (fp->f_ci->m_fattr & FILE_ATTRIBUTE_SPARSE_FILE_LE) {
+		err = vfs_fallocate(fp->filp,
+				    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+				    off, len);
+	} else {
+		size = i_size_read(file_inode(fp->filp));
+		if (off >= size) {
+			err = 0;
+			goto out;
+		}
+
+		len = min(len, size - off);
+		zero_buf = kvzalloc(SZ_64K, GFP_KERNEL);
+		if (!zero_buf) {
+			err = -ENOMEM;
+			goto out;
+		}
+
+		while (len) {
+			ssize_t written;
+			size_t count = min_t(loff_t, len, SZ_64K);
+
+			written = kernel_write(fp->filp, zero_buf, count, &pos);
+			if (written < 0) {
+				err = written;
+				goto out;
+			}
+			if (!written) {
+				err = -EIO;
+				goto out;
+			}
+			len -= written;
+		}
+		err = 0;
+	}
+out:
+	revert_creds(saved_cred);
+	kvfree(zero_buf);
+	return err;
+}
+
+int ksmbd_vfs_zero_holes(struct ksmbd_file *fp)
+{
+	struct file *f = fp->filp;
+	const struct cred *saved_cred;
+	loff_t size, pos = 0;
+	char *zero_buf;
+	int err;
+
+	err = file_write_and_wait(f);
+	if (err)
+		return err;
+
+	size = i_size_read(file_inode(f));
+	if (!size)
+		return 0;
+
+	/*
+	 * FALLOC_FL_ZERO_RANGE may leave unwritten extents, which SEEK_DATA
+	 * reports as holes. Write zeroes into each hole so that clearing the
+	 * sparse attribute leaves the file fully allocated.
+	 */
+	zero_buf = kvzalloc(SZ_64K, GFP_KERNEL);
+	if (!zero_buf)
+		return -ENOMEM;
+
+	saved_cred = override_creds(f->f_cred);
+	while (pos < size) {
+		loff_t data, hole;
+
+		hole = vfs_llseek(f, pos, SEEK_HOLE);
+		if (hole == -ENXIO || hole >= size)
+			break;
+		if (hole < 0) {
+			err = hole;
+			goto out;
+		}
+
+		data = vfs_llseek(f, hole, SEEK_DATA);
+		if (data == -ENXIO) {
+			data = size;
+		} else if (data < 0) {
+			err = data;
+			goto out;
+		}
+		data = min(data, size);
+		if (data <= hole) {
+			err = -EIO;
+			goto out;
+		}
+
+		pos = hole;
+		while (pos < data) {
+			ssize_t written;
+			size_t count = min_t(loff_t, data - pos, SZ_64K);
+
+			written = kernel_write(f, zero_buf, count, &pos);
+			if (written < 0) {
+				err = written;
+				goto out;
+			}
+			if (!written) {
+				err = -EIO;
+				goto out;
+			}
+		}
+	}
+	err = file_write_and_wait(f);
+out:
+	revert_creds(saved_cred);
+	kvfree(zero_buf);
+	return err;
+}
+
+int ksmbd_vfs_trim_data(struct ksmbd_work *work, struct ksmbd_file *fp,
+			loff_t off, loff_t len)
+{
+	const struct cred *saved_cred;
+	int err;
+
+	smb_break_all_levII_oplock(work, fp, 1);
+	if (!work->tcon->posix_extensions) {
+		loff_t size = i_size_read(file_inode(fp->filp));
+
+		if (off < size) {
+			err = check_lock_range(fp->filp, off,
+					       min(off + len, size) - 1,
+					       WRITE);
+			if (err)
+				return -EAGAIN;
+		}
+	}
+
+	saved_cred = override_creds(fp->filp->f_cred);
+	err = vfs_fallocate(fp->filp,
+			    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+			    off, len);
+	revert_creds(saved_cred);
+	return err;
+}
+
+int ksmbd_vfs_query_allocated_ranges(struct ksmbd_file *fp, loff_t start,
+				     loff_t length,
+				     struct file_allocated_range_buffer *ranges,
+				     unsigned int in_count,
+				     unsigned int *out_count)
+{
+	struct file *f = fp->filp;
+	struct inode *inode = file_inode(fp->filp);
+	loff_t maxbytes = inode->i_sb->s_maxbytes, size;
+	loff_t extent_start, extent_end, end;
+	int ret = 0;
+
+	*out_count = 0;
+	if (start < 0 || length < 0)
+		return -EINVAL;
+	if (start > maxbytes)
+		return -EFBIG;
+	if (!in_count)
+		return 0;
+	if (length > maxbytes || maxbytes - length < start)
+		length = maxbytes - start;
+	size = i_size_read(inode);
+	if (!length || start >= size)
+		return 0;
+	if (length > size - start)
+		length = size - start;
+
+	end = start + length;
+	if ((fp->f_ci->m_fattr & FILE_ATTRIBUTE_SPARSE_FILE_LE) &&
+	    start < end) {
+		ret = file_write_and_wait_range(f, start, end - 1);
+		if (ret)
+			return ret;
+	}
+
+	while (start < end && *out_count < in_count) {
+		extent_start = vfs_llseek(f, start, SEEK_DATA);
+		if (extent_start < 0) {
+			if (extent_start != -ENXIO)
+				ret = extent_start;
+			break;
+		}
+
+		if (extent_start >= end)
+			break;
+
+		extent_end = vfs_llseek(f, extent_start, SEEK_HOLE);
+		if (extent_end < 0) {
+			if (extent_end != -ENXIO)
+				ret = extent_end;
+			break;
+		} else if (extent_start >= extent_end) {
+			break;
+		}
+
+		ranges[*out_count].file_offset = cpu_to_le64(extent_start);
+		ranges[(*out_count)++].length =
+			cpu_to_le64(min(extent_end, end) - extent_start);
+		start = extent_end;
+	}
+
+	if (!ret && start < end && *out_count == in_count)
+		ret = -E2BIG;
+
+	return ret;
+}
+
+int ksmbd_vfs_remove_xattr(struct mnt_idmap *idmap,
+			   const struct path *path, char *attr_name,
+			   bool get_write)
+{
+	int err;
+
+	if (get_write == true) {
+		err = mnt_want_write(path->mnt);
+		if (err)
+			return err;
+	}
+
+	err = vfs_removexattr(idmap, path->dentry, attr_name);
+
+	if (get_write == true)
+		mnt_drop_write(path->mnt);
+
+	return err;
+}
+
+int ksmbd_vfs_unlink(struct file *filp)
+{
+	const struct cred *saved_cred;
+	int err = 0;
+	struct dentry *dir, *dentry = filp->f_path.dentry;
+	struct mnt_idmap *idmap = file_mnt_idmap(filp);
+
+	saved_cred = override_creds(filp->f_cred);
+	err = mnt_want_write(filp->f_path.mnt);
+	if (err)
+		goto out_revert;
+
+	dir = dget_parent(dentry);
+	dentry = start_removing_dentry(dir, dentry);
+	err = PTR_ERR(dentry);
+	if (IS_ERR(dentry))
+		goto out;
+
+	if (S_ISDIR(d_inode(dentry)->i_mode))
+		err = vfs_rmdir(idmap, d_inode(dir), dentry, NULL);
+	else
+		err = vfs_unlink(idmap, d_inode(dir), dentry, NULL);
+
+	end_removing(dentry);
+	if (err)
+		ksmbd_debug(VFS, "failed to delete, err %d\n", err);
+out:
+	dput(dir);
+	mnt_drop_write(filp->f_path.mnt);
+out_revert:
+	revert_creds(saved_cred);
+	return err;
+}
+
+static bool __dir_empty(struct dir_context *ctx, const char *name, int namlen,
+		       loff_t offset, u64 ino, unsigned int d_type)
+{
+	struct ksmbd_readdir_data *buf;
+
+	buf = container_of(ctx, struct ksmbd_readdir_data, ctx);
+	if (!name_is_dot_dotdot(name, namlen))
+		buf->dirent_count++;
+
+	return !buf->dirent_count;
+}
+
+/**
+ * ksmbd_vfs_empty_dir() - check for empty directory
+ * @fp:	ksmbd file pointer
+ *
+ * Return:	true if directory empty, otherwise false
+ */
+int ksmbd_vfs_empty_dir(struct ksmbd_file *fp)
+{
+	int err;
+	struct ksmbd_readdir_data readdir_data;
+
+	memset(&readdir_data, 0, sizeof(struct ksmbd_readdir_data));
+
+	set_ctx_actor(&readdir_data.ctx, __dir_empty);
+	readdir_data.dirent_count = 0;
+
+	err = iterate_dir(fp->filp, &readdir_data.ctx);
+	if (readdir_data.dirent_count)
+		err = -ENOTEMPTY;
+	else
+		err = 0;
+	return err;
+}
+
+static bool __caseless_lookup(struct dir_context *ctx, const char *name,
+			     int namlen, loff_t offset, u64 ino,
+			     unsigned int d_type)
+{
+	struct ksmbd_readdir_data *buf;
+	int cmp = -EINVAL;
+
+	buf = container_of(ctx, struct ksmbd_readdir_data, ctx);
+
+	if (buf->used != namlen)
+		return true;
+	if (IS_ENABLED(CONFIG_UNICODE) && buf->um) {
+		const struct qstr q_buf = {.name = buf->private,
+					   .len = buf->used};
+		const struct qstr q_name = {.name = name,
+					    .len = namlen};
+
+		cmp = utf8_strncasecmp(buf->um, &q_buf, &q_name);
+	}
+	if (cmp < 0)
+		cmp = strncasecmp((char *)buf->private, name, namlen);
+	if (!cmp) {
+		memcpy((char *)buf->private, name, buf->used);
+		buf->dirent_count = 1;
+		return false;
+	}
+	return true;
+}
+
+/**
+ * ksmbd_vfs_lookup_in_dir() - lookup a file in a directory
+ * @dir:	path info
+ * @name:	filename to lookup
+ * @namelen:	filename length
+ * @um:		&struct unicode_map to use
+ *
+ * Return:	0 on success, otherwise error
+ */
+static int ksmbd_vfs_lookup_in_dir(const struct path *dir, char *name,
+				   size_t namelen, struct unicode_map *um)
+{
+	int ret;
+	struct file *dfilp;
+	int flags = O_RDONLY | O_LARGEFILE;
+	struct ksmbd_readdir_data readdir_data = {
+		.ctx.actor	= __caseless_lookup,
+		.private	= name,
+		.used		= namelen,
+		.dirent_count	= 0,
+		.um		= um,
+	};
+
+	dfilp = dentry_open(dir, flags, current_cred());
+	if (IS_ERR(dfilp))
+		return PTR_ERR(dfilp);
+
+	ret = iterate_dir(dfilp, &readdir_data.ctx);
+	if (readdir_data.dirent_count > 0)
+		ret = 0;
+	fput(dfilp);
+	return ret;
+}
+
+static
+int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
+			  unsigned int flags,
+			  struct path *path, bool caseless, bool for_remove)
+{
+	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	struct path parent_path;
+	size_t path_len, remain_len;
+	int err;
+
+retry:
+	err = ksmbd_vfs_path_lookup(share_conf, filepath, flags, path, for_remove);
+	if (!err || err != -ENOENT || !caseless)
+		return err;
+
+	path_len = strlen(filepath);
+	remain_len = path_len;
+
+	parent_path = share_conf->vfs_path;
+	path_get(&parent_path);
+
+	while (d_can_lookup(parent_path.dentry)) {
+		char *filename = filepath + path_len - remain_len;
+		char *next = strchrnul(filename, '/');
+		size_t filename_len = next - filename;
+		bool is_last = !next[0];
+
+		if (filename_len == 0)
+			break;
+
+		err = ksmbd_vfs_lookup_in_dir(&parent_path, filename,
+					      filename_len,
+					      work->conn->um);
+		path_put(&parent_path);
+		if (err)
+			goto out;
+		if (is_last) {
+			caseless = false;
+			goto retry;
+		}
+		next[0] = '\0';
+
+		err = vfs_path_lookup(share_conf->vfs_path.dentry,
+				      share_conf->vfs_path.mnt,
+				      filepath,
+				      flags,
+				      &parent_path);
+		next[0] = '/';
+		if (err)
+			goto out;
+
+		remain_len -= filename_len + 1;
+	}
+
+	err = -EINVAL;
+	path_put(&parent_path);
+out:
+	return err;
+}
+
+/**
+ * ksmbd_vfs_kern_path() - lookup a file and get path info
+ * @work:		work
+ * @filepath:		file path that is relative to share
+ * @flags:		lookup flags
+ * @path:		if lookup succeed, return path info
+ * @caseless:	caseless filename lookup
+ *
+ * Perform the lookup, possibly crossing over any mount point.
+ * On return no locks will be held and write-access to filesystem
+ * won't have been checked.
+ * Return:	0 if file was found, otherwise error
+ */
+int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
+			unsigned int flags,
+			struct path *path, bool caseless)
+{
+	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
+				     caseless, false);
+}
+
+/**
+ * ksmbd_vfs_kern_path_start_removing() - lookup a file and get path info prior to removal
+ * @work:		work
+ * @filepath:		file path that is relative to share
+ * @flags:		lookup flags
+ * @path:		if lookup succeed, return path info
+ * @caseless:	caseless filename lookup
+ *
+ * Perform the lookup, but don't cross over any mount point.
+ * On return the parent of path->dentry will be locked and write-access to
+ * filesystem will have been gained.
+ * Return:	0 on if file was found, otherwise error
+ */
+int ksmbd_vfs_kern_path_start_removing(struct ksmbd_work *work, char *filepath,
+				       unsigned int flags,
+				       struct path *path, bool caseless)
+{
+	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
+				     caseless, true);
+}
+
+void ksmbd_vfs_kern_path_end_removing(const struct path *path)
+{
+	end_removing(path->dentry);
+	mnt_drop_write(path->mnt);
+	mntput(path->mnt);
+}
+
+struct dentry *ksmbd_vfs_kern_path_create(struct ksmbd_work *work,
+					  const char *name,
+					  unsigned int flags,
+					  struct path *path)
+{
+	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	struct qstr last;
+	struct dentry *dent;
+	int err;
+
+	/* resolve the name beneath the share root so ".." cannot escape */
+	CLASS(filename_kernel, filename)(name);
+
+	err = vfs_path_parent_lookup(filename, flags | LOOKUP_BENEATH,
+				     path, &last, &share_conf->vfs_path);
+	if (err)
+		return ERR_PTR(err);
+
+	err = mnt_want_write(path->mnt);
+	if (err) {
+		path_put(path);
+		return ERR_PTR(err);
+	}
+
+	dent = start_creating_noperm(path->dentry, &last);
+	if (IS_ERR(dent)) {
+		mnt_drop_write(path->mnt);
+		path_put(path);
+	}
+	return dent;
+}
+
+int ksmbd_vfs_remove_acl_xattrs(struct mnt_idmap *idmap,
+				const struct path *path)
+{
+	char *name, *xattr_list = NULL;
+	ssize_t xattr_list_len;
+	int err = 0;
+
+	xattr_list_len = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
+	if (xattr_list_len < 0) {
+		goto out;
+	} else if (!xattr_list_len) {
+		ksmbd_debug(SMB, "empty xattr in the file\n");
+		goto out;
+	}
+
+	err = mnt_want_write(path->mnt);
+	if (err)
+		goto out;
+
+	for (name = xattr_list; name - xattr_list < xattr_list_len;
+	     name += strlen(name) + 1) {
+		ksmbd_debug(SMB, "%s, len %zd\n", name, strlen(name));
+
+		if (!strncmp(name, XATTR_NAME_POSIX_ACL_ACCESS,
+			     sizeof(XATTR_NAME_POSIX_ACL_ACCESS) - 1) ||
+		    !strncmp(name, XATTR_NAME_POSIX_ACL_DEFAULT,
+			     sizeof(XATTR_NAME_POSIX_ACL_DEFAULT) - 1)) {
+			err = vfs_remove_acl(idmap, path->dentry, name);
+			if (err)
+				ksmbd_debug(SMB,
+					    "remove acl xattr failed : %s\n", name);
+		}
+	}
+	mnt_drop_write(path->mnt);
+
+out:
+	kvfree(xattr_list);
+	return err;
+}
+
+int ksmbd_vfs_remove_sd_xattrs(struct mnt_idmap *idmap, const struct path *path)
+{
+	char *name, *xattr_list = NULL;
+	ssize_t xattr_list_len;
+	int err = 0;
+
+	xattr_list_len = ksmbd_vfs_listxattr(path->dentry, &xattr_list);
+	if (xattr_list_len < 0) {
+		goto out;
+	} else if (!xattr_list_len) {
+		ksmbd_debug(SMB, "empty xattr in the file\n");
+		goto out;
+	}
+
+	for (name = xattr_list; name - xattr_list < xattr_list_len;
+			name += strlen(name) + 1) {
+		ksmbd_debug(SMB, "%s, len %zd\n", name, strlen(name));
+
+		if (!strncmp(name, XATTR_NAME_SD, XATTR_NAME_SD_LEN)) {
+			err = ksmbd_vfs_remove_xattr(idmap, path, name, true);
+			if (err)
+				ksmbd_debug(SMB, "remove xattr failed : %s\n", name);
+		}
+	}
+out:
+	kvfree(xattr_list);
+	return err;
+}
+
+static struct xattr_smb_acl *ksmbd_vfs_make_xattr_posix_acl(struct mnt_idmap *idmap,
+							    struct inode *inode,
+							    int acl_type)
+{
+	struct xattr_smb_acl *smb_acl = NULL;
+	struct posix_acl *posix_acls;
+	struct posix_acl_entry *pa_entry;
+	struct xattr_acl_entry *xa_entry;
+	int i;
+
+	if (!IS_ENABLED(CONFIG_FS_POSIX_ACL))
+		return NULL;
+
+	posix_acls = get_inode_acl(inode, acl_type);
+	if (IS_ERR_OR_NULL(posix_acls))
+		return NULL;
+
+	smb_acl = kzalloc(sizeof(struct xattr_smb_acl) +
+			  sizeof(struct xattr_acl_entry) * posix_acls->a_count,
+			  KSMBD_DEFAULT_GFP);
+	if (!smb_acl)
+		goto out;
+
+	smb_acl->count = posix_acls->a_count;
+	pa_entry = posix_acls->a_entries;
+	xa_entry = smb_acl->entries;
+	for (i = 0; i < posix_acls->a_count; i++, pa_entry++, xa_entry++) {
+		switch (pa_entry->e_tag) {
+		case ACL_USER:
+			xa_entry->type = SMB_ACL_USER;
+			xa_entry->uid = posix_acl_uid_translate(idmap, pa_entry);
+			break;
+		case ACL_USER_OBJ:
+			xa_entry->type = SMB_ACL_USER_OBJ;
+			break;
+		case ACL_GROUP:
+			xa_entry->type = SMB_ACL_GROUP;
+			xa_entry->gid = posix_acl_gid_translate(idmap, pa_entry);
+			break;
+		case ACL_GROUP_OBJ:
+			xa_entry->type = SMB_ACL_GROUP_OBJ;
+			break;
+		case ACL_OTHER:
+			xa_entry->type = SMB_ACL_OTHER;
+			break;
+		case ACL_MASK:
+			xa_entry->type = SMB_ACL_MASK;
+			break;
+		default:
+			pr_err("unknown type : 0x%x\n", pa_entry->e_tag);
+			goto out;
+		}
+
+		if (pa_entry->e_perm & ACL_READ)
+			xa_entry->perm |= SMB_ACL_READ;
+		if (pa_entry->e_perm & ACL_WRITE)
+			xa_entry->perm |= SMB_ACL_WRITE;
+		if (pa_entry->e_perm & ACL_EXECUTE)
+			xa_entry->perm |= SMB_ACL_EXECUTE;
+	}
+out:
+	posix_acl_release(posix_acls);
+	return smb_acl;
+}
+
+int ksmbd_vfs_set_sd_xattr(struct ksmbd_conn *conn,
+			   struct mnt_idmap *idmap,
+			   const struct path *path,
+			   struct smb_ntsd *pntsd, int len,
+			   bool get_write)
+{
+	int rc;
+	struct ndr sd_ndr = {0}, acl_ndr = {0};
+	struct xattr_ntacl acl = {0};
+	struct xattr_smb_acl *smb_acl, *def_smb_acl = NULL;
+	struct dentry *dentry = path->dentry;
+	struct inode *inode = d_inode(dentry);
+
+	acl.version = 4;
+	acl.hash_type = XATTR_SD_HASH_TYPE_SHA256;
+	acl.current_time = ksmbd_UnixTimeToNT(current_time(inode));
+
+	memcpy(acl.desc, "posix_acl", 9);
+	acl.desc_len = 10;
+
+	pntsd->osidoffset =
+		cpu_to_le32(le32_to_cpu(pntsd->osidoffset) + NDR_NTSD_OFFSETOF);
+	pntsd->gsidoffset =
+		cpu_to_le32(le32_to_cpu(pntsd->gsidoffset) + NDR_NTSD_OFFSETOF);
+	pntsd->dacloffset =
+		cpu_to_le32(le32_to_cpu(pntsd->dacloffset) + NDR_NTSD_OFFSETOF);
+
+	acl.sd_buf = (char *)pntsd;
+	acl.sd_size = len;
+
+	sha256(acl.sd_buf, acl.sd_size, acl.hash);
+
+	smb_acl = ksmbd_vfs_make_xattr_posix_acl(idmap, inode,
+						 ACL_TYPE_ACCESS);
+	if (S_ISDIR(inode->i_mode))
+		def_smb_acl = ksmbd_vfs_make_xattr_posix_acl(idmap, inode,
+							     ACL_TYPE_DEFAULT);
+
+	rc = ndr_encode_posix_acl(&acl_ndr, idmap, inode,
+				  smb_acl, def_smb_acl);
+	if (rc) {
+		pr_err("failed to encode ndr to posix acl\n");
+		goto out;
+	}
+
+	sha256(acl_ndr.data, acl_ndr.offset, acl.posix_acl_hash);
+
+	rc = ndr_encode_v4_ntacl(&sd_ndr, &acl);
+	if (rc) {
+		pr_err("failed to encode ndr to posix acl\n");
+		goto out;
+	}
+
+	rc = ksmbd_vfs_setxattr(idmap, path,
+				XATTR_NAME_SD, sd_ndr.data,
+				sd_ndr.offset, 0, get_write);
+	if (rc < 0)
+		pr_err("Failed to store XATTR ntacl :%d\n", rc);
+
+out:
+	kfree(sd_ndr.data);
+	kfree(acl_ndr.data);
+	kfree(smb_acl);
+	kfree(def_smb_acl);
+	return rc;
+}
+
+int ksmbd_vfs_get_sd_xattr(struct ksmbd_conn *conn,
+			   struct mnt_idmap *idmap,
+			   struct dentry *dentry,
+			   struct smb_ntsd **pntsd)
+{
+	int rc;
+	struct ndr n;
+	struct inode *inode = d_inode(dentry);
+	struct ndr acl_ndr = {0};
+	struct xattr_ntacl acl = {0};
+	struct xattr_smb_acl *smb_acl = NULL, *def_smb_acl = NULL;
+	__u8 cmp_hash[XATTR_SD_HASH_SIZE] = {0};
+
+	rc = ksmbd_vfs_getxattr(idmap, dentry, XATTR_NAME_SD, &n.data);
+	if (rc <= 0)
+		return rc;
+
+	n.length = rc;
+	rc = ndr_decode_v4_ntacl(&n, &acl);
+	if (rc)
+		goto out_free;
+
+	smb_acl = ksmbd_vfs_make_xattr_posix_acl(idmap, inode,
+						 ACL_TYPE_ACCESS);
+	if (S_ISDIR(inode->i_mode))
+		def_smb_acl = ksmbd_vfs_make_xattr_posix_acl(idmap, inode,
+							     ACL_TYPE_DEFAULT);
+
+	rc = ndr_encode_posix_acl(&acl_ndr, idmap, inode, smb_acl,
+				  def_smb_acl);
+	if (rc) {
+		pr_err("failed to encode ndr to posix acl\n");
+		goto out_free;
+	}
+
+	sha256(acl_ndr.data, acl_ndr.offset, cmp_hash);
+
+	if (memcmp(cmp_hash, acl.posix_acl_hash, XATTR_SD_HASH_SIZE)) {
+		pr_err("hash value diff\n");
+		rc = -EINVAL;
+		goto out_free;
+	}
+
+	*pntsd = acl.sd_buf;
+	if (acl.sd_size < sizeof(struct smb_ntsd)) {
+		pr_err("sd size is invalid\n");
+		rc = -EINVAL;
+		goto out_free;
+	}
+
+	(*pntsd)->osidoffset = cpu_to_le32(le32_to_cpu((*pntsd)->osidoffset) -
+					   NDR_NTSD_OFFSETOF);
+	(*pntsd)->gsidoffset = cpu_to_le32(le32_to_cpu((*pntsd)->gsidoffset) -
+					   NDR_NTSD_OFFSETOF);
+	(*pntsd)->dacloffset = cpu_to_le32(le32_to_cpu((*pntsd)->dacloffset) -
+					   NDR_NTSD_OFFSETOF);
+
+	rc = acl.sd_size;
+out_free:
+	kfree(acl_ndr.data);
+	kfree(smb_acl);
+	kfree(def_smb_acl);
+	if (rc < 0) {
+		kfree(acl.sd_buf);
+		*pntsd = NULL;
+	}
+	kfree(n.data);
+	return rc;
+}
+
+int ksmbd_vfs_set_dos_attrib_xattr(struct mnt_idmap *idmap,
+				   const struct path *path,
+				   struct xattr_dos_attrib *da,
+				   bool get_write)
+{
+	struct ndr n;
+	int err;
+
+	err = ndr_encode_dos_attr(&n, da);
+	if (err)
+		goto out;
+
+	err = ksmbd_vfs_setxattr(idmap, path, XATTR_NAME_DOS_ATTRIBUTE,
+				 (void *)n.data, n.offset, 0, get_write);
+	if (err)
+		ksmbd_debug(SMB, "failed to store dos attribute in xattr\n");
+
+out:
+	kfree(n.data);
+	return err;
+}
+
+int ksmbd_vfs_get_dos_attrib_xattr(struct mnt_idmap *idmap,
+				   struct dentry *dentry,
+				   struct xattr_dos_attrib *da)
+{
+	struct ndr n;
+	int err;
+
+	err = ksmbd_vfs_getxattr(idmap, dentry, XATTR_NAME_DOS_ATTRIBUTE,
+				 (char **)&n.data);
+	if (err > 0) {
+		n.length = err;
+		if (ndr_decode_dos_attr(&n, da))
+			err = -EINVAL;
+		kfree(n.data);
+	} else {
+		ksmbd_debug(SMB, "failed to load dos attribute in xattr\n");
+	}
+
+	return err;
+}
+
+/**
+ * ksmbd_vfs_init_kstat() - convert unix stat information to smb stat format
+ * @p:          destination buffer
+ * @ksmbd_kstat:      ksmbd kstat wrapper
+ *
+ * Returns: pointer to the converted &struct file_directory_info
+ */
+void *ksmbd_vfs_init_kstat(char **p, struct ksmbd_kstat *ksmbd_kstat)
+{
+	FILE_DIRECTORY_INFO *info = (FILE_DIRECTORY_INFO *)(*p);
+	struct kstat *kstat = ksmbd_kstat->kstat;
+	u64 time;
+
+	info->FileIndex = 0;
+	info->CreationTime = cpu_to_le64(ksmbd_kstat->create_time);
+	time = ksmbd_UnixTimeToNT(kstat->atime);
+	info->LastAccessTime = cpu_to_le64(time);
+	time = ksmbd_UnixTimeToNT(kstat->mtime);
+	info->LastWriteTime = cpu_to_le64(time);
+	time = ksmbd_UnixTimeToNT(kstat->ctime);
+	info->ChangeTime = cpu_to_le64(time);
+
+	if (ksmbd_kstat->file_attributes & FILE_ATTRIBUTE_DIRECTORY_LE) {
+		info->EndOfFile = 0;
+		info->AllocationSize = 0;
+	} else {
+		info->EndOfFile = cpu_to_le64(kstat->size);
+		info->AllocationSize = cpu_to_le64(kstat->blocks << 9);
+	}
+	info->ExtFileAttributes = ksmbd_kstat->file_attributes;
+
+	return info;
+}
+
+int ksmbd_vfs_fill_dentry_attrs(struct ksmbd_work *work,
+				struct mnt_idmap *idmap,
+				struct dentry *dentry,
+				struct ksmbd_kstat *ksmbd_kstat)
+{
+	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	u64 time;
+	int rc;
+	struct path path = {
+		.mnt = share_conf->vfs_path.mnt,
+		.dentry = dentry,
+	};
+
+	rc = vfs_getattr(&path, ksmbd_kstat->kstat,
+			 STATX_BASIC_STATS | STATX_BTIME,
+			 AT_STATX_SYNC_AS_STAT);
+	if (rc)
+		return rc;
+
+	time = ksmbd_UnixTimeToNT(ksmbd_kstat->kstat->ctime);
+	ksmbd_kstat->create_time = time;
+
+	/*
+	 * set default value for the case that store dos attributes is not yes
+	 * or that acl is disable in server's filesystem and the config is yes.
+	 */
+	if (S_ISDIR(ksmbd_kstat->kstat->mode))
+		ksmbd_kstat->file_attributes = FILE_ATTRIBUTE_DIRECTORY_LE;
+	else
+		ksmbd_kstat->file_attributes = FILE_ATTRIBUTE_ARCHIVE_LE;
+
+	if (test_share_config_flag(work->tcon->share_conf,
+				   KSMBD_SHARE_FLAG_STORE_DOS_ATTRS)) {
+		struct xattr_dos_attrib da;
+
+		rc = ksmbd_vfs_get_dos_attrib_xattr(idmap, dentry, &da);
+		if (rc > 0) {
+			ksmbd_kstat->file_attributes = cpu_to_le32(da.attr);
+			ksmbd_kstat->create_time = da.create_time;
+		} else {
+			ksmbd_debug(VFS, "fail to load dos attribute.\n");
+		}
+	}
+
+	/*
+	 * Only pay for this when it'll actually be used: AAPL
+	 * READDIR_ATTR_V2's flags field (AAPL_READDIR_ATTR_V2_NO_XATTR) is
+	 * the only consumer. XATTR_NAME_STREAM ("user.DosStream.") is a
+	 * reliable, distinct prefix for genuine ADS/stream xattrs -- unlike
+	 * DOSATTRIB or ACL xattrs, which live under different prefixes, so
+	 * this can't false-positive into telling Finder a file has no extra
+	 * data when it actually does.
+	 */
+	ksmbd_kstat->has_ads_stream = false;
+	if (work->conn->aapl_readdir_attr_v2) {
+		char *xattr_list = NULL, *name;
+		ssize_t xattr_list_len;
+
+		xattr_list_len = ksmbd_vfs_listxattr(dentry, &xattr_list);
+		if (xattr_list_len > 0) {
+			for (name = xattr_list;
+			     name - xattr_list < xattr_list_len;
+			     name += strlen(name) + 1) {
+				if (!strncmp(name, XATTR_NAME_STREAM,
+					     XATTR_NAME_STREAM_LEN)) {
+					ksmbd_kstat->has_ads_stream = true;
+					break;
+				}
+			}
+		}
+		kvfree(xattr_list);
+	}
+
+	return 0;
+}
+
+ssize_t ksmbd_vfs_casexattr_len(struct mnt_idmap *idmap,
+				struct dentry *dentry, char *attr_name,
+				int attr_name_len)
+{
+	char *name, *xattr_list = NULL;
+	ssize_t value_len = -ENOENT, xattr_list_len;
+
+	xattr_list_len = ksmbd_vfs_listxattr(dentry, &xattr_list);
+	if (xattr_list_len <= 0)
+		goto out;
+
+	for (name = xattr_list; name - xattr_list < xattr_list_len;
+			name += strlen(name) + 1) {
+		ksmbd_debug(VFS, "%s, len %zd\n", name, strlen(name));
+		if (strncasecmp(attr_name, name, attr_name_len))
+			continue;
+
+		value_len = ksmbd_vfs_xattr_len(idmap, dentry, name);
+		break;
+	}
+
+out:
+	kvfree(xattr_list);
+	return value_len;
+}
+
+int ksmbd_vfs_xattr_stream_name(char *stream_name, char **xattr_stream_name,
+				size_t *xattr_stream_name_size, int s_type)
+{
+	char *type, *buf;
+
+	if (s_type == DIR_STREAM)
+		type = ":$INDEX_ALLOCATION";
+	else
+		type = ":$DATA";
+
+	buf = kasprintf(KSMBD_DEFAULT_GFP, "%s%s%s",
+			XATTR_NAME_STREAM, stream_name,	type);
+	if (!buf)
+		return -ENOMEM;
+
+	*xattr_stream_name = buf;
+	*xattr_stream_name_size = strlen(buf) + 1;
+
+	return 0;
+}
+
+static ssize_t ksmbd_vfs_copy_file_range_buffered(struct ksmbd_work *work,
+						  struct ksmbd_file *src_fp,
+						  struct ksmbd_file *dst_fp,
+						  loff_t src_off,
+						  loff_t dst_off, size_t len)
+{
+	size_t buf_size = min_t(size_t, len, SZ_1M);
+	size_t copied = 0;
+	char *buf;
+	ssize_t ret = 0;
+
+	buf = kvmalloc(buf_size, KSMBD_DEFAULT_GFP);
+	if (!buf)
+		return -ENOMEM;
+
+	while (copied < len) {
+		size_t chunk_size = min(buf_size, len - copied);
+		size_t done = 0;
+		loff_t src_pos, dst_pos;
+
+		if (dst_off > src_off) {
+			src_pos = src_off + len - copied - chunk_size;
+			dst_pos = dst_off + len - copied - chunk_size;
+		} else {
+			src_pos = src_off + copied;
+			dst_pos = dst_off + copied;
+		}
+
+		while (done < chunk_size) {
+			loff_t pos = src_pos + done;
+
+			ret = ksmbd_vfs_read(work, src_fp, chunk_size - done,
+					     &pos, buf + done);
+			if (ret <= 0) {
+				if (!ret)
+					ret = -EIO;
+				goto out;
+			}
+			done += ret;
+		}
+
+		done = 0;
+		while (done < chunk_size) {
+			loff_t pos = dst_pos + done;
+			ssize_t written = 0;
+
+			ret = ksmbd_vfs_write(work, dst_fp, buf + done,
+					      chunk_size - done, &pos, false,
+					      &written);
+			if (ret < 0)
+				goto out;
+			if (!written) {
+				ret = -EIO;
+				goto out;
+			}
+			done += written;
+		}
+		copied += chunk_size;
+	}
+	ret = copied;
+out:
+	kvfree(buf);
+	return ret;
+}
+
+int ksmbd_vfs_copy_file_ranges(struct ksmbd_work *work,
+			       struct ksmbd_file *src_fp,
+			       struct ksmbd_file *dst_fp,
+			       struct srv_copychunk *chunks,
+			       unsigned int chunk_count,
+			       unsigned int *chunk_count_written,
+			       unsigned int *chunk_size_written,
+			       loff_t *total_size_written)
+{
+	unsigned int i;
+	loff_t src_off, dst_off, src_file_size;
+	size_t len;
+	int ret;
+
+	*chunk_count_written = 0;
+	*chunk_size_written = 0;
+	*total_size_written = 0;
+
+	if (!(src_fp->daccess & (FILE_READ_DATA_LE | FILE_EXECUTE_LE))) {
+		pr_err("no right to read(%pD)\n", src_fp->filp);
+		return -EACCES;
+	}
+	if (!(dst_fp->daccess & (FILE_WRITE_DATA_LE | FILE_APPEND_DATA_LE))) {
+		pr_err("no right to write(%pD)\n", dst_fp->filp);
+		return -EACCES;
+	}
+
+	smb_break_all_levII_oplock(work, dst_fp, 1);
+
+	if (!work->tcon->posix_extensions) {
+		for (i = 0; i < chunk_count; i++) {
+			src_off = le64_to_cpu(chunks[i].SourceOffset);
+			dst_off = le64_to_cpu(chunks[i].TargetOffset);
+			len = le32_to_cpu(chunks[i].Length);
+
+			if (check_lock_range(src_fp->filp, src_off,
+					     src_off + len - 1, READ))
+				return -EAGAIN;
+			if (check_lock_range(dst_fp->filp, dst_off,
+					     dst_off + len - 1, WRITE))
+				return -EAGAIN;
+		}
+	}
+
+	if (ksmbd_stream_fd(src_fp)) {
+		const struct cred *saved_cred;
+
+		saved_cred = override_creds(src_fp->filp->f_cred);
+		src_file_size = ksmbd_vfs_casexattr_len(
+				file_mnt_idmap(src_fp->filp),
+				src_fp->filp->f_path.dentry,
+				src_fp->stream.name, src_fp->stream.size);
+		revert_creds(saved_cred);
+		if (src_file_size < 0)
+			return src_file_size;
+	} else {
+		src_file_size = i_size_read(file_inode(src_fp->filp));
+	}
+
+	/*
+	 * macOS Finder's Cmd+D duplicate sends FSCTL_SRV_COPYCHUNK with
+	 * ChunkCount=0 meaning "copy the whole file/stream", not the
+	 * standard SMB2 "query my copy limits, no data" semantics --
+	 * fsctl_copychunk() only reaches here with chunk_count == 0 for
+	 * AAPL-negotiated connections, so this doesn't affect compliant
+	 * non-AAPL clients. Without this, the destination stays at its
+	 * just-created 0 bytes / empty stream: the for loop below is a
+	 * no-op when chunk_count is 0, since it never has an iteration to
+	 * treat as "copy everything".
+	 */
+	if (chunk_count == 0 && work->conn->is_aapl) {
+		loff_t off = 0;
+
+		while (off < src_file_size) {
+			size_t remaining = src_file_size - off;
+			ssize_t copied;
+
+			/* Same source/destination offset here: an in-place,
+			 * same-inode copy at matching offsets is a degenerate
+			 * no-op range, not a real overlap, but vfs_copy_file_range
+			 * still doesn't support streams -- route those (and the
+			 * same-inode case defensively) through the buffered path.
+			 */
+			if (ksmbd_stream_fd(src_fp) || ksmbd_stream_fd(dst_fp) ||
+			    file_inode(src_fp->filp) == file_inode(dst_fp->filp)) {
+				copied = ksmbd_vfs_copy_file_range_buffered(work, src_fp, dst_fp,
+									    off, off, remaining);
+			} else {
+				copied = vfs_copy_file_range(src_fp->filp, off,
+							     dst_fp->filp, off,
+							     remaining, 0);
+				if (copied == -EOPNOTSUPP || copied == -EXDEV)
+					copied = vfs_copy_file_range(src_fp->filp, off,
+								     dst_fp->filp, off,
+								     remaining,
+								     COPY_FILE_SPLICE);
+			}
+			if (copied < 0)
+				return copied;
+			if (copied == 0)
+				break;
+			off += copied;
+		}
+
+		/*
+		 * This is a synthesized whole-file copy, not a response to
+		 * any chunk descriptor the client actually sent (it sent
+		 * none -- chunk_count is 0). Report zero chunks/chunk-bytes
+		 * rather than inventing a chunk that doesn't correspond to
+		 * anything in the request; only total_size_written (bytes
+		 * actually copied) is meaningful here.
+		 */
+		*chunk_count_written = 0;
+		*chunk_size_written = 0;
+		*total_size_written = off;
+		return 0;
+	}
+
+	for (i = 0; i < chunk_count; i++) {
+		bool stream_len_mismatch = false;
+		size_t copy_len;
+
+		src_off = le64_to_cpu(chunks[i].SourceOffset);
+		dst_off = le64_to_cpu(chunks[i].TargetOffset);
+		len = le32_to_cpu(chunks[i].Length);
+		copy_len = len;
+
+		if (src_off < 0)
+			return -E2BIG;
+
+		if (src_off > src_file_size || len > src_file_size - src_off) {
+			/*
+			 * macOS can reuse the main file's chunk list when copying
+			 * streams, so the requested range can exceed the size of
+			 * the xattr-backed stream. For an AAPL connection, copy the
+			 * available stream data and report the requested length to
+			 * avoid a copy length mismatch.
+			 */
+			if (!work->conn->is_aapl ||
+			    !ksmbd_stream_fd(src_fp) ||
+			    !ksmbd_stream_fd(dst_fp))
+				return -E2BIG;
+
+			stream_len_mismatch = true;
+			if (src_off < src_file_size)
+				copy_len = src_file_size - src_off;
+			else
+				copy_len = 0;
+		}
+
+		/*
+		 * vfs_copy_file_range does not support streams or overlapping
+		 * ranges within the same file.
+		 */
+		if (!copy_len) {
+			ret = 0;
+		} else if (ksmbd_stream_fd(src_fp) || ksmbd_stream_fd(dst_fp) ||
+		    (file_inode(src_fp->filp) == file_inode(dst_fp->filp) &&
+		     dst_off + copy_len > src_off &&
+		     dst_off < src_off + copy_len)) {
+			ret = ksmbd_vfs_copy_file_range_buffered(work, src_fp,
+							  dst_fp, src_off,
+							  dst_off, copy_len);
+		} else {
+			ret = vfs_copy_file_range(src_fp->filp, src_off,
+					dst_fp->filp, dst_off, copy_len, 0);
+			if (ret == -EOPNOTSUPP || ret == -EXDEV)
+				ret = vfs_copy_file_range(src_fp->filp, src_off,
+							  dst_fp->filp, dst_off,
+							  copy_len,
+							  COPY_FILE_SPLICE);
+		}
+		if (ret < 0)
+			return ret;
+		if (stream_len_mismatch)
+			ret = len;
+
+		*chunk_count_written += 1;
+		*total_size_written += ret;
+	}
+	return 0;
+}
+
+void ksmbd_vfs_posix_lock_wait(struct file_lock *flock)
+{
+	wait_event(flock->c.flc_wait, !flock->c.flc_blocker);
+}
+
+void ksmbd_vfs_posix_lock_unblock(struct file_lock *flock)
+{
+	locks_delete_block(flock);
+}
+
+int ksmbd_vfs_set_init_posix_acl(struct mnt_idmap *idmap,
+				 const struct path *path)
+{
+	struct posix_acl_state acl_state;
+	struct posix_acl *acls;
+	struct dentry *dentry = path->dentry;
+	struct inode *inode = d_inode(dentry);
+	int rc;
+
+	if (!IS_ENABLED(CONFIG_FS_POSIX_ACL))
+		return -EOPNOTSUPP;
+
+	ksmbd_debug(SMB, "Set posix acls\n");
+	rc = init_acl_state(&acl_state, 1);
+	if (rc)
+		return rc;
+
+	/* Set default owner group */
+	acl_state.owner.allow = (inode->i_mode & 0700) >> 6;
+	acl_state.group.allow = (inode->i_mode & 0070) >> 3;
+	acl_state.other.allow = inode->i_mode & 0007;
+	acl_state.users->aces[acl_state.users->n].uid = inode->i_uid;
+	acl_state.users->aces[acl_state.users->n++].perms.allow =
+		acl_state.owner.allow;
+	acl_state.groups->aces[acl_state.groups->n].gid = inode->i_gid;
+	acl_state.groups->aces[acl_state.groups->n++].perms.allow =
+		acl_state.group.allow;
+	acl_state.mask.allow = 0x07;
+
+	acls = posix_acl_alloc(6, KSMBD_DEFAULT_GFP);
+	if (!acls) {
+		free_acl_state(&acl_state);
+		return -ENOMEM;
+	}
+	posix_state_to_acl(&acl_state, acls->a_entries);
+
+	rc = set_posix_acl(idmap, dentry, ACL_TYPE_ACCESS, acls);
+	if (rc < 0)
+		ksmbd_debug(SMB, "Set posix acl(ACL_TYPE_ACCESS) failed, rc : %d\n",
+			    rc);
+	else if (S_ISDIR(inode->i_mode)) {
+		posix_state_to_acl(&acl_state, acls->a_entries);
+		rc = set_posix_acl(idmap, dentry, ACL_TYPE_DEFAULT, acls);
+		if (rc < 0)
+			ksmbd_debug(SMB, "Set posix acl(ACL_TYPE_DEFAULT) failed, rc : %d\n",
+				    rc);
+	}
+
+	free_acl_state(&acl_state);
+	posix_acl_release(acls);
+	return rc;
+}
+
+int ksmbd_vfs_inherit_posix_acl(struct mnt_idmap *idmap,
+				const struct path *path, struct inode *parent_inode)
+{
+	struct posix_acl *acls;
+
+	if (!IS_ENABLED(CONFIG_FS_POSIX_ACL))
+		return -EOPNOTSUPP;
+
+	acls = get_inode_acl(parent_inode, ACL_TYPE_DEFAULT);
+	if (IS_ERR_OR_NULL(acls))
+		return -ENOENT;
+
+	posix_acl_release(acls);
+	return 0;
+}
+
+void ksmbd_vfs_update_compressed_fattr(struct dentry *dentry, __le32 *fattr)
+{
+	int rc;
+	struct file_kattr fa = { .flags_valid = true };
+
+	rc = vfs_fileattr_get(dentry, &fa);
+	if (rc)
+		return;
+
+	if (fa.flags & FS_COMPR_FL)
+		*fattr |= FILE_ATTRIBUTE_COMPRESSED_LE;
+}
+
+int ksmbd_vfs_get_compression(struct ksmbd_file *fp, u16 *fmt)
+{
+	struct file_kattr fa = { .flags_valid = true };
+	int rc;
+
+	rc = vfs_fileattr_get(fp->filp->f_path.dentry, &fa);
+	if (rc == -ENOIOCTLCMD || rc == -ENOTTY || rc == -EINVAL ||
+	    rc == -EOPNOTSUPP) {
+		if (fp->f_ci->m_fattr & FILE_ATTRIBUTE_COMPRESSED_LE)
+			*fmt = COMPRESSION_FORMAT_LZNT1;
+		else
+			*fmt = COMPRESSION_FORMAT_NONE;
+		rc = 0;
+		goto out;
+	}
+	if (rc)
+		goto out;
+
+	if (fp->f_ci->m_fattr & FILE_ATTRIBUTE_COMPRESSED_LE)
+		*fmt = COMPRESSION_FORMAT_LZNT1;
+	else
+		*fmt = COMPRESSION_FORMAT_NONE;
+
+out:
+	return rc;
+}
+
+static int __ksmbd_vfs_set_compression(struct ksmbd_work *work,
+				       struct ksmbd_file *fp, u16 fmt,
+				       bool check_access)
+{
+	const struct cred *saved_cred = NULL;
+	struct file_kattr fa;
+	struct dentry *dentry = fp->filp->f_path.dentry;
+	struct mnt_idmap *idmap = file_mnt_idmap(fp->filp);
+	u32 flags;
+	__le32 old_fattr;
+	int rc;
+
+	if (check_access && !(fp->daccess & FILE_WRITE_DATA_LE)) {
+		rc = -EACCES;
+		goto out;
+	}
+
+	if (fmt != COMPRESSION_FORMAT_NONE &&
+	    fmt != COMPRESSION_FORMAT_DEFAULT &&
+	    fmt != COMPRESSION_FORMAT_LZNT1) {
+		rc = -EINVAL;
+		goto out;
+	}
+
+	saved_cred = override_creds(fp->filp->f_cred);
+	rc = vfs_fileattr_get(dentry, &fa);
+	if (rc == -ENOIOCTLCMD || rc == -ENOTTY || rc == -EINVAL ||
+	    rc == -EOPNOTSUPP)
+		goto update_fattr;
+	if (rc)
+		goto out;
+
+	flags = fa.flags;
+	if (fmt == COMPRESSION_FORMAT_NONE) {
+		flags &= ~FS_COMPR_FL;
+	} else if (fmt == COMPRESSION_FORMAT_DEFAULT ||
+		   fmt == COMPRESSION_FORMAT_LZNT1) {
+		flags |= FS_COMPR_FL;
+	}
+
+	if (flags != fa.flags) {
+		fileattr_fill_flags(&fa, flags);
+		rc = mnt_want_write_file(fp->filp);
+		if (rc)
+			goto out;
+
+		rc = vfs_fileattr_set(idmap, dentry, &fa);
+		mnt_drop_write_file(fp->filp);
+		if (rc == -ENOIOCTLCMD || rc == -ENOTTY || rc == -EINVAL ||
+		    rc == -EOPNOTSUPP)
+			goto update_fattr;
+		if (rc)
+			goto out;
+	}
+
+update_fattr:
+	old_fattr = fp->f_ci->m_fattr;
+	if (fmt == COMPRESSION_FORMAT_NONE)
+		fp->f_ci->m_fattr &= ~FILE_ATTRIBUTE_COMPRESSED_LE;
+	else
+		fp->f_ci->m_fattr |= FILE_ATTRIBUTE_COMPRESSED_LE;
+
+	if (fp->f_ci->m_fattr != old_fattr) {
+		struct xattr_dos_attrib da = {0};
+
+		rc = ksmbd_vfs_get_dos_attrib_xattr(idmap, dentry, &da);
+		if (rc <= 0) {
+			da.version = 4;
+			da.itime = fp->itime;
+			da.create_time = fp->create_time;
+			da.flags = XATTR_DOSINFO_CREATE_TIME |
+				XATTR_DOSINFO_ITIME;
+		}
+
+		da.attr = le32_to_cpu(fp->f_ci->m_fattr);
+		da.flags |= XATTR_DOSINFO_ATTRIB;
+		rc = ksmbd_vfs_set_dos_attrib_xattr(idmap,
+						    &fp->filp->f_path,
+						    &da, true);
+		if (rc)
+			rc = 0;
+	}
+
+out:
+	if (saved_cred)
+		revert_creds(saved_cred);
+	return rc;
+}
+
+int ksmbd_vfs_set_compression(struct ksmbd_work *work,
+			      struct ksmbd_file *fp, u16 fmt)
+{
+	return __ksmbd_vfs_set_compression(work, fp, fmt, true);
+}
+
+int ksmbd_vfs_set_compression_create(struct ksmbd_work *work,
+				     struct ksmbd_file *fp, u16 fmt)
+{
+	return __ksmbd_vfs_set_compression(work, fp, fmt, false);
+}

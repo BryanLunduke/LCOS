@@ -1,0 +1,150 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * wmi.h - ACPI WMI interface
+ *
+ * Copyright (c) 2015 Andrew Lutomirski
+ */
+
+#ifndef _LINUX_WMI_H
+#define _LINUX_WMI_H
+
+#include <linux/compiler_attributes.h>
+#include <linux/device.h>
+#include <linux/acpi.h>
+#include <linux/device-id/wmi.h>
+#include <linux/types.h>
+
+/**
+ * struct wmi_device - WMI device structure
+ * @dev: Device associated with this WMI device
+ * @setable: True for devices implementing the Set Control Method
+ *
+ * This represents WMI devices discovered by the WMI driver core.
+ */
+struct wmi_device {
+	struct device dev;
+	bool setable;
+};
+
+/**
+ * to_wmi_device() - Helper macro to cast a device to a wmi_device
+ * @device: device struct
+ *
+ * Cast a struct device to a struct wmi_device.
+ */
+#define to_wmi_device(device)	container_of_const(device, struct wmi_device, dev)
+
+/**
+ * struct wmi_buffer - WMI data buffer
+ * @length: Buffer length in bytes
+ * @data: Pointer to the buffer content
+ *
+ * This structure is used to exchange data with the WMI driver core.
+ */
+struct wmi_buffer {
+	size_t length;
+	void *data;
+};
+
+/**
+ * struct wmi_string - WMI string representation
+ * @length: Size of @chars in bytes
+ * @chars: UTF16-LE characters with optional nul termination and padding
+ *
+ * This structure is used when exchanging string data over the WMI interface.
+ */
+struct wmi_string {
+	__le16 length;
+	__le16 chars[];
+} __packed;
+
+ssize_t wmi_string_to_utf8s(const struct wmi_string *str, u8 *dst, size_t length);
+
+ssize_t wmi_string_from_utf8s(struct wmi_string *str, size_t max_chars, const u8 *src,
+			      size_t src_length);
+
+int wmidev_invoke_method(struct wmi_device *wdev, u8 instance, u32 method_id,
+			 const struct wmi_buffer *in, struct wmi_buffer *out, size_t min_size);
+
+int wmidev_invoke_procedure(struct wmi_device *wdev, u8 instance, u32 method_id,
+			    const struct wmi_buffer *in);
+
+int wmidev_query_block(struct wmi_device *wdev, u8 instance, struct wmi_buffer *out,
+		       size_t min_size);
+
+int wmidev_set_block(struct wmi_device *wdev, u8 instance, const struct wmi_buffer *in);
+
+acpi_status wmidev_evaluate_method(struct wmi_device *wdev, u8 instance, u32 method_id,
+				   const struct acpi_buffer *in, struct acpi_buffer *out);
+
+union acpi_object *wmidev_block_query(struct wmi_device *wdev, u8 instance);
+
+acpi_status wmidev_block_set(struct wmi_device *wdev, u8 instance, const struct acpi_buffer *in);
+
+u8 wmidev_instance_count(struct wmi_device *wdev);
+
+/**
+ * struct wmi_driver - WMI driver structure
+ * @driver: Driver model structure
+ * @id_table: List of WMI GUIDs supported by this driver
+ * @min_event_size: Minimum event payload size supported by this driver
+ * @no_singleton: Driver can be instantiated multiple times
+ * @probe: Callback for device binding
+ * @remove: Callback for device unbinding
+ * @shutdown: Callback for device shutdown
+ * @notify: Callback for receiving WMI events (deprecated)
+ * @notify_new: Callback for receiving WMI events
+ *
+ * This represents WMI drivers which handle WMI devices. The data inside the buffer
+ * passed to the @notify_new callback is guaranteed to be aligned on a 8-byte boundary.
+ * The minimum supported size for said buffer can be specified using @min_event_size.
+ * WMI drivers that still use the deprecated @notify callback can still set @min_event_size
+ * to 0 in order to signal that they support WMI events which provide no event data.
+ */
+struct wmi_driver {
+	struct device_driver driver;
+	const struct wmi_device_id *id_table;
+	size_t min_event_size;
+	bool no_singleton;
+
+	int (*probe)(struct wmi_device *wdev, const void *context);
+	void (*remove)(struct wmi_device *wdev);
+	void (*shutdown)(struct wmi_device *wdev);
+	void (*notify)(struct wmi_device *device, union acpi_object *data);
+	void (*notify_new)(struct wmi_device *device, const struct wmi_buffer *data);
+};
+
+/**
+ * to_wmi_driver() - Helper macro to cast a driver to a wmi_driver
+ * @drv: driver struct
+ *
+ * Cast a struct device_driver to a struct wmi_driver.
+ */
+#define to_wmi_driver(drv)	container_of_const(drv, struct wmi_driver, driver)
+
+int __must_check __wmi_driver_register(struct wmi_driver *driver, struct module *owner);
+
+void wmi_driver_unregister(struct wmi_driver *driver);
+
+/**
+ * wmi_driver_register() - Helper macro to register a WMI driver
+ * @driver: wmi_driver struct
+ *
+ * Helper macro for registering a WMI driver. It automatically passes
+ * THIS_MODULE to the underlying function.
+ */
+#define wmi_driver_register(driver) __wmi_driver_register((driver), THIS_MODULE)
+
+/**
+ * module_wmi_driver() - Helper macro to register/unregister a WMI driver
+ * @__wmi_driver: wmi_driver struct
+ *
+ * Helper macro for WMI drivers which do not do anything special in module
+ * init/exit. This eliminates a lot of boilerplate. Each module may only
+ * use this macro once, and calling it replaces module_init() and module_exit().
+ */
+#define module_wmi_driver(__wmi_driver) \
+	module_driver(__wmi_driver, wmi_driver_register, \
+		      wmi_driver_unregister)
+
+#endif

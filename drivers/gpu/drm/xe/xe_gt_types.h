@@ -1,0 +1,395 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Copyright © 2022-2023 Intel Corporation
+ */
+
+#ifndef _XE_GT_TYPES_H_
+#define _XE_GT_TYPES_H_
+
+#include "xe_device_types.h"
+#include "xe_force_wake_types.h"
+#include "xe_gt_idle_types.h"
+#include "xe_gt_sriov_pf_types.h"
+#include "xe_gt_sriov_vf_types.h"
+#include "xe_gt_stats_types.h"
+#include "xe_hw_engine_types.h"
+#include "xe_hw_fence_types.h"
+#include "xe_oa_types.h"
+#include "xe_reg_sr_types.h"
+#include "xe_sa_types.h"
+#include "xe_tlb_inval_types.h"
+#include "xe_uc_types.h"
+
+struct xe_exec_queue_ops;
+struct xe_migrate;
+struct xe_ring_ops;
+
+enum xe_gt_type {
+	XE_GT_TYPE_UNINITIALIZED,
+	XE_GT_TYPE_MAIN,
+	XE_GT_TYPE_MEDIA,
+};
+
+enum xe_gt_eu_type {
+	XE_GT_EU_TYPE_SIMD8,
+	XE_GT_EU_TYPE_SIMD16,
+};
+
+#define XE_MAX_DSS_FUSE_REGS		4
+#define XE_MAX_DSS_FUSE_BITS		(32 * XE_MAX_DSS_FUSE_REGS)
+#define XE_MAX_EU_FUSE_REGS		1
+#define XE_MAX_EU_FUSE_BITS		(32 * XE_MAX_EU_FUSE_REGS)
+#define XE_MAX_L3_BANK_MASK_BITS	64
+
+typedef unsigned long xe_dss_mask_t[BITS_TO_LONGS(XE_MAX_DSS_FUSE_BITS)];
+typedef unsigned long xe_eu_mask_t[BITS_TO_LONGS(XE_MAX_EU_FUSE_BITS)];
+typedef unsigned long xe_l3_bank_mask_t[BITS_TO_LONGS(XE_MAX_L3_BANK_MASK_BITS)];
+
+/*
+ * The hardware has multiple kinds of multicast register ranges that need
+ * special register steering (and future platforms are expected to add
+ * additional types).
+ *
+ * During driver startup, we initialize the steering control register to
+ * direct reads to a slice/subslice that are valid for the 'subslice' class
+ * of multicast registers.  If another type of steering does not have any
+ * overlap in valid steering targets with 'subslice' style registers, we will
+ * need to explicitly re-steer reads of registers of the other type.
+ *
+ * Only the replication types that may need additional non-default steering
+ * are listed here.
+ */
+enum xe_steering_type {
+	L3BANK,
+	NODE,
+	MSLICE,
+	LNCF,
+	DSS,
+	OADDRM,
+	SQIDI_PSMI,
+
+	/*
+	 * Although most GAM ranges must be steered to (0,0) and thus use the
+	 * INSTANCE0 type farther down, some platforms have special rules
+	 * for specific subtypes that require steering to (1,0) instead.
+	 */
+	GAM1,
+
+	/*
+	 * On some platforms there are multiple types of MCR registers that
+	 * will always return a non-terminated value at instance (0, 0).  We'll
+	 * lump those all into a single category to keep things simple.
+	 */
+	INSTANCE0,
+
+	/*
+	 * Register ranges that don't need special steering for each register:
+	 * it's sufficient to keep the HW-default for the selector, or only
+	 * change it once, on GT initialization. This needs to be the last
+	 * steering type.
+	 */
+	IMPLICIT_STEERING,
+	NUM_STEERING_TYPES
+};
+
+#define gt_to_tile(gt__)							\
+	_Generic(gt__,								\
+		 const struct xe_gt * : (const struct xe_tile *)((gt__)->tile),	\
+		 struct xe_gt * : (gt__)->tile)
+
+#define gt_to_xe(gt__)										\
+	_Generic(gt__,										\
+		 const struct xe_gt * : (const struct xe_device *)(gt_to_tile(gt__)->xe),	\
+		 struct xe_gt * : gt_to_tile(gt__)->xe)
+
+/**
+ * struct xe_gt - A "Graphics Technology" unit of the GPU
+ *
+ * A GT ("Graphics Technology") is the subset of a GPU primarily responsible
+ * for implementing the graphics, compute, and/or media IP.  It encapsulates
+ * the hardware engines, programmable execution units, and GuC.   Each GT has
+ * its own handling of power management (RC6+forcewake) and multicast register
+ * steering.
+ *
+ * A GPU/tile may have a single GT that supplies all graphics, compute, and
+ * media functionality, or the graphics/compute and media may be split into
+ * separate GTs within a tile.
+ */
+struct xe_gt {
+	/** @tile: Backpointer to GT's tile */
+	struct xe_tile *tile;
+
+	/** @info: GT info */
+	struct {
+		/** @info.type: type of GT */
+		enum xe_gt_type type;
+		/** @info.reference_clock: clock frequency */
+		u32 reference_clock;
+		/** @info.timestamp_base: GT timestamp base */
+		u32 timestamp_base;
+		/**
+		 * @info.engine_mask: mask of engines present on GT. Some of
+		 * them may be reserved in runtime and not available for user.
+		 * See @user_engines.mask
+		 */
+		u64 engine_mask;
+		/** @info.gmdid: raw GMD_ID value from hardware */
+		u32 gmdid;
+		/**
+		 * @info.multi_queue_engine_class_mask: Bitmask of engine classes with
+		 * multi queue support enabled.
+		 */
+		u16 multi_queue_engine_class_mask;
+		/** @info.id: Unique ID of this GT within the PCI Device */
+		u8 id;
+		/** @info.has_indirect_ring_state: GT has indirect ring state support */
+		u8 has_indirect_ring_state:1;
+		/**
+		 * @info.has_uncorrectable_error_reporting: GT has uncorrectable
+		 * error reporting support
+		 */
+		u8 has_uncorrectable_error_reporting:1;
+		/**
+		 * @info.has_xe2_blt_instructions: GT supports Xe2-style MEM_SET
+		 * and MEM_COPY blitter functionality.  Note that despite the
+		 * name, some Xe1 platforms may also support this "Xe2-style"
+		 * feature.
+		 */
+		u8 has_xe2_blt_instructions:1;
+		/**
+		 * @info.num_geometry_xecore_fuse_regs: Number of 32b-bit fuse
+		 * registers the geometry XeCore mask spans.
+		 */
+		u8 num_geometry_xecore_fuse_regs;
+		/**
+		 * @info.num_compute_xecore_fuse_regs: Number of 32b-bit fuse
+		 * registers the compute XeCore mask spans.
+		 */
+		u8 num_compute_xecore_fuse_regs;
+	} info;
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	/** @stats: GT stats */
+	struct xe_gt_stats __percpu *stats;
+#endif
+
+	/**
+	 * @mmio: mmio info for GT.  All GTs within a tile share the same
+	 * register space, but have their own copy of GSI registers at a
+	 * specific offset.
+	 */
+	struct xe_mmio mmio;
+
+	/**
+	 * @pm: power management info for GT.  The driver uses the GT's
+	 * "force wake" interface to wake up specific parts of the GT hardware
+	 * from C6 sleep states and ensure the hardware remains awake while it
+	 * is being actively used.
+	 */
+	struct {
+		/** @pm.fw: force wake for GT */
+		struct xe_force_wake fw;
+	} pm;
+
+	/** @sriov: virtualization data related to GT */
+	union {
+		/** @sriov.pf: PF data. Valid only if driver is running as PF */
+		struct xe_gt_sriov_pf pf;
+		/** @sriov.vf: VF data. Valid only if driver is running as VF */
+		struct xe_gt_sriov_vf vf;
+	} sriov;
+
+	/**
+	 * @reg_sr: table with registers to be restored on GT init/resume/reset
+	 */
+	struct xe_reg_sr reg_sr;
+
+	/** @reset: state for GT resets */
+	struct {
+		/**
+		 * @reset.worker: work so GT resets can done async allowing to reset
+		 * code to safely flush all code paths
+		 */
+		struct work_struct worker;
+	} reset;
+
+	/** @tlb_inval: TLB invalidation state */
+	struct xe_tlb_inval tlb_inval;
+
+	/**
+	 * @ccs_mode: Number of compute engines enabled.
+	 * Allows fixed mapping of available compute slices to compute engines.
+	 * By default only the first available compute engine is enabled and all
+	 * available compute slices are allocated to it.
+	 */
+	u32 ccs_mode;
+
+	/** @usm: unified shared memory state */
+	struct {
+		/**
+		 * @usm.bb_pool: Pool from which batchbuffers, for USM operations
+		 * (e.g. migrations, fixing page tables), are allocated.
+		 * Dedicated pool needed so USM operations do not get blocked
+		 * behind any user operations which may have resulted in a
+		 * fault.
+		 */
+		struct xe_sa_manager *bb_pool;
+		/**
+		 * @usm.paging_hwe0: The first designated paging engine.
+		 * This is some reserved BCS instance used for USM operations
+		 * (e.g. migrations, fixing page tables)
+		 */
+		struct xe_hw_engine *paging_hwe0;
+		/**
+		 * @usm.paging_logical_mask: logical mask of paging engines.
+		 * Should be densely populated.
+		 */
+		u32 paging_logical_mask;
+	} usm;
+
+	/** @ordered_wq: used to serialize GT resets and TDRs */
+	struct workqueue_struct *ordered_wq;
+
+	/** @uc: micro controllers on the GT */
+	struct xe_uc uc;
+
+	/** @gtidle: idle properties of GT */
+	struct xe_gt_idle gtidle;
+
+	/** @exec_queue_ops: submission backend exec queue operations */
+	const struct xe_exec_queue_ops *exec_queue_ops;
+
+	/**
+	 * @ring_ops: ring operations for this hw engine (1 per engine class)
+	 */
+	const struct xe_ring_ops *ring_ops[XE_ENGINE_CLASS_MAX];
+
+	/** @fence_irq: fence IRQs (1 per engine class) */
+	struct xe_hw_fence_irq fence_irq[XE_ENGINE_CLASS_MAX];
+
+	/** @default_lrc: default LRC state */
+	void *default_lrc[XE_ENGINE_CLASS_MAX];
+
+	/** @hw_engines: hardware engines on the GT */
+	struct xe_hw_engine hw_engines[XE_NUM_HW_ENGINES];
+
+	/** @eclass: per hardware engine class interface on the GT */
+	struct xe_hw_engine_class_intf  eclass[XE_ENGINE_CLASS_MAX];
+
+	/** @sysfs: sysfs' kobj used by xe_gt_sysfs */
+	struct kobject *sysfs;
+
+	/** @freq: Main GT freq sysfs control */
+	struct kobject *freq;
+
+	/** @mocs: info */
+	struct {
+		/** @mocs.uc_index: UC index */
+		u8 uc_index;
+		/** @mocs.wb_index: WB index, only used on L3_CCS platforms */
+		u8 wb_index;
+	} mocs;
+
+	/** @fuse_topo: GT topology reported by fuse registers */
+	struct {
+		/** @fuse_topo.g_dss_mask: dual-subslices usable by geometry */
+		xe_dss_mask_t g_dss_mask;
+
+		/** @fuse_topo.c_dss_mask: dual-subslices usable by compute */
+		xe_dss_mask_t c_dss_mask;
+
+		/** @fuse_topo.eu_mask_per_dss: EU mask per DSS*/
+		xe_eu_mask_t eu_mask_per_dss;
+
+		/** @fuse_topo.l3_bank_mask: L3 bank mask */
+		xe_l3_bank_mask_t l3_bank_mask;
+
+		/**
+		 * @fuse_topo.eu_type: type/width of EU stored in
+		 * fuse_topo.eu_mask_per_dss
+		 */
+		enum xe_gt_eu_type eu_type;
+	} fuse_topo;
+
+	/** @steering: register steering for individual HW units */
+	struct {
+		/** @steering.ranges: register ranges used for this steering type */
+		const struct xe_mmio_range *ranges;
+
+		/** @steering.group_target: target to steer accesses to */
+		u16 group_target;
+		/** @steering.instance_target: instance to steer accesses to */
+		u16 instance_target;
+		/** @steering.initialized: Whether this steering range is initialized */
+		bool initialized;
+	} steering[NUM_STEERING_TYPES];
+
+	/**
+	 * @steering_dss_per_grp: number of DSS per steering group (gslice,
+	 *    cslice, etc.).
+	 */
+	unsigned int steering_dss_per_grp;
+
+	/**
+	 * @mcr_lock: protects the MCR_SELECTOR register for the duration
+	 *    of a steered operation
+	 */
+	spinlock_t mcr_lock;
+
+	/**
+	 * @global_invl_lock: protects the register for the duration
+	 *    of a global invalidation of l2 cache
+	 */
+	spinlock_t global_invl_lock;
+
+	/** @wa_active: keep track of active workarounds */
+	struct {
+		/** @wa_active.gt: bitmap with active GT workarounds */
+		unsigned long *gt;
+		/** @wa_active.engine: bitmap with active engine workarounds */
+		unsigned long *engine;
+		/** @wa_active.lrc: bitmap with active LRC workarounds */
+		unsigned long *lrc;
+		/** @wa_active.oob: bitmap with active OOB workarounds */
+		unsigned long *oob;
+		/**
+		 * @wa_active.oob_initialized: mark oob as initialized to help
+		 * detecting misuse of XE_GT_WA() - it can only be called on
+		 * initialization after OOB WAs have been processed
+		 */
+		bool oob_initialized;
+	} wa_active;
+
+	/** @tuning_active: keep track of active tunings */
+	struct {
+		/** @tuning_active.gt: bitmap with active GT tunings */
+		unsigned long *gt;
+		/** @tuning_active.engine: bitmap with active engine tunings */
+		unsigned long *engine;
+		/** @tuning_active.lrc: bitmap with active LRC tunings */
+		unsigned long *lrc;
+	} tuning_active;
+
+	/** @user_engines: engines present in GT and available to userspace */
+	struct {
+		/**
+		 * @user_engines.mask: like @info.engine_mask, but take in
+		 * consideration only engines available to userspace
+		 */
+		u64 mask;
+
+		/**
+		 * @user_engines.instances_per_class: aggregate per class the
+		 * number of engines available to userspace
+		 */
+		u8 instances_per_class[XE_ENGINE_CLASS_MAX];
+	} user_engines;
+
+	/** @oa: oa observation subsystem per gt info */
+	struct xe_oa_gt oa;
+
+	/** @eu_stall: EU stall counters subsystem per gt info */
+	struct xe_eu_stall_gt *eu_stall;
+};
+
+#endif

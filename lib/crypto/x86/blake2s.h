@@ -1,0 +1,62 @@
+/* SPDX-License-Identifier: GPL-2.0 OR MIT */
+/*
+ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ */
+
+#include <asm/cpufeature.h>
+#include <asm/fpu/api.h>
+#include <asm/processor.h>
+#include <asm/simd.h>
+#include <linux/jump_label.h>
+#include <linux/kernel.h>
+#include <linux/sizes.h>
+
+asmlinkage void blake2s_compress_ssse3(struct blake2s_ctx *ctx,
+				       const u8 *data, size_t nblocks, u32 inc);
+asmlinkage void blake2s_compress_avx512(struct blake2s_ctx *ctx,
+					const u8 *data, size_t nblocks, u32 inc);
+
+static __ro_after_init DEFINE_STATIC_KEY_FALSE(blake2s_use_ssse3);
+static __ro_after_init DEFINE_STATIC_KEY_FALSE(blake2s_use_avx512);
+
+static void blake2s_compress(struct blake2s_ctx *ctx,
+			     const u8 *data, size_t nblocks, u32 inc)
+{
+	/* SIMD disables preemption, so relax after processing each page. */
+	BUILD_BUG_ON(SZ_4K / BLAKE2S_BLOCK_SIZE < 8);
+
+	if (!static_branch_likely(&blake2s_use_ssse3) || !may_use_simd()) {
+		blake2s_compress_generic(ctx, data, nblocks, inc);
+		return;
+	}
+
+	do {
+		const size_t blocks = min_t(size_t, nblocks,
+					    SZ_4K / BLAKE2S_BLOCK_SIZE);
+
+		kernel_fpu_begin();
+		if (static_branch_likely(&blake2s_use_avx512))
+			blake2s_compress_avx512(ctx, data, blocks, inc);
+		else
+			blake2s_compress_ssse3(ctx, data, blocks, inc);
+		kernel_fpu_end();
+
+		data += blocks * BLAKE2S_BLOCK_SIZE;
+		nblocks -= blocks;
+	} while (nblocks);
+}
+
+#define blake2s_mod_init_arch blake2s_mod_init_arch
+static void blake2s_mod_init_arch(void)
+{
+	if (boot_cpu_has(X86_FEATURE_SSSE3))
+		static_branch_enable(&blake2s_use_ssse3);
+
+	if (boot_cpu_has(X86_FEATURE_AVX) &&
+	    boot_cpu_has(X86_FEATURE_AVX2) &&
+	    boot_cpu_has(X86_FEATURE_AVX512F) &&
+	    boot_cpu_has(X86_FEATURE_AVX512VL) &&
+	    cpu_has_xfeatures(XFEATURE_MASK_SSE | XFEATURE_MASK_YMM |
+			      XFEATURE_MASK_AVX512, NULL))
+		static_branch_enable(&blake2s_use_avx512);
+}

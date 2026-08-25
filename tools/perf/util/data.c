@@ -1,0 +1,597 @@
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/compiler.h>
+#include <linux/kernel.h>
+#include <linux/string.h>
+#include <linux/zalloc.h>
+#include <linux/err.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <asm/bug.h>
+#include <dirent.h>
+
+#include "data.h"
+#include "util.h" // rm_rf_perf_data()
+#include "debug.h"
+#include "header.h"
+#include "rlimit.h"
+#include <internal/lib.h>
+
+static void perf_data_file__close(struct perf_data_file *file)
+{
+	if (file->use_stdio) {
+		if (file->fptr) {
+			fclose(file->fptr);
+			file->fptr = NULL;
+		}
+	} else {
+		close(file->fd);
+		file->fd = -1;
+	}
+	zfree(&file->path);
+}
+
+static void close_dir(struct perf_data_file *files, int nr)
+{
+	while (--nr >= 0)
+		perf_data_file__close(&files[nr]);
+
+	free(files);
+}
+
+void perf_data__close_dir(struct perf_data *data)
+{
+	close_dir(data->dir.files, data->dir.nr);
+	data->dir.files = NULL;
+	data->dir.nr = 0;
+}
+
+int perf_data__create_dir(struct perf_data *data, int nr)
+{
+	enum rlimit_action set_rlimit = NO_CHANGE;
+	struct perf_data_file *files = NULL;
+	int i, ret;
+
+	if (WARN_ON(!data->is_dir))
+		return -EINVAL;
+
+	files = calloc(nr, sizeof(*files));
+	if (!files)
+		return -ENOMEM;
+
+	for (i = 0; i < nr; i++) {
+		struct perf_data_file *file = &files[i];
+
+		ret = asprintf(&file->path, "%s/data.%d", data->path, i);
+		if (ret < 0) {
+			ret = -ENOMEM;
+			goto out_err;
+		}
+
+retry_open:
+		ret = open(file->path, O_RDWR|O_CREAT|O_TRUNC, S_IRUSR|S_IWUSR);
+		if (ret < 0) {
+			/*
+			 * If using parallel threads to collect data,
+			 * perf record needs at least 6 fds per CPU.
+			 * When we run out of them try to increase the limits.
+			 */
+			if (errno == EMFILE && rlimit__increase_nofile(&set_rlimit))
+				goto retry_open;
+
+			ret = -errno;
+			goto out_err;
+		}
+		set_rlimit = NO_CHANGE;
+
+		file->fd = ret;
+	}
+
+	data->dir.version = PERF_DIR_VERSION;
+	data->dir.files   = files;
+	data->dir.nr      = nr;
+	return 0;
+
+out_err:
+	close_dir(files, i);
+	return ret;
+}
+
+int perf_data__open_dir(struct perf_data *data)
+{
+	struct perf_data_file *files = NULL;
+	struct dirent *dent;
+	int ret = -1;
+	DIR *dir;
+	int nr = 0;
+
+	/*
+	 * Directory containing a single regular perf data file which is already
+	 * open, means there is nothing more to do here.
+	 */
+	if (perf_data__is_single_file(data))
+		return 0;
+
+	if (WARN_ON(!data->is_dir))
+		return -EINVAL;
+
+	/* The version is provided by DIR_FORMAT feature. */
+	if (WARN_ON(data->dir.version != PERF_DIR_VERSION))
+		return -1;
+
+	dir = opendir(data->path);
+	if (!dir)
+		return -EINVAL;
+
+	while ((dent = readdir(dir)) != NULL) {
+		struct perf_data_file *file;
+		char path[PATH_MAX];
+		struct stat st;
+
+		snprintf(path, sizeof(path), "%s/%s", data->path, dent->d_name);
+		if (stat(path, &st))
+			continue;
+
+		if (!S_ISREG(st.st_mode) || strncmp(dent->d_name, "data.", 5))
+			continue;
+
+		ret = -ENOMEM;
+
+		file = realloc(files, (nr + 1) * sizeof(*files));
+		if (!file)
+			goto out_err;
+
+		files = file;
+		file = &files[nr++];
+
+		*file = (struct perf_data_file){
+			.path = strdup(path),
+			.fd = -1,
+			.size = st.st_size,
+			.use_stdio = false,
+		};
+		if (!file->path)
+			goto out_err;
+
+		ret = open(file->path, O_RDONLY);
+		if (ret < 0) {
+			ret = -errno;
+			goto out_err;
+		}
+		file->fd = ret;
+	}
+
+	closedir(dir);
+	if (!files)
+		return -EINVAL;
+
+	data->dir.files = files;
+	data->dir.nr    = nr;
+	return 0;
+
+out_err:
+	closedir(dir);
+	close_dir(files, nr);
+	return ret;
+}
+
+static bool check_pipe(struct perf_data *data)
+{
+	struct stat st;
+	bool is_pipe = false;
+	int fd = perf_data__is_read(data) ?
+		 STDIN_FILENO : STDOUT_FILENO;
+
+	if (!data->path) {
+		if (!fstat(fd, &st) && S_ISFIFO(st.st_mode))
+			is_pipe = true;
+	} else {
+		if (!strcmp(data->path, "-"))
+			is_pipe = true;
+	}
+
+	if (is_pipe) {
+		if (data->file.use_stdio) {
+			const char *mode;
+
+			mode = perf_data__is_read(data) ? "r" : "w";
+			data->file.fptr = fdopen(fd, mode);
+
+			if (data->file.fptr == NULL) {
+				data->file.fd = fd;
+				data->file.use_stdio = false;
+			}
+
+		/*
+		 * When is_pipe and data->file.fd is given, use given fd
+		 * instead of STDIN_FILENO or STDOUT_FILENO
+		 */
+		} else if (data->file.fd <= 0) {
+			data->file.fd = fd;
+		}
+	}
+
+	return data->is_pipe = is_pipe;
+}
+
+static int check_backup(struct perf_data *data)
+{
+	struct stat st;
+
+	if (perf_data__is_read(data))
+		return 0;
+
+	if (!stat(data->path, &st) && st.st_size) {
+		char oldname[PATH_MAX];
+		int ret;
+
+		snprintf(oldname, sizeof(oldname), "%s.old",
+			 data->path);
+
+		ret = rm_rf_perf_data(oldname);
+		if (ret) {
+			if (ret == -2)
+				pr_err("Can't remove old data: Unknown file found (%s)\n", oldname);
+			else
+				pr_err("Can't remove old data: %m (%s)\n", oldname);
+			return -1;
+		}
+
+		if (rename(data->path, oldname)) {
+			pr_err("Can't move data: %m (%s to %s)\n", data->path, oldname);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static bool is_dir(struct perf_data *data)
+{
+	struct stat st;
+
+	if (stat(data->path, &st))
+		return false;
+
+	return (st.st_mode & S_IFMT) == S_IFDIR;
+}
+
+static int open_file_read(struct perf_data *data)
+{
+	int flags = data->in_place_update ? O_RDWR : O_RDONLY;
+	struct stat st;
+	int fd;
+
+	fd = open(data->file.path, flags);
+	if (fd < 0) {
+		int err = errno;
+
+		pr_err("failed to open %s: %m", data->file.path);
+		if (err == ENOENT && !strcmp(data->file.path, "perf.data"))
+			pr_err("  (try 'perf record' first)");
+		pr_err("\n");
+		return -err;
+	}
+
+	if (fstat(fd, &st) < 0)
+		goto out_close;
+
+	if (!data->force && st.st_uid && (st.st_uid != geteuid())) {
+		pr_err("File %s not owned by current user or root (use -f to override)\n",
+		       data->file.path);
+		goto out_close;
+	}
+
+	if (!st.st_size) {
+		pr_info("zero-sized data (%s), nothing to do!\n",
+			data->file.path);
+		goto out_close;
+	}
+
+	data->file.size = st.st_size;
+	return fd;
+
+ out_close:
+	close(fd);
+	return -1;
+}
+
+static int open_file_write(struct perf_data *data)
+{
+	int fd = open(data->file.path, O_CREAT|O_RDWR|O_TRUNC|O_CLOEXEC, S_IRUSR|S_IWUSR);
+
+	if (fd < 0)
+		pr_err("failed to open %s : %m\n", data->file.path);
+
+	return fd;
+}
+
+static int open_file(struct perf_data *data)
+{
+	int fd;
+
+	fd = perf_data__is_read(data) ?
+	     open_file_read(data) : open_file_write(data);
+
+	if (fd < 0) {
+		zfree(&data->file.path);
+		return -1;
+	}
+
+	data->file.fd = fd;
+	return 0;
+}
+
+static int open_file_dup(struct perf_data *data)
+{
+	data->file.path = strdup(data->path);
+	if (!data->file.path)
+		return -ENOMEM;
+
+	return open_file(data);
+}
+
+static int open_dir(struct perf_data *data)
+{
+	int ret;
+
+	/*
+	 * So far we open only the header, so we can read the data version and
+	 * layout.
+	 */
+	if (asprintf(&data->file.path, "%s/data", data->path) < 0)
+		return -1;
+
+	if (perf_data__is_write(data) && mkdir(data->path, 0700) < 0) {
+		zfree(&data->file.path);
+		return -1;
+	}
+
+	ret = open_file(data);
+
+	/* Cleanup whatever we managed to create so far. */
+	if (ret && perf_data__is_write(data))
+		rm_rf_perf_data(data->path);
+
+	return ret;
+}
+
+int perf_data__open(struct perf_data *data)
+{
+	int ret;
+
+	if (data->open)
+		return 0;
+
+	if (check_pipe(data)) {
+		data->open = true;
+		return 0;
+	}
+
+	/* currently it allows stdio for pipe only */
+	data->file.use_stdio = false;
+
+	if (!data->path)
+		data->path = "perf.data";
+
+	if (check_backup(data))
+		return -1;
+
+	if (perf_data__is_read(data))
+		data->is_dir = is_dir(data);
+
+	ret = perf_data__is_dir(data) ? open_dir(data) : open_file_dup(data);
+
+	if (!ret)
+		data->open = true;
+
+	return ret;
+}
+
+void perf_data__close(struct perf_data *data)
+{
+	if (!data->open)
+		return;
+
+	if (perf_data__is_dir(data))
+		perf_data__close_dir(data);
+
+	perf_data_file__close(&data->file);
+	data->open = false;
+}
+
+static ssize_t perf_data_file__read(struct perf_data_file *file, void *buf, size_t size)
+{
+	if (file->use_stdio) {
+		if (fread(buf, size, 1, file->fptr) == 1)
+			return size;
+		return feof(file->fptr) ? 0 : -1;
+	}
+	return readn(file->fd, buf, size);
+}
+
+ssize_t perf_data__read(struct perf_data *data, void *buf, size_t size)
+{
+	return perf_data_file__read(&data->file, buf, size);
+}
+
+ssize_t perf_data_file__write(struct perf_data_file *file,
+			      void *buf, size_t size)
+{
+	if (file->use_stdio) {
+		if (fwrite(buf, size, /*nmemb=*/1, file->fptr) == 1)
+			return size;
+		return -1;
+	}
+	return writen(file->fd, buf, size);
+}
+
+ssize_t perf_data__write(struct perf_data *data,
+			 void *buf, size_t size)
+{
+	return perf_data_file__write(&data->file, buf, size);
+}
+
+off_t perf_data_file__seek(struct perf_data_file *file, off_t offset, int whence)
+{
+	if (file->use_stdio) {
+		off_t res = fseeko(file->fptr, offset, whence);
+
+		return res < 0 ? -1 : ftello(file->fptr);
+	}
+	return lseek(file->fd, offset, whence);
+}
+
+off_t perf_data__seek(struct perf_data *data, off_t offset, int whence)
+{
+	/* Note, a pipe fd will fail with -1 with errno of ESPIPE. */
+	return perf_data_file__seek(&data->file, offset, whence);
+}
+
+int perf_data__switch(struct perf_data *data,
+		      const char *postfix,
+		      size_t pos, bool at_exit,
+		      char **new_filepath)
+{
+	int ret;
+
+	if (perf_data__is_read(data))
+		return -EINVAL;
+
+	if (asprintf(new_filepath, "%s.%s", data->path, postfix) < 0)
+		return -ENOMEM;
+
+	/*
+	 * Only fire a warning, don't return error, continue fill
+	 * original file.
+	 */
+	if (rename(data->path, *new_filepath))
+		pr_warning("Failed to rename %s to %s\n", data->path, *new_filepath);
+
+	if (!at_exit) {
+		perf_data_file__close(&data->file);
+		data->open = false;
+		ret = perf_data__open(data);
+		if (ret < 0)
+			goto out;
+
+		if (perf_data__seek(data, pos, SEEK_SET) == (off_t)-1) {
+			ret = -errno;
+			pr_debug("Failed to seek to %zu: %m", pos);
+			goto out;
+		}
+	}
+	ret = perf_data__fd(data);
+out:
+	return ret;
+}
+
+unsigned long perf_data__size(struct perf_data *data)
+{
+	u64 size = data->file.size;
+	int i;
+
+	if (perf_data__is_single_file(data))
+		return size;
+
+	for (i = 0; i < data->dir.nr; i++) {
+		struct perf_data_file *file = &data->dir.files[i];
+
+		size += file->size;
+	}
+
+	return size;
+}
+
+int perf_data__make_kcore_dir(struct perf_data *data, char *buf, size_t buf_sz)
+{
+	int ret;
+
+	if (!data->is_dir)
+		return -1;
+
+	ret = snprintf(buf, buf_sz, "%s/kcore_dir", data->path);
+	if (ret < 0 || (size_t)ret >= buf_sz)
+		return -1;
+
+	return mkdir(buf, S_IRWXU);
+}
+
+bool has_kcore_dir(const char *path)
+{
+	struct dirent *d = ERR_PTR(-EINVAL);
+	const char *name = "kcore_dir";
+	DIR *dir = opendir(path);
+	size_t n = strlen(name);
+	bool result = false;
+
+	if (dir) {
+		while (d && !result) {
+			d = readdir(dir);
+			result = d ? strncmp(d->d_name, name, n) : false;
+		}
+		closedir(dir);
+	}
+
+	return result;
+}
+
+char *perf_data__kallsyms_name(struct perf_data *data)
+{
+	char *kallsyms_name;
+	struct stat st;
+
+	if (!data->is_dir)
+		return NULL;
+
+	if (asprintf(&kallsyms_name, "%s/kcore_dir/kallsyms", data->path) < 0)
+		return NULL;
+
+	if (stat(kallsyms_name, &st)) {
+		free(kallsyms_name);
+		return NULL;
+	}
+
+	return kallsyms_name;
+}
+
+char *perf_data__guest_kallsyms_name(struct perf_data *data, pid_t machine_pid)
+{
+	char *kallsyms_name;
+	struct stat st;
+
+	if (!data->is_dir)
+		return NULL;
+
+	if (asprintf(&kallsyms_name, "%s/kcore_dir__%d/kallsyms", data->path, machine_pid) < 0)
+		return NULL;
+
+	if (stat(kallsyms_name, &st)) {
+		free(kallsyms_name);
+		return NULL;
+	}
+
+	return kallsyms_name;
+}
+
+bool is_perf_data(const char *path)
+{
+	bool ret = false;
+	FILE *file;
+	u64 magic;
+
+	file = fopen(path, "r");
+	if (!file)
+		return false;
+
+	if (fread(&magic, 1, 8, file) < 8)
+		goto out;
+
+	ret = is_perf_magic(magic);
+out:
+	fclose(file);
+	return ret;
+}

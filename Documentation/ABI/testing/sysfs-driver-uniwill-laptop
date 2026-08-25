@@ -1,0 +1,105 @@
+What:		/sys/bus/platform/devices/INOU0000:XX/fn_lock
+Date:		November 2025
+KernelVersion:	6.19
+Contact:	Armin Wolf <W_Armin@gmx.de>
+Description:
+		Allows userspace applications to enable/disable the FN lock feature
+		of the integrated keyboard by writing "1"/"0" into this file.
+
+		Reading this file returns the current enable status of the FN lock functionality.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/super_key_enable
+Date:		November 2025
+KernelVersion:	6.19
+Contact:	Armin Wolf <W_Armin@gmx.de>
+Description:
+		Allows userspace applications to enable/disable the super key of the integrated
+		keyboard by writing "1"/"0" into this file.
+
+		Reading this file returns the current enable status of the super key.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/touchpad_toggle_enable
+Date:		November 2025
+KernelVersion:	6.19
+Contact:	Armin Wolf <W_Armin@gmx.de>
+Description:
+		Allows userspace applications to enable/disable the touchpad toggle functionality
+		of the integrated touchpad by writing "1"/"0" into this file.
+
+		Reading this file returns the current enable status of the touchpad toggle
+		functionality.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/rainbow_animation
+Date:		November 2025
+KernelVersion:	6.19
+Contact:	Armin Wolf <W_Armin@gmx.de>
+Description:
+		Forces the integrated lightbar to display a rainbow animation when the machine
+		is not suspended. Writing "1"/"0" into this file enables/disables this
+		functionality.
+
+		Reading this file returns the current status of the rainbow animation functionality.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/breathing_in_suspend
+Date:		November 2025
+KernelVersion:	6.19
+Contact:	Armin Wolf <W_Armin@gmx.de>
+Description:
+		Causes the integrated lightbar to display a breathing animation when the machine
+		has been suspended and is running on AC power. Writing "1"/"0" into this file
+		enables/disables this functionality.
+
+		Reading this file returns the current status of the breathing animation
+		functionality.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/ctgp_offset
+Date:		January 2026
+KernelVersion:	7.0
+Contact:	Werner Sembach <wse@tuxedocomputers.com>
+Description:
+		Allows userspace applications to set the configurable TGP offset on top of the base
+		TGP. Base TGP and max TGP and therefore the max cTGP offset are device specific.
+		Note that setting the maximum cTGP leaves no window open for Dynamic Boost as
+		Dynamic Boost also can not go over max TGP. Setting the cTGP to maximum is
+		effectively disabling Dynamic Boost and telling the device to always prioritize the
+		GPU over the CPU.
+
+		Reading this file returns the current configurable TGP offset.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/usb_c_power_priority
+Date:		February 2026
+KernelVersion:	7.1
+Contact:	Werner Sembach <wse@tuxedocomputers.com>
+Description:
+		Allows userspace applications to choose the USB-C power distribution profile between
+		one that offers a bigger share of the power to the battery and one that offers more
+		of it to the CPU. Writing "charging"/"performance" into this file selects the
+		respective profile.
+
+		Reading this file returns the profile names with the currently active one in
+		brackets.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/ac_auto_boot
+Date:		March 2026
+KernelVersion:	7.1
+Contact:	Armin Wolf <W_Armin@gmx.de>
+Description:
+		Allows userspace applications to configure if the device should boot automatically
+		when being connected to a power source. Writing "1"/"0" into this file
+		enables/disables this functionality. Enabling both AC auto boot and USB powershare
+		at the same time is not supported.
+
+		Reading this file returns the current status of the AC auto boot functionality.
+
+What:		/sys/bus/platform/devices/INOU0000:XX/usb_powershare_high
+Date:		March 2026
+KernelVersion:	7.1
+Contact:	Armin Wolf <W_Armin@gmx.de>
+Description:
+		Allows userspace applications to configure if the device should continue to provide
+		power via the USB ports when hibernating or powered off. Might also increase the
+		power budget available to USB ports on some devices. Writing "1"/"0" into this
+		file enables/disables this functionality. Enabling both USB powershare and AC auto
+		boot at the same time is not supported.
+
+		Reading this file returns the current status of the USB powershare functionality.

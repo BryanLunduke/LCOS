@@ -1,0 +1,166 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ * Copyright (C) 2015 Google, Inc.
+ *
+ * Author: Sami Tolvanen <samitolvanen@google.com>
+ */
+
+#ifndef DM_VERITY_FEC_H
+#define DM_VERITY_FEC_H
+
+#include "dm-verity.h"
+#include <linux/rslib.h>
+
+/* Reed-Solomon(n, k) parameters */
+#define DM_VERITY_FEC_RS_N	255
+#define DM_VERITY_FEC_MIN_ROOTS	2	/* RS(255, 253): ~0.8% space overhead */
+#define DM_VERITY_FEC_MAX_ROOTS	24	/* RS(255, 231): ~10% space overhead */
+
+/* buffers for deinterleaving and decoding */
+#define DM_VERITY_FEC_BUF_RS_BITS	4 /* log2(RS messages per buffer) */
+
+#define DM_VERITY_OPT_FEC_DEV		"use_fec_from_device"
+#define DM_VERITY_OPT_FEC_BLOCKS	"fec_blocks"
+#define DM_VERITY_OPT_FEC_START		"fec_start"
+#define DM_VERITY_OPT_FEC_ROOTS		"fec_roots"
+
+/* configuration */
+struct dm_verity_fec {
+	struct dm_dev *dev;	/* parity data device */
+	struct dm_bufio_client *data_bufio;	/* for data dev access */
+	struct dm_bufio_client *bufio;		/* for parity data access */
+	size_t block_size;	/* size of data, hash, and parity blocks in bytes */
+	sector_t start;		/* parity data start in blocks */
+	sector_t blocks;	/* number of blocks covered */
+	sector_t region_blocks; /* blocks per region: ceil(blocks / rs_k) */
+	sector_t hash_blocks;	/* blocks covered after v->hash_start */
+	unsigned char roots;	/* parity bytes per RS codeword, n-k of RS(n, k) */
+	unsigned char rs_k;	/* message bytes per RS codeword, k of RS(n, k) */
+	mempool_t fio_pool;	/* mempool for dm_verity_fec_io */
+	mempool_t rs_pool;	/* mempool for fio->rs */
+	mempool_t prealloc_pool;	/* mempool for preallocated buffers */
+	mempool_t output_pool;	/* mempool for output */
+	struct kmem_cache *cache;	/* cache for buffers */
+	atomic64_t corrected; /* corrected errors */
+};
+
+/* per-bio data */
+struct dm_verity_fec_io {
+	struct rs_control *rs;	/* Reed-Solomon state */
+	int erasures[DM_VERITY_FEC_MAX_ROOTS]; /* erasures for decode_rs8 */
+	u8 *output;		/* buffer for corrected output */
+	unsigned int level;		/* recursion level */
+	unsigned int nbufs;		/* number of buffers allocated */
+	/*
+	 * Buffers for deinterleaving RS codewords.  Each buffer has space for
+	 * the message bytes of (1 << DM_VERITY_FEC_BUF_RS_BITS) RS codewords.
+	 * The array length is fec_max_nbufs(v), and we try to allocate that
+	 * many buffers.  However, in low-memory situations we may be unable to
+	 * allocate all buffers.  'nbufs' holds the number actually allocated.
+	 */
+	u8 *bufs[];
+};
+
+#ifdef CONFIG_DM_VERITY_FEC
+
+/* each feature parameter requires a value */
+#define DM_VERITY_OPTS_FEC	8
+
+/* Returns true if forward error correction is enabled. */
+static inline bool verity_fec_is_enabled(struct dm_verity *v)
+{
+	return v->fec && v->fec->dev;
+}
+
+extern int verity_fec_decode(struct dm_verity *v, struct dm_verity_io *io,
+			     enum verity_block_type type, const u8 *want_digest,
+			     sector_t block, u8 *dest);
+
+extern unsigned int verity_fec_status_table(struct dm_verity *v, unsigned int sz,
+					char *result, unsigned int maxlen);
+
+extern void __verity_fec_finish_io(struct dm_verity_io *io);
+static inline void verity_fec_finish_io(struct dm_verity_io *io)
+{
+	if (unlikely(io->fec_io))
+		__verity_fec_finish_io(io);
+}
+
+static inline void verity_fec_init_io(struct dm_verity_io *io)
+{
+	io->fec_io = NULL;
+}
+
+extern bool verity_is_fec_opt_arg(const char *arg_name);
+extern int verity_fec_parse_opt_args(struct dm_arg_set *as,
+				     struct dm_verity *v, unsigned int *argc,
+				     const char *arg_name);
+
+extern void verity_fec_dtr(struct dm_verity *v);
+
+extern int verity_fec_ctr_alloc(struct dm_verity *v);
+extern int verity_fec_ctr(struct dm_verity *v);
+
+#else /* !CONFIG_DM_VERITY_FEC */
+
+#define DM_VERITY_OPTS_FEC	0
+
+static inline bool verity_fec_is_enabled(struct dm_verity *v)
+{
+	return false;
+}
+
+static inline int verity_fec_decode(struct dm_verity *v,
+				    struct dm_verity_io *io,
+				    enum verity_block_type type,
+				    const u8 *want_digest,
+				    sector_t block, u8 *dest)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline unsigned int verity_fec_status_table(struct dm_verity *v,
+					       unsigned int sz, char *result,
+					       unsigned int maxlen)
+{
+	return sz;
+}
+
+static inline void verity_fec_finish_io(struct dm_verity_io *io)
+{
+}
+
+static inline void verity_fec_init_io(struct dm_verity_io *io)
+{
+}
+
+static inline bool verity_is_fec_opt_arg(const char *arg_name)
+{
+	return false;
+}
+
+static inline int verity_fec_parse_opt_args(struct dm_arg_set *as,
+					    struct dm_verity *v,
+					    unsigned int *argc,
+					    const char *arg_name)
+{
+	return -EINVAL;
+}
+
+static inline void verity_fec_dtr(struct dm_verity *v)
+{
+}
+
+static inline int verity_fec_ctr_alloc(struct dm_verity *v)
+{
+	return 0;
+}
+
+static inline int verity_fec_ctr(struct dm_verity *v)
+{
+	return 0;
+}
+
+#endif /* CONFIG_DM_VERITY_FEC */
+
+#endif /* DM_VERITY_FEC_H */

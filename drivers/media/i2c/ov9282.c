@@ -1,0 +1,1417 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * OmniVision ov9282 Camera Sensor Driver
+ *
+ * Copyright (C) 2021 Intel Corporation
+ */
+#include <linux/unaligned.h>
+
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/i2c.h>
+#include <linux/math.h>
+#include <linux/module.h>
+#include <linux/pm_runtime.h>
+#include <linux/regmap.h>
+#include <linux/regulator/consumer.h>
+
+#include <media/v4l2-cci.h>
+#include <media/v4l2-ctrls.h>
+#include <media/v4l2-event.h>
+#include <media/v4l2-fwnode.h>
+#include <media/v4l2-subdev.h>
+
+/* Streaming Mode */
+#define OV9282_REG_MODE_SELECT	CCI_REG8(0x0100)
+#define OV9282_MODE_STANDBY	0x00
+#define OV9282_MODE_STREAMING	0x01
+
+#define OV9282_REG_PLL_CTRL_0D	CCI_REG8(0x030d)
+#define OV9282_PLL_CTRL_0D_RAW8		0x60
+#define OV9282_PLL_CTRL_0D_RAW10	0x50
+
+#define OV9282_REG_TIMING_HTS	CCI_REG16(0x380c)
+#define OV9282_TIMING_HTS_MAX	0x7fff
+
+/* Lines per frame */
+#define OV9282_REG_LPFR		CCI_REG16(0x380e)
+
+/* Chip ID */
+#define OV9282_REG_ID		CCI_REG16(0x300a)
+#define OV9282_ID		0x9281
+
+/* Output enable registers */
+#define OV9282_REG_OUTPUT_ENABLE4	CCI_REG8(0x3004)
+#define OV9282_OUTPUT_ENABLE4_GPIO2	BIT(1)
+#define OV9282_OUTPUT_ENABLE4_D9	BIT(0)
+
+#define OV9282_REG_OUTPUT_ENABLE5	CCI_REG8(0x3005)
+#define OV9282_OUTPUT_ENABLE5_D8	BIT(7)
+#define OV9282_OUTPUT_ENABLE5_D7	BIT(6)
+#define OV9282_OUTPUT_ENABLE5_D6	BIT(5)
+#define OV9282_OUTPUT_ENABLE5_D5	BIT(4)
+#define OV9282_OUTPUT_ENABLE5_D4	BIT(3)
+#define OV9282_OUTPUT_ENABLE5_D3	BIT(2)
+#define OV9282_OUTPUT_ENABLE5_D2	BIT(1)
+#define OV9282_OUTPUT_ENABLE5_D1	BIT(0)
+
+#define OV9282_REG_OUTPUT_ENABLE6	CCI_REG8(0x3006)
+#define OV9282_OUTPUT_ENABLE6_D0	BIT(7)
+#define OV9282_OUTPUT_ENABLE6_PCLK	BIT(6)
+#define OV9282_OUTPUT_ENABLE6_HREF	BIT(5)
+#define OV9282_OUTPUT_ENABLE6_STROBE	BIT(3)
+#define OV9282_OUTPUT_ENABLE6_ILPWM	BIT(2)
+#define OV9282_OUTPUT_ENABLE6_VSYNC	BIT(1)
+
+/* Exposure control */
+#define OV9282_REG_EXPOSURE	CCI_REG24(0x3500)
+#define OV9282_EXPOSURE_MIN	1
+#define OV9282_EXPOSURE_OFFSET	25
+#define OV9282_EXPOSURE_STEP	1
+#define OV9282_EXPOSURE_DEFAULT	0x0282
+
+/* AEC/AGC manual */
+#define OV9282_REG_AEC_MANUAL		CCI_REG8(0x3503)
+#define OV9282_DIGFRAC_GAIN_DELAY	BIT(6)
+#define OV9282_GAIN_CHANGE_DELAY	BIT(5)
+#define OV9282_GAIN_DELAY		BIT(4)
+#define OV9282_GAIN_PREC16_EN		BIT(3)
+#define OV9282_GAIN_MANUAL_AS_SENSGAIN	BIT(2)
+#define OV9282_AEC_MANUAL_DEFAULT	0x00
+
+/* Analog gain control */
+#define OV9282_REG_AGAIN	CCI_REG8(0x3509)
+#define OV9282_AGAIN_MIN	0x10
+#define OV9282_AGAIN_MAX	0xff
+#define OV9282_AGAIN_STEP	1
+#define OV9282_AGAIN_DEFAULT	0x10
+
+/* Group hold register */
+#define OV9282_REG_HOLD		CCI_REG8(0x3308)
+
+#define OV9282_REG_ANA_CORE_2	CCI_REG8(0x3662)
+#define OV9282_ANA_CORE2_RAW8	0x07
+#define OV9282_ANA_CORE2_RAW10	0x05
+
+#define OV9282_REG_TIMING_FORMAT_1	CCI_REG8(0x3820)
+#define OV9282_REG_TIMING_FORMAT_2	CCI_REG8(0x3821)
+#define OV9282_FLIP_BIT			BIT(2)
+
+#define OV9282_REG_MIPI_CTRL00	CCI_REG8(0x4800)
+#define OV9282_GATED_CLOCK	BIT(5)
+
+/* Flash/Strobe control registers */
+#define OV9282_REG_STROBE_FRAME_SPAN		CCI_REG32(0x3925)
+#define OV9282_STROBE_FRAME_SPAN_DEFAULT	0x0000001a
+
+/* Input clock rate */
+#define OV9282_INCLK_RATE	24000000
+
+/* CSI2 HW configuration */
+#define OV9282_LINK_FREQ	400000000
+#define OV9282_NUM_DATA_LANES	2
+
+/* Pixel rate */
+#define OV9282_PIXEL_RATE_10BIT		(OV9282_LINK_FREQ * 2 * \
+					 OV9282_NUM_DATA_LANES / 10)
+#define OV9282_PIXEL_RATE_8BIT		(OV9282_LINK_FREQ * 2 * \
+					 OV9282_NUM_DATA_LANES / 8)
+
+/*
+ * OV9282 native and active pixel array size.
+ * 8 dummy rows/columns on each edge of a 1280x800 active array
+ */
+#define OV9282_NATIVE_WIDTH		1296U
+#define OV9282_NATIVE_HEIGHT		816U
+#define OV9282_PIXEL_ARRAY_LEFT		8U
+#define OV9282_PIXEL_ARRAY_TOP		8U
+#define OV9282_PIXEL_ARRAY_WIDTH	1280U
+#define OV9282_PIXEL_ARRAY_HEIGHT	800U
+
+#define OV9282_REG_MIN		0x00
+#define OV9282_REG_MAX		0xfffff
+
+#define OV9282_STROBE_SPAN_FACTOR	192
+
+static const char * const ov9282_supply_names[] = {
+	"avdd",		/* Analog power */
+	"dovdd",	/* Digital I/O power */
+	"dvdd",		/* Digital core power */
+};
+
+#define OV9282_NUM_SUPPLIES ARRAY_SIZE(ov9282_supply_names)
+
+/**
+ * struct ov9282_reg_list - ov9282 sensor register list
+ * @num_of_regs: Number of registers in the list
+ * @regs: Pointer to register list
+ */
+struct ov9282_reg_list {
+	u32 num_of_regs;
+	const struct cci_reg_sequence *regs;
+};
+
+/**
+ * struct ov9282_mode - ov9282 sensor mode structure
+ * @width: Frame width
+ * @height: Frame height
+ * @hblank_min: Minimum horizontal blanking in lines for non-continuous[0] and
+ *		continuous[1] clock modes
+ * @vblank: Vertical blanking in lines
+ * @vblank_min: Minimum vertical blanking in lines
+ * @vblank_max: Maximum vertical blanking in lines
+ * @link_freq_idx: Link frequency index
+ * @crop: on-sensor cropping for this mode
+ * @reg_list: Register list for sensor mode
+ */
+struct ov9282_mode {
+	u32 width;
+	u32 height;
+	u32 hblank_min[2];
+	u32 vblank;
+	u32 vblank_min;
+	u32 vblank_max;
+	u32 link_freq_idx;
+	struct v4l2_rect crop;
+	struct ov9282_reg_list reg_list;
+};
+
+/**
+ * struct ov9282 - ov9282 sensor device structure
+ * @dev: Pointer to generic device
+ * @sd: V4L2 sub-device
+ * @regmap: Regmap for sensor register access
+ * @pad: Media pad. Only one pad supported
+ * @reset_gpio: Sensor reset gpio
+ * @inclk: Sensor input clock
+ * @supplies: Regulator supplies for the sensor
+ * @ctrl_handler: V4L2 control handler
+ * @link_freq_ctrl: Pointer to link frequency control
+ * @hblank_ctrl: Pointer to horizontal blanking control
+ * @vblank_ctrl: Pointer to vertical blanking control
+ * @exp_ctrl: Pointer to exposure control
+ * @again_ctrl: Pointer to analog gain control
+ * @pixel_rate: Pointer to pixel rate control
+ * @flash_duration: Pointer to flash duration control
+ * @vblank: Vertical blanking in lines
+ * @noncontinuous_clock: Selection of CSI2 noncontinuous clock mode
+ * @cur_mode: Pointer to current selected sensor mode
+ * @code: Mbus code currently selected
+ */
+struct ov9282 {
+	struct device *dev;
+	struct v4l2_subdev sd;
+	struct regmap *regmap;
+	struct media_pad pad;
+	struct gpio_desc *reset_gpio;
+	struct clk *inclk;
+	struct regulator_bulk_data supplies[OV9282_NUM_SUPPLIES];
+	struct v4l2_ctrl_handler ctrl_handler;
+	struct v4l2_ctrl *link_freq_ctrl;
+	struct v4l2_ctrl *hblank_ctrl;
+	struct v4l2_ctrl *vblank_ctrl;
+	struct {
+		struct v4l2_ctrl *exp_ctrl;
+		struct v4l2_ctrl *again_ctrl;
+	};
+	struct v4l2_ctrl *pixel_rate;
+	struct v4l2_ctrl *flash_duration;
+	u32 vblank;
+	bool noncontinuous_clock;
+	const struct ov9282_mode *cur_mode;
+	u32 code;
+};
+
+static const s64 link_freq[] = {
+	OV9282_LINK_FREQ,
+};
+
+/*
+ * Common registers
+ *
+ * Note: Do NOT include a software reset (0x0103, 0x01) in any of these
+ * register arrays as some settings are written as part of ov9282_power_on,
+ * and the reset will clear them.
+ */
+static const struct cci_reg_sequence common_regs[] = {
+	{CCI_REG8(0x0302), 0x32},
+	{CCI_REG8(0x030e), 0x02},
+	{CCI_REG8(0x3001), 0x00},
+	{OV9282_REG_OUTPUT_ENABLE4, 0x00},
+	{OV9282_REG_OUTPUT_ENABLE5, 0x00},
+	{OV9282_REG_OUTPUT_ENABLE6, OV9282_OUTPUT_ENABLE6_ILPWM},
+	{CCI_REG8(0x3011), 0x0a},
+	{CCI_REG8(0x3013), 0x18},
+	{CCI_REG8(0x301c), 0xf0},
+	{CCI_REG8(0x3022), 0x01},
+	{CCI_REG8(0x3030), 0x10},
+	{CCI_REG8(0x3039), 0x32},
+	{CCI_REG8(0x303a), 0x00},
+	{OV9282_REG_AEC_MANUAL, OV9282_GAIN_PREC16_EN},
+	{CCI_REG8(0x3505), 0x8c},
+	{CCI_REG8(0x3507), 0x03},
+	{CCI_REG8(0x3508), 0x00},
+	{CCI_REG8(0x3610), 0x80},
+	{CCI_REG8(0x3611), 0xa0},
+	{CCI_REG8(0x3620), 0x6e},
+	{CCI_REG8(0x3632), 0x56},
+	{CCI_REG8(0x3633), 0x78},
+	{CCI_REG8(0x3666), 0x00},
+	{CCI_REG8(0x366f), 0x5a},
+	{CCI_REG8(0x3680), 0x84},
+	{CCI_REG8(0x3712), 0x80},
+	{CCI_REG8(0x372d), 0x22},
+	{CCI_REG8(0x3731), 0x80},
+	{CCI_REG8(0x3732), 0x30},
+	{CCI_REG8(0x377d), 0x22},
+	{CCI_REG8(0x3788), 0x02},
+	{CCI_REG8(0x3789), 0xa4},
+	{CCI_REG8(0x378a), 0x00},
+	{CCI_REG8(0x378b), 0x4a},
+	{CCI_REG8(0x3799), 0x20},
+	{CCI_REG8(0x3881), 0x42},
+	{CCI_REG8(0x38a8), 0x02},
+	{CCI_REG8(0x38a9), 0x80},
+	{CCI_REG8(0x38b1), 0x00},
+	{CCI_REG8(0x38c4), 0x00},
+	{CCI_REG8(0x38c5), 0xc0},
+	{CCI_REG8(0x38c6), 0x04},
+	{CCI_REG8(0x38c7), 0x80},
+	{CCI_REG8(0x3920), 0xff},
+	{CCI_REG8(0x4010), 0x40},
+	{CCI_REG8(0x4043), 0x40},
+	{CCI_REG8(0x4307), 0x30},
+	{CCI_REG8(0x4317), 0x00},
+	{CCI_REG8(0x4501), 0x00},
+	{CCI_REG8(0x450a), 0x08},
+	{CCI_REG8(0x4601), 0x04},
+	{CCI_REG8(0x470f), 0x00},
+	{CCI_REG8(0x4f07), 0x00},
+	{CCI_REG8(0x5000), 0x9f},
+	{CCI_REG8(0x5001), 0x00},
+	{CCI_REG8(0x5e00), 0x00},
+	{CCI_REG8(0x5d00), 0x07},
+	{CCI_REG8(0x5d01), 0x00},
+	{CCI_REG8(0x0101), 0x01},
+	{CCI_REG8(0x1000), 0x03},
+	{CCI_REG8(0x5a08), 0x84},
+};
+
+#define MODE_1280_800		0
+#define MODE_1280_720		1
+#define MODE_640_400		2
+
+#define DEFAULT_MODE		MODE_1280_720
+
+/* Sensor mode registers */
+static const struct cci_reg_sequence mode_1280x800_regs[] = {
+	{CCI_REG8(0x3778), 0x00},
+	{CCI_REG8(0x3800), 0x00},
+	{CCI_REG8(0x3801), 0x00},
+	{CCI_REG8(0x3802), 0x00},
+	{CCI_REG8(0x3803), 0x00},
+	{CCI_REG8(0x3804), 0x05},
+	{CCI_REG8(0x3805), 0x0f},
+	{CCI_REG8(0x3806), 0x03},
+	{CCI_REG8(0x3807), 0x2f},
+	{CCI_REG8(0x3808), 0x05},
+	{CCI_REG8(0x3809), 0x00},
+	{CCI_REG8(0x380a), 0x03},
+	{CCI_REG8(0x380b), 0x20},
+	{CCI_REG8(0x3810), 0x00},
+	{CCI_REG8(0x3811), 0x08},
+	{CCI_REG8(0x3812), 0x00},
+	{CCI_REG8(0x3813), 0x08},
+	{CCI_REG8(0x3814), 0x11},
+	{CCI_REG8(0x3815), 0x11},
+	{OV9282_REG_TIMING_FORMAT_1, 0x40},
+	{OV9282_REG_TIMING_FORMAT_2, 0x00},
+	{CCI_REG8(0x4003), 0x40},
+	{CCI_REG8(0x4008), 0x04},
+	{CCI_REG8(0x4009), 0x0b},
+	{CCI_REG8(0x400c), 0x00},
+	{CCI_REG8(0x400d), 0x07},
+	{CCI_REG8(0x4507), 0x00},
+	{CCI_REG8(0x4509), 0x00},
+};
+
+static const struct cci_reg_sequence mode_1280x720_regs[] = {
+	{CCI_REG8(0x3778), 0x00},
+	{CCI_REG8(0x3800), 0x00},
+	{CCI_REG8(0x3801), 0x00},
+	{CCI_REG8(0x3802), 0x00},
+	{CCI_REG8(0x3803), 0x00},
+	{CCI_REG8(0x3804), 0x05},
+	{CCI_REG8(0x3805), 0x0f},
+	{CCI_REG8(0x3806), 0x02},
+	{CCI_REG8(0x3807), 0xdf},
+	{CCI_REG8(0x3808), 0x05},
+	{CCI_REG8(0x3809), 0x00},
+	{CCI_REG8(0x380a), 0x02},
+	{CCI_REG8(0x380b), 0xd0},
+	{CCI_REG8(0x3810), 0x00},
+	{CCI_REG8(0x3811), 0x08},
+	{CCI_REG8(0x3812), 0x00},
+	{CCI_REG8(0x3813), 0x08},
+	{CCI_REG8(0x3814), 0x11},
+	{CCI_REG8(0x3815), 0x11},
+	{OV9282_REG_TIMING_FORMAT_1, 0x3c},
+	{OV9282_REG_TIMING_FORMAT_2, 0x84},
+	{CCI_REG8(0x4003), 0x40},
+	{CCI_REG8(0x4008), 0x02},
+	{CCI_REG8(0x4009), 0x05},
+	{CCI_REG8(0x400c), 0x00},
+	{CCI_REG8(0x400d), 0x03},
+	{CCI_REG8(0x4507), 0x00},
+	{CCI_REG8(0x4509), 0x80},
+};
+
+static const struct cci_reg_sequence mode_640x400_regs[] = {
+	{CCI_REG8(0x3778), 0x10},
+	{CCI_REG8(0x3800), 0x00},
+	{CCI_REG8(0x3801), 0x00},
+	{CCI_REG8(0x3802), 0x00},
+	{CCI_REG8(0x3803), 0x00},
+	{CCI_REG8(0x3804), 0x05},
+	{CCI_REG8(0x3805), 0x0f},
+	{CCI_REG8(0x3806), 0x03},
+	{CCI_REG8(0x3807), 0x2f},
+	{CCI_REG8(0x3808), 0x02},
+	{CCI_REG8(0x3809), 0x80},
+	{CCI_REG8(0x380a), 0x01},
+	{CCI_REG8(0x380b), 0x90},
+	{CCI_REG8(0x3810), 0x00},
+	{CCI_REG8(0x3811), 0x04},
+	{CCI_REG8(0x3812), 0x00},
+	{CCI_REG8(0x3813), 0x04},
+	{CCI_REG8(0x3814), 0x31},
+	{CCI_REG8(0x3815), 0x22},
+	{OV9282_REG_TIMING_FORMAT_1, 0x60},
+	{OV9282_REG_TIMING_FORMAT_2, 0x01},
+	{CCI_REG8(0x4008), 0x02},
+	{CCI_REG8(0x4009), 0x05},
+	{CCI_REG8(0x400c), 0x00},
+	{CCI_REG8(0x400d), 0x03},
+	{CCI_REG8(0x4507), 0x03},
+	{CCI_REG8(0x4509), 0x80},
+};
+
+/* Supported sensor mode configurations */
+static const struct ov9282_mode supported_modes[] = {
+	[MODE_1280_800] = {
+		.width = 1280,
+		.height = 800,
+		.hblank_min = { 250, 176 },
+		.vblank = 1022,
+		.vblank_min = 110,
+		.vblank_max = 51540,
+		.link_freq_idx = 0,
+		.crop = {
+			.left = OV9282_PIXEL_ARRAY_LEFT,
+			.top = OV9282_PIXEL_ARRAY_TOP,
+			.width = 1280,
+			.height = 800
+		},
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_1280x800_regs),
+			.regs = mode_1280x800_regs,
+		},
+	},
+	[MODE_1280_720] = {
+		.width = 1280,
+		.height = 720,
+		.hblank_min = { 250, 176 },
+		.vblank = 1022,
+		.vblank_min = 41,
+		.vblank_max = 51540,
+		.link_freq_idx = 0,
+		.crop = {
+			/*
+			 * Note that this mode takes the top 720 lines from the
+			 * 800 of the sensor. It does not take a middle crop.
+			 */
+			.left = OV9282_PIXEL_ARRAY_LEFT,
+			.top = OV9282_PIXEL_ARRAY_TOP,
+			.width = 1280,
+			.height = 720
+		},
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_1280x720_regs),
+			.regs = mode_1280x720_regs,
+		},
+	},
+	[MODE_640_400] = {
+		.width = 640,
+		.height = 400,
+		.hblank_min = { 890, 816 },
+		.vblank = 1022,
+		.vblank_min = 22,
+		.vblank_max = 51540,
+		.link_freq_idx = 0,
+		.crop = {
+			.left = OV9282_PIXEL_ARRAY_LEFT,
+			.top = OV9282_PIXEL_ARRAY_TOP,
+			.width = 1280,
+			.height = 800
+		},
+		.reg_list = {
+			.num_of_regs = ARRAY_SIZE(mode_640x400_regs),
+			.regs = mode_640x400_regs,
+		},
+	},
+};
+
+/**
+ * to_ov9282() - ov9282 V4L2 sub-device to ov9282 device.
+ * @subdev: pointer to ov9282 V4L2 sub-device
+ *
+ * Return: pointer to ov9282 device
+ */
+static inline struct ov9282 *to_ov9282(struct v4l2_subdev *subdev)
+{
+	return container_of(subdev, struct ov9282, sd);
+}
+
+/**
+ * ov9282_update_controls() - Update control ranges based on streaming mode
+ * @ov9282: pointer to ov9282 device
+ * @mode: pointer to ov9282_mode sensor mode
+ * @fmt: pointer to the requested mode
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+static int ov9282_update_controls(struct ov9282 *ov9282,
+				  const struct ov9282_mode *mode,
+				  const struct v4l2_subdev_format *fmt)
+{
+	u32 hblank_min;
+	s64 pixel_rate;
+	int ret;
+
+	ret = __v4l2_ctrl_s_ctrl(ov9282->link_freq_ctrl, mode->link_freq_idx);
+	if (ret)
+		return ret;
+
+	pixel_rate = (fmt->format.code == MEDIA_BUS_FMT_Y10_1X10) ?
+		OV9282_PIXEL_RATE_10BIT : OV9282_PIXEL_RATE_8BIT;
+	ret = __v4l2_ctrl_modify_range(ov9282->pixel_rate, pixel_rate,
+				       pixel_rate, 1, pixel_rate);
+	if (ret)
+		return ret;
+
+	hblank_min = mode->hblank_min[ov9282->noncontinuous_clock ? 0 : 1];
+	ret =  __v4l2_ctrl_modify_range(ov9282->hblank_ctrl, hblank_min,
+					OV9282_TIMING_HTS_MAX - mode->width, 1,
+					hblank_min);
+	if (ret)
+		return ret;
+
+	return __v4l2_ctrl_modify_range(ov9282->vblank_ctrl, mode->vblank_min,
+					mode->vblank_max, 1, mode->vblank);
+}
+
+static u32 ov9282_exposure_to_us(struct ov9282 *ov9282, u32 exposure)
+{
+	/* calculate exposure time in µs */
+	u32 frame_width = ov9282->cur_mode->width + ov9282->hblank_ctrl->val;
+	u32 trow_us = frame_width / (ov9282->pixel_rate->val / 1000000UL);
+
+	return exposure * trow_us;
+}
+
+/**
+ * ov9282_update_exp_gain() - Set updated exposure and gain
+ * @ov9282: pointer to ov9282 device
+ * @exposure: updated exposure value
+ * @gain: updated analog gain value
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+static int ov9282_update_exp_gain(struct ov9282 *ov9282, u32 exposure, u32 gain)
+{
+	u32 exposure_us = ov9282_exposure_to_us(ov9282, exposure);
+	int ret, ret_hold;
+
+	dev_dbg(ov9282->dev, "Set exp %u (~%u us), analog gain %u",
+		exposure, exposure_us, gain);
+
+	ret = cci_write(ov9282->regmap, OV9282_REG_HOLD, 0x01, NULL);
+	if (ret)
+		return ret;
+
+	ret = cci_write(ov9282->regmap, OV9282_REG_EXPOSURE, exposure << 4, NULL);
+	if (ret)
+		goto error_release_group_hold;
+
+	ret = cci_write(ov9282->regmap, OV9282_REG_AGAIN, gain, NULL);
+	if (ret)
+		goto error_release_group_hold;
+
+	ret = __v4l2_ctrl_modify_range(ov9282->flash_duration,
+				       0, exposure_us, 1,
+				       OV9282_STROBE_FRAME_SPAN_DEFAULT);
+
+error_release_group_hold:
+	ret_hold = cci_write(ov9282->regmap, OV9282_REG_HOLD, 0, NULL);
+
+	return ret ? ret : ret_hold;
+}
+
+static u32 ov9282_us_to_flash_duration(struct ov9282 *ov9282, u32 value)
+{
+	/*
+	 * Calculate "strobe_frame_span" increments from a given value (µs).
+	 * This is quite tricky as "The step width of shift and span is
+	 * programmable under system clock domain.", but it's not documented
+	 * how to program this step width (at least in the datasheet available
+	 * to the author at time of writing).
+	 * The formula below is interpolated from different modes/framerates
+	 * and should work quite well for most settings.
+	 */
+	u32 frame_width = ov9282->cur_mode->width + ov9282->hblank_ctrl->val;
+
+	return value * OV9282_STROBE_SPAN_FACTOR / frame_width;
+}
+
+static u32 ov9282_flash_duration_to_us(struct ov9282 *ov9282, u32 value)
+{
+	/*
+	 * Calculate back to microseconds from "strobe_frame_span" increments.
+	 * As the calculation in ov9282_us_to_flash_duration uses an integer
+	 * divison round up here.
+	 */
+	u32 frame_width = ov9282->cur_mode->width + ov9282->hblank_ctrl->val;
+
+	return DIV_ROUND_UP(value * frame_width, OV9282_STROBE_SPAN_FACTOR);
+}
+
+static int ov9282_set_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct ov9282 *ov9282 =
+		container_of(ctrl->handler, struct ov9282, ctrl_handler);
+	u32 analog_gain;
+	u32 exposure;
+	u32 lpfr;
+	int ret;
+
+	switch (ctrl->id) {
+	case V4L2_CID_VBLANK:
+		ov9282->vblank = ov9282->vblank_ctrl->val;
+
+		dev_dbg(ov9282->dev, "Received vblank %u, new lpfr %u",
+			ov9282->vblank,
+			ov9282->vblank + ov9282->cur_mode->height);
+
+		ret = __v4l2_ctrl_modify_range(ov9282->exp_ctrl,
+					       OV9282_EXPOSURE_MIN,
+					       ov9282->vblank +
+					       ov9282->cur_mode->height -
+					       OV9282_EXPOSURE_OFFSET,
+					       1, OV9282_EXPOSURE_DEFAULT);
+		break;
+	}
+
+	/* Set controls only if sensor is in power on state */
+	if (!pm_runtime_get_if_in_use(ov9282->dev))
+		return 0;
+
+	switch (ctrl->id) {
+	case V4L2_CID_EXPOSURE:
+		exposure = ctrl->val;
+		analog_gain = ov9282->again_ctrl->val;
+
+		dev_dbg(ov9282->dev, "Received exp %u, analog gain %u",
+			exposure, analog_gain);
+
+		ret = ov9282_update_exp_gain(ov9282, exposure, analog_gain);
+		break;
+	case V4L2_CID_VBLANK:
+		lpfr = ov9282->vblank + ov9282->cur_mode->height;
+		ret = cci_write(ov9282->regmap, OV9282_REG_LPFR, lpfr, NULL);
+		break;
+	case V4L2_CID_HFLIP:
+		ret = cci_update_bits(ov9282->regmap, OV9282_REG_TIMING_FORMAT_2,
+				      OV9282_FLIP_BIT, ctrl->val ? OV9282_FLIP_BIT : 0, NULL);
+		break;
+	case V4L2_CID_VFLIP:
+		ret = cci_update_bits(ov9282->regmap, OV9282_REG_TIMING_FORMAT_1,
+				      OV9282_FLIP_BIT, ctrl->val ? OV9282_FLIP_BIT : 0, NULL);
+		break;
+	case V4L2_CID_HBLANK:
+		ret = cci_write(ov9282->regmap, OV9282_REG_TIMING_HTS,
+				(ctrl->val + ov9282->cur_mode->width) >> 1, NULL);
+		break;
+	case V4L2_CID_FLASH_STROBE_OE:
+		ret = cci_update_bits(ov9282->regmap, OV9282_REG_OUTPUT_ENABLE6,
+				      OV9282_OUTPUT_ENABLE6_STROBE,
+				      ctrl->val ? OV9282_OUTPUT_ENABLE6_STROBE : 0, NULL);
+		break;
+	case V4L2_CID_FLASH_DURATION:
+		ret = cci_write(ov9282->regmap, OV9282_REG_STROBE_FRAME_SPAN,
+				ov9282_us_to_flash_duration(ov9282, ctrl->val), NULL);
+		break;
+	default:
+		dev_err(ov9282->dev, "Invalid control %d", ctrl->id);
+		ret = -EINVAL;
+	}
+
+	pm_runtime_put(ov9282->dev);
+
+	return ret;
+}
+
+static int ov9282_try_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct ov9282 *ov9282 =
+		container_of_const(ctrl->handler, struct ov9282, ctrl_handler);
+
+	if (ctrl->id == V4L2_CID_FLASH_DURATION) {
+		u32 us = ctrl->val;
+		u32 fd = ov9282_us_to_flash_duration(ov9282, us);
+
+		/* get nearest strobe_duration value */
+		u32 us0 = ov9282_flash_duration_to_us(ov9282, fd);
+		u32 us1 = ov9282_flash_duration_to_us(ov9282, fd + 1);
+
+		if (abs(us1 - us) < abs(us - us0))
+			ctrl->val = us1;
+		else
+			ctrl->val = us0;
+
+		if (us != ctrl->val)
+			dev_dbg(ov9282->dev, "using next valid strobe_duration %u instead of %u\n",
+				ctrl->val, us);
+	}
+
+	return 0;
+}
+
+/* V4l2 subdevice control ops*/
+static const struct v4l2_ctrl_ops ov9282_ctrl_ops = {
+	.s_ctrl = ov9282_set_ctrl,
+	.try_ctrl = ov9282_try_ctrl,
+};
+
+static int ov9282_enum_mbus_code(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *sd_state,
+				 struct v4l2_subdev_mbus_code_enum *code)
+{
+	switch (code->index) {
+	case 0:
+		code->code = MEDIA_BUS_FMT_Y10_1X10;
+		break;
+	case 1:
+		code->code = MEDIA_BUS_FMT_Y8_1X8;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * ov9282_enum_frame_size() - Enumerate V4L2 sub-device frame sizes
+ * @sd: pointer to ov9282 V4L2 sub-device structure
+ * @sd_state: V4L2 sub-device configuration
+ * @fsize: V4L2 sub-device size enumeration need to be filled
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+static int ov9282_enum_frame_size(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *sd_state,
+				  struct v4l2_subdev_frame_size_enum *fsize)
+{
+	if (fsize->index >= ARRAY_SIZE(supported_modes))
+		return -EINVAL;
+
+	if (fsize->code != MEDIA_BUS_FMT_Y10_1X10 &&
+	    fsize->code != MEDIA_BUS_FMT_Y8_1X8)
+		return -EINVAL;
+
+	fsize->min_width = supported_modes[fsize->index].width;
+	fsize->max_width = fsize->min_width;
+	fsize->min_height = supported_modes[fsize->index].height;
+	fsize->max_height = fsize->min_height;
+
+	return 0;
+}
+
+/**
+ * ov9282_fill_pad_format() - Fill subdevice pad format
+ *                            from selected sensor mode
+ * @ov9282: pointer to ov9282 device
+ * @mode: pointer to ov9282_mode sensor mode
+ * @code: mbus code to be stored
+ * @fmt: V4L2 sub-device format need to be filled
+ */
+static void ov9282_fill_pad_format(struct ov9282 *ov9282,
+				   const struct ov9282_mode *mode,
+				   u32 code,
+				   struct v4l2_subdev_format *fmt)
+{
+	fmt->format.width = mode->width;
+	fmt->format.height = mode->height;
+	fmt->format.code = code;
+	fmt->format.field = V4L2_FIELD_NONE;
+	fmt->format.colorspace = V4L2_COLORSPACE_RAW;
+	fmt->format.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
+	fmt->format.quantization = V4L2_QUANTIZATION_DEFAULT;
+	fmt->format.xfer_func = V4L2_XFER_FUNC_NONE;
+}
+
+static int ov9282_get_pad_format(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *sd_state,
+				 struct v4l2_subdev_format *fmt)
+{
+	struct ov9282 *ov9282 = to_ov9282(sd);
+
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		struct v4l2_mbus_framefmt *framefmt;
+
+		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
+		fmt->format = *framefmt;
+	} else {
+		ov9282_fill_pad_format(ov9282, ov9282->cur_mode, ov9282->code,
+				       fmt);
+	}
+
+	return 0;
+}
+
+static int ov9282_set_pad_format(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *sd_state,
+				 struct v4l2_subdev_format *fmt)
+{
+	struct ov9282 *ov9282 = to_ov9282(sd);
+	const struct ov9282_mode *mode;
+	u32 code;
+	int ret = 0;
+
+	mode = v4l2_find_nearest_size(supported_modes,
+				      ARRAY_SIZE(supported_modes),
+				      width, height,
+				      fmt->format.width,
+				      fmt->format.height);
+	if (fmt->format.code == MEDIA_BUS_FMT_Y8_1X8)
+		code = MEDIA_BUS_FMT_Y8_1X8;
+	else
+		code = MEDIA_BUS_FMT_Y10_1X10;
+
+	ov9282_fill_pad_format(ov9282, mode, code, fmt);
+
+	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
+		struct v4l2_mbus_framefmt *framefmt;
+
+		framefmt = v4l2_subdev_state_get_format(sd_state, fmt->pad);
+		*framefmt = fmt->format;
+	} else {
+		ret = ov9282_update_controls(ov9282, mode, fmt);
+		if (!ret) {
+			ov9282->cur_mode = mode;
+			ov9282->code = code;
+		}
+	}
+
+	return ret;
+}
+
+static int ov9282_init_state(struct v4l2_subdev *sd,
+			     struct v4l2_subdev_state *sd_state)
+{
+	struct ov9282 *ov9282 = to_ov9282(sd);
+	struct v4l2_subdev_format fmt = { 0 };
+
+	fmt.which = sd_state ? V4L2_SUBDEV_FORMAT_TRY : V4L2_SUBDEV_FORMAT_ACTIVE;
+	ov9282_fill_pad_format(ov9282, &supported_modes[DEFAULT_MODE],
+			       ov9282->code, &fmt);
+
+	return ov9282_set_pad_format(sd, sd_state, &fmt);
+}
+
+static const struct v4l2_rect *
+__ov9282_get_pad_crop(struct ov9282 *ov9282,
+		      struct v4l2_subdev_state *sd_state,
+		      unsigned int pad, enum v4l2_subdev_format_whence which)
+{
+	switch (which) {
+	case V4L2_SUBDEV_FORMAT_TRY:
+		return v4l2_subdev_state_get_crop(sd_state, pad);
+	case V4L2_SUBDEV_FORMAT_ACTIVE:
+		return &ov9282->cur_mode->crop;
+	}
+
+	return NULL;
+}
+
+static int ov9282_get_selection(struct v4l2_subdev *sd,
+				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_selection *sel)
+{
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP: {
+		struct ov9282 *ov9282 = to_ov9282(sd);
+
+		sel->r = *__ov9282_get_pad_crop(ov9282, sd_state, sel->pad,
+						sel->which);
+
+		return 0;
+	}
+
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.top = 0;
+		sel->r.left = 0;
+		sel->r.width = OV9282_NATIVE_WIDTH;
+		sel->r.height = OV9282_NATIVE_HEIGHT;
+
+		return 0;
+
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r.top = OV9282_PIXEL_ARRAY_TOP;
+		sel->r.left = OV9282_PIXEL_ARRAY_LEFT;
+		sel->r.width = OV9282_PIXEL_ARRAY_WIDTH;
+		sel->r.height = OV9282_PIXEL_ARRAY_HEIGHT;
+
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int ov9282_enable_streams(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_state *state, u32 pad,
+				 u64 streams_mask)
+{
+	const struct cci_reg_sequence bitdepth_regs[2][2] = {
+		{
+			{OV9282_REG_PLL_CTRL_0D, OV9282_PLL_CTRL_0D_RAW10},
+			{OV9282_REG_ANA_CORE_2, OV9282_ANA_CORE2_RAW10},
+		}, {
+			{OV9282_REG_PLL_CTRL_0D, OV9282_PLL_CTRL_0D_RAW8},
+			{OV9282_REG_ANA_CORE_2, OV9282_ANA_CORE2_RAW8},
+		}
+	};
+	struct ov9282 *ov9282 = to_ov9282(sd);
+	const struct ov9282_reg_list *reg_list;
+	int bitdepth_index;
+	int ret;
+
+	ret = pm_runtime_resume_and_get(ov9282->dev);
+	if (ret)
+		return ret;
+
+	/* Write common registers */
+	ret = cci_multi_reg_write(ov9282->regmap, common_regs,
+				  ARRAY_SIZE(common_regs), NULL);
+	if (ret) {
+		dev_err(ov9282->dev, "fail to write common registers");
+		goto err_pm_put;
+	}
+
+	bitdepth_index = ov9282->code == MEDIA_BUS_FMT_Y10_1X10 ? 0 : 1;
+	ret = cci_multi_reg_write(ov9282->regmap,
+				  bitdepth_regs[bitdepth_index], 2, NULL);
+	if (ret) {
+		dev_err(ov9282->dev, "fail to write bitdepth regs");
+		goto err_pm_put;
+	}
+
+	/* Write sensor mode registers */
+	reg_list = &ov9282->cur_mode->reg_list;
+	ret = cci_multi_reg_write(ov9282->regmap, reg_list->regs,
+				  reg_list->num_of_regs, NULL);
+	if (ret) {
+		dev_err(ov9282->dev, "fail to write initial registers");
+		goto err_pm_put;
+	}
+
+	/* Setup handler will write actual exposure and gain */
+	ret =  __v4l2_ctrl_handler_setup(ov9282->sd.ctrl_handler);
+	if (ret) {
+		dev_err(ov9282->dev, "fail to setup handler");
+		goto err_pm_put;
+	}
+
+	/* Start streaming */
+	ret = cci_write(ov9282->regmap, OV9282_REG_MODE_SELECT,
+			OV9282_MODE_STREAMING, NULL);
+	if (ret) {
+		dev_err(ov9282->dev, "fail to start streaming");
+		goto err_pm_put;
+	}
+
+	return 0;
+
+err_pm_put:
+	pm_runtime_put(ov9282->dev);
+
+	return ret;
+}
+
+static int ov9282_disable_streams(struct v4l2_subdev *sd,
+				  struct v4l2_subdev_state *state, u32 pad,
+				  u64 streams_mask)
+{
+	struct ov9282 *ov9282 = to_ov9282(sd);
+	int ret;
+
+	ret = cci_write(ov9282->regmap, OV9282_REG_MODE_SELECT,
+			OV9282_MODE_STANDBY, NULL);
+
+	pm_runtime_put(ov9282->dev);
+
+	return ret;
+}
+
+/**
+ * ov9282_detect() - Detect ov9282 sensor
+ * @ov9282: pointer to ov9282 device
+ *
+ * Return: 0 if successful, -EIO if sensor id does not match
+ */
+static int ov9282_detect(struct ov9282 *ov9282)
+{
+	int ret;
+	u64 val;
+
+	ret = cci_read(ov9282->regmap, OV9282_REG_ID, &val, NULL);
+	if (ret)
+		return ret;
+
+	if (val != OV9282_ID) {
+		dev_err(ov9282->dev, "chip id mismatch: %x!=%llx",
+			OV9282_ID, val);
+		return -ENXIO;
+	}
+
+	return 0;
+}
+
+static int ov9282_configure_regulators(struct ov9282 *ov9282)
+{
+	unsigned int i;
+
+	for (i = 0; i < OV9282_NUM_SUPPLIES; i++)
+		ov9282->supplies[i].supply = ov9282_supply_names[i];
+
+	return devm_regulator_bulk_get(ov9282->dev,
+				       OV9282_NUM_SUPPLIES,
+				       ov9282->supplies);
+}
+
+/**
+ * ov9282_parse_hw_config() - Parse HW configuration and check if supported
+ * @ov9282: pointer to ov9282 device
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+static int ov9282_parse_hw_config(struct ov9282 *ov9282)
+{
+	struct fwnode_handle *fwnode = dev_fwnode(ov9282->dev);
+	struct v4l2_fwnode_endpoint bus_cfg = {
+		.bus_type = V4L2_MBUS_CSI2_DPHY
+	};
+	struct fwnode_handle *ep;
+	unsigned long rate;
+	unsigned int i;
+	int ret;
+
+	if (!fwnode)
+		return -ENXIO;
+
+	/* Request optional reset pin */
+	ov9282->reset_gpio = devm_gpiod_get_optional(ov9282->dev, "reset",
+						     GPIOD_OUT_LOW);
+	if (IS_ERR(ov9282->reset_gpio)) {
+		dev_err(ov9282->dev, "failed to get reset gpio %pe",
+			ov9282->reset_gpio);
+		return PTR_ERR(ov9282->reset_gpio);
+	}
+
+	/* Get sensor input clock */
+	ov9282->inclk = devm_v4l2_sensor_clk_get(ov9282->dev, NULL);
+	if (IS_ERR(ov9282->inclk))
+		return dev_err_probe(ov9282->dev, PTR_ERR(ov9282->inclk),
+				     "could not get inclk\n");
+
+	ret = ov9282_configure_regulators(ov9282);
+	if (ret)
+		return dev_err_probe(ov9282->dev, ret,
+				     "Failed to get power regulators\n");
+
+	rate = clk_get_rate(ov9282->inclk);
+	if (rate != OV9282_INCLK_RATE) {
+		dev_err(ov9282->dev, "inclk frequency mismatch");
+		return -EINVAL;
+	}
+
+	ep = fwnode_graph_get_next_endpoint(fwnode, NULL);
+	if (!ep)
+		return -ENXIO;
+
+	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
+	fwnode_handle_put(ep);
+	if (ret)
+		return ret;
+
+	ov9282->noncontinuous_clock =
+		bus_cfg.bus.mipi_csi2.flags & V4L2_MBUS_CSI2_NONCONTINUOUS_CLOCK;
+
+	if (bus_cfg.bus.mipi_csi2.num_data_lanes != OV9282_NUM_DATA_LANES) {
+		dev_err(ov9282->dev,
+			"number of CSI2 data lanes %d is not supported",
+			bus_cfg.bus.mipi_csi2.num_data_lanes);
+		ret = -EINVAL;
+		goto done_endpoint_free;
+	}
+
+	if (!bus_cfg.nr_of_link_frequencies) {
+		dev_err(ov9282->dev, "no link frequencies defined");
+		ret = -EINVAL;
+		goto done_endpoint_free;
+	}
+
+	for (i = 0; i < bus_cfg.nr_of_link_frequencies; i++)
+		if (bus_cfg.link_frequencies[i] == OV9282_LINK_FREQ)
+			goto done_endpoint_free;
+
+	ret = -EINVAL;
+
+done_endpoint_free:
+	v4l2_fwnode_endpoint_free(&bus_cfg);
+
+	return ret;
+}
+
+/* V4l2 subdevice ops */
+static const struct v4l2_subdev_core_ops ov9282_core_ops = {
+	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
+	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+};
+
+static const struct v4l2_subdev_video_ops ov9282_video_ops = {
+	.s_stream = v4l2_subdev_s_stream_helper,
+};
+
+static const struct v4l2_subdev_pad_ops ov9282_pad_ops = {
+	.enum_mbus_code = ov9282_enum_mbus_code,
+	.enum_frame_size = ov9282_enum_frame_size,
+	.get_fmt = ov9282_get_pad_format,
+	.set_fmt = ov9282_set_pad_format,
+	.get_selection = ov9282_get_selection,
+	.enable_streams = ov9282_enable_streams,
+	.disable_streams = ov9282_disable_streams,
+};
+
+static const struct v4l2_subdev_ops ov9282_subdev_ops = {
+	.core = &ov9282_core_ops,
+	.video = &ov9282_video_ops,
+	.pad = &ov9282_pad_ops,
+};
+
+static const struct v4l2_subdev_internal_ops ov9282_internal_ops = {
+	.init_state = ov9282_init_state,
+};
+
+static int ov9282_power_on(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ov9282 *ov9282 = to_ov9282(sd);
+	int ret;
+
+	ret = regulator_bulk_enable(OV9282_NUM_SUPPLIES, ov9282->supplies);
+	if (ret < 0) {
+		dev_err(dev, "Failed to enable regulators\n");
+		return ret;
+	}
+
+	usleep_range(400, 600);
+
+	gpiod_set_value_cansleep(ov9282->reset_gpio, 1);
+
+	ret = clk_prepare_enable(ov9282->inclk);
+	if (ret) {
+		dev_err(ov9282->dev, "fail to enable inclk");
+		goto error_reset;
+	}
+
+	usleep_range(400, 600);
+
+	ret = cci_write(ov9282->regmap, OV9282_REG_MIPI_CTRL00,
+			ov9282->noncontinuous_clock ? OV9282_GATED_CLOCK : 0, NULL);
+	if (ret) {
+		dev_err(ov9282->dev, "fail to write MIPI_CTRL00");
+		goto error_clk;
+	}
+
+	return 0;
+
+error_clk:
+	clk_disable_unprepare(ov9282->inclk);
+error_reset:
+	gpiod_set_value_cansleep(ov9282->reset_gpio, 0);
+
+	regulator_bulk_disable(OV9282_NUM_SUPPLIES, ov9282->supplies);
+
+	return ret;
+}
+
+static int ov9282_power_off(struct device *dev)
+{
+	struct v4l2_subdev *sd = dev_get_drvdata(dev);
+	struct ov9282 *ov9282 = to_ov9282(sd);
+
+	gpiod_set_value_cansleep(ov9282->reset_gpio, 0);
+
+	clk_disable_unprepare(ov9282->inclk);
+
+	regulator_bulk_disable(OV9282_NUM_SUPPLIES, ov9282->supplies);
+
+	return 0;
+}
+
+/**
+ * ov9282_init_controls() - Initialize sensor subdevice controls
+ * @ov9282: pointer to ov9282 device
+ *
+ * Return: 0 if successful, error code otherwise.
+ */
+static int ov9282_init_controls(struct ov9282 *ov9282)
+{
+	struct v4l2_ctrl_handler *ctrl_hdlr = &ov9282->ctrl_handler;
+	const struct ov9282_mode *mode = ov9282->cur_mode;
+	struct v4l2_fwnode_device_properties props;
+	u32 hblank_min;
+	u32 exposure_us;
+	u32 lpfr;
+	int ret;
+
+	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 12);
+	if (ret)
+		return ret;
+
+	/* Initialize exposure and gain */
+	lpfr = mode->vblank + mode->height;
+	ov9282->exp_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+					     &ov9282_ctrl_ops,
+					     V4L2_CID_EXPOSURE,
+					     OV9282_EXPOSURE_MIN,
+					     lpfr - OV9282_EXPOSURE_OFFSET,
+					     OV9282_EXPOSURE_STEP,
+					     OV9282_EXPOSURE_DEFAULT);
+
+	ov9282->again_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+					       &ov9282_ctrl_ops,
+					       V4L2_CID_ANALOGUE_GAIN,
+					       OV9282_AGAIN_MIN,
+					       OV9282_AGAIN_MAX,
+					       OV9282_AGAIN_STEP,
+					       OV9282_AGAIN_DEFAULT);
+
+	v4l2_ctrl_cluster(2, &ov9282->exp_ctrl);
+
+	ov9282->vblank_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+						&ov9282_ctrl_ops,
+						V4L2_CID_VBLANK,
+						mode->vblank_min,
+						mode->vblank_max,
+						1, mode->vblank);
+
+	v4l2_ctrl_new_std(ctrl_hdlr, &ov9282_ctrl_ops, V4L2_CID_VFLIP,
+			  0, 1, 1, 1);
+
+	v4l2_ctrl_new_std(ctrl_hdlr, &ov9282_ctrl_ops, V4L2_CID_HFLIP,
+			  0, 1, 1, 1);
+
+	/* Read only controls */
+	ov9282->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &ov9282_ctrl_ops,
+					       V4L2_CID_PIXEL_RATE,
+					       OV9282_PIXEL_RATE_10BIT,
+					       OV9282_PIXEL_RATE_10BIT, 1,
+					       OV9282_PIXEL_RATE_10BIT);
+
+	ov9282->link_freq_ctrl = v4l2_ctrl_new_int_menu(ctrl_hdlr,
+							&ov9282_ctrl_ops,
+							V4L2_CID_LINK_FREQ,
+							ARRAY_SIZE(link_freq) -
+							1,
+							mode->link_freq_idx,
+							link_freq);
+	if (ov9282->link_freq_ctrl)
+		ov9282->link_freq_ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
+	hblank_min = mode->hblank_min[ov9282->noncontinuous_clock ? 0 : 1];
+	ov9282->hblank_ctrl = v4l2_ctrl_new_std(ctrl_hdlr,
+						&ov9282_ctrl_ops,
+						V4L2_CID_HBLANK,
+						hblank_min,
+						OV9282_TIMING_HTS_MAX - mode->width,
+						1, hblank_min);
+
+	/* Flash/Strobe controls */
+	v4l2_ctrl_new_std(ctrl_hdlr, &ov9282_ctrl_ops,
+			  V4L2_CID_FLASH_STROBE_OE, 0, 1, 1, 0);
+
+	exposure_us = ov9282_exposure_to_us(ov9282, OV9282_EXPOSURE_DEFAULT);
+	ov9282->flash_duration =
+		v4l2_ctrl_new_std(ctrl_hdlr, &ov9282_ctrl_ops,
+				  V4L2_CID_FLASH_DURATION, 0, exposure_us, 1,
+				  OV9282_STROBE_FRAME_SPAN_DEFAULT);
+
+	ret = v4l2_fwnode_device_parse(ov9282->dev, &props);
+	if (!ret) {
+		/* Failure sets ctrl_hdlr->error, which we check afterwards anyway */
+		v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &ov9282_ctrl_ops,
+						&props);
+	}
+
+	if (ctrl_hdlr->error || ret) {
+		dev_err(ov9282->dev, "control init failed: %d",
+			ctrl_hdlr->error);
+		v4l2_ctrl_handler_free(ctrl_hdlr);
+		return ctrl_hdlr->error;
+	}
+
+	ov9282->sd.ctrl_handler = ctrl_hdlr;
+
+	return 0;
+}
+
+static int ov9282_probe(struct i2c_client *client)
+{
+	struct ov9282 *ov9282;
+	int ret;
+
+	ov9282 = devm_kzalloc(&client->dev, sizeof(*ov9282), GFP_KERNEL);
+	if (!ov9282)
+		return -ENOMEM;
+
+	ov9282->dev = &client->dev;
+
+	/* Initialize subdev */
+	v4l2_i2c_subdev_init(&ov9282->sd, client, &ov9282_subdev_ops);
+	ov9282->sd.internal_ops = &ov9282_internal_ops;
+	v4l2_i2c_subdev_set_name(&ov9282->sd, client,
+				 device_get_match_data(ov9282->dev), NULL);
+
+	ret = ov9282_parse_hw_config(ov9282);
+	if (ret) {
+		dev_err(ov9282->dev, "HW configuration is not supported");
+		return ret;
+	}
+
+	ov9282->regmap = devm_cci_regmap_init_i2c(client, 16);
+	if (IS_ERR(ov9282->regmap))
+		return dev_err_probe(ov9282->dev, PTR_ERR(ov9282->regmap),
+				     "Failed to init CCI\n");
+
+	ret = ov9282_power_on(ov9282->dev);
+	if (ret)
+		return dev_err_probe(ov9282->dev, ret,
+				     "failed to power-on the sensor");
+
+	/* Check module identity */
+	ret = ov9282_detect(ov9282);
+	if (ret) {
+		dev_err(ov9282->dev, "failed to find sensor: %d", ret);
+		goto error_power_off;
+	}
+
+	/* Set default mode to first mode */
+	ov9282->cur_mode = &supported_modes[DEFAULT_MODE];
+	ov9282->code = MEDIA_BUS_FMT_Y10_1X10;
+	ov9282->vblank = ov9282->cur_mode->vblank;
+
+	ret = ov9282_init_controls(ov9282);
+	if (ret) {
+		dev_err(ov9282->dev, "failed to init controls: %d", ret);
+		goto error_power_off;
+	}
+
+	/* Initialize subdev */
+	ov9282->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE |
+			    V4L2_SUBDEV_FL_HAS_EVENTS;
+	ov9282->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
+
+	/* Initialize source pad */
+	ov9282->pad.flags = MEDIA_PAD_FL_SOURCE;
+	ret = media_entity_pads_init(&ov9282->sd.entity, 1, &ov9282->pad);
+	if (ret) {
+		dev_err(ov9282->dev, "failed to init entity pads: %d", ret);
+		goto error_handler_free;
+	}
+
+	ov9282->sd.state_lock = ov9282->ctrl_handler.lock;
+	ret = v4l2_subdev_init_finalize(&ov9282->sd);
+	if (ret < 0) {
+		dev_err_probe(ov9282->dev, ret, "failed to init subdev\n");
+		goto error_media_entity;
+	}
+
+	pm_runtime_set_active(ov9282->dev);
+	pm_runtime_enable(ov9282->dev);
+
+	ret = v4l2_async_register_subdev_sensor(&ov9282->sd);
+	if (ret < 0)
+		goto v4l2_subdev_cleanup;
+
+	pm_runtime_idle(ov9282->dev);
+
+	return 0;
+
+v4l2_subdev_cleanup:
+	v4l2_subdev_cleanup(&ov9282->sd);
+	pm_runtime_disable(ov9282->dev);
+	pm_runtime_set_suspended(ov9282->dev);
+error_media_entity:
+	media_entity_cleanup(&ov9282->sd.entity);
+error_handler_free:
+	v4l2_ctrl_handler_free(ov9282->sd.ctrl_handler);
+error_power_off:
+	ov9282_power_off(ov9282->dev);
+
+	return ret;
+}
+
+static void ov9282_remove(struct i2c_client *client)
+{
+	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+
+	v4l2_async_unregister_subdev(sd);
+	v4l2_subdev_cleanup(sd);
+	media_entity_cleanup(&sd->entity);
+	v4l2_ctrl_handler_free(sd->ctrl_handler);
+
+	pm_runtime_disable(&client->dev);
+	if (!pm_runtime_status_suspended(&client->dev))
+		ov9282_power_off(&client->dev);
+	pm_runtime_set_suspended(&client->dev);
+}
+
+static const struct dev_pm_ops ov9282_pm_ops = {
+	SET_RUNTIME_PM_OPS(ov9282_power_off, ov9282_power_on, NULL)
+};
+
+static const struct of_device_id ov9282_of_match[] = {
+	{ .compatible = "ovti,ov9281", .data = "ov9281" },
+	{ .compatible = "ovti,ov9282", .data = "ov9282" },
+	{ }
+};
+
+MODULE_DEVICE_TABLE(of, ov9282_of_match);
+
+static struct i2c_driver ov9282_driver = {
+	.probe = ov9282_probe,
+	.remove = ov9282_remove,
+	.driver = {
+		.name = "ov9282",
+		.pm = &ov9282_pm_ops,
+		.of_match_table = ov9282_of_match,
+	},
+};
+
+module_i2c_driver(ov9282_driver);
+
+MODULE_DESCRIPTION("OmniVision ov9282 sensor driver");
+MODULE_LICENSE("GPL");

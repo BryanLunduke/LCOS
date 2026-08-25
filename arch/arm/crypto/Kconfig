@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: GPL-2.0
+
+menu "Accelerated Cryptographic Algorithms for CPU (arm)"
+
+config CRYPTO_GHASH_ARM_CE
+	tristate "AEAD cipher: AES in GCM mode (ARMv8 Crypto Extensions)"
+	depends on KERNEL_MODE_NEON
+	select CRYPTO_AEAD
+	select CRYPTO_LIB_AES
+	select CRYPTO_LIB_GF128MUL
+	help
+	  AEAD cipher: AES-GCM
+
+	  Architecture: arm using
+	  - ARMv8 Crypto Extensions
+
+config CRYPTO_AES_ARM_BS
+	tristate "Ciphers: AES, modes: ECB/CBC/CTR/XTS (bit-sliced NEON)"
+	depends on KERNEL_MODE_NEON
+	select CRYPTO_SKCIPHER
+	select CRYPTO_LIB_AES
+	help
+	  Length-preserving ciphers: AES cipher algorithms (FIPS-197)
+	  with block cipher modes:
+	   - ECB (Electronic Codebook) mode (NIST SP800-38A)
+	   - CBC (Cipher Block Chaining) mode (NIST SP800-38A)
+	   - CTR (Counter) mode (NIST SP800-38A)
+	   - XTS (XOR Encrypt XOR with ciphertext stealing) mode (NIST SP800-38E
+	     and IEEE 1619)
+
+	  Bit sliced AES gives around 45% speedup on Cortex-A15 for CTR mode
+	  and for XTS mode encryption, CBC and XTS mode decryption speedup is
+	  around 25%. (CBC encryption speed is not affected by this driver.)
+
+	  The bit sliced AES code does not use lookup tables, so it is believed
+	  to be invulnerable to cache timing attacks. However, since the bit
+	  sliced AES code cannot process single blocks efficiently, in certain
+	  cases table-based code with some countermeasures against cache timing
+	  attacks will still be used as a fallback method; specifically CBC
+	  encryption (not CBC decryption), the encryption of XTS tweaks, XTS
+	  ciphertext stealing when the message isn't a multiple of 16 bytes, and
+	  CTR when invoked in a context in which NEON instructions are unusable.
+
+config CRYPTO_AES_ARM_CE
+	tristate "Ciphers: AES, modes: ECB/CBC/CTS/CTR/XTS (ARMv8 Crypto Extensions)"
+	depends on KERNEL_MODE_NEON
+	select CRYPTO_SKCIPHER
+	select CRYPTO_LIB_AES
+	help
+	  Length-preserving ciphers: AES cipher algorithms (FIPS-197)
+	   with block cipher modes:
+	   - ECB (Electronic Codebook) mode (NIST SP800-38A)
+	   - CBC (Cipher Block Chaining) mode (NIST SP800-38A)
+	   - CTR (Counter) mode (NIST SP800-38A)
+	   - CTS (Cipher Text Stealing) mode (NIST SP800-38A)
+	   - XTS (XOR Encrypt XOR with ciphertext stealing) mode (NIST SP800-38E
+	     and IEEE 1619)
+
+	  Architecture: arm using:
+	  - ARMv8 Crypto Extensions
+
+endmenu
+

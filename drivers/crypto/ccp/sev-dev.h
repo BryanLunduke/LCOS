@@ -1,0 +1,89 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * AMD Platform Security Processor (PSP) interface driver
+ *
+ * Copyright (C) 2017-2019 Advanced Micro Devices, Inc.
+ *
+ * Author: Brijesh Singh <brijesh.singh@amd.com>
+ */
+
+#ifndef __SEV_DEV_H__
+#define __SEV_DEV_H__
+
+#include <linux/device.h>
+#include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/list.h>
+#include <linux/wait.h>
+#include <linux/dmapool.h>
+#include <linux/hw_random.h>
+#include <linux/bitops.h>
+#include <linux/interrupt.h>
+#include <linux/irqreturn.h>
+#include <linux/dmaengine.h>
+#include <linux/psp-sev.h>
+#include <linux/miscdevice.h>
+#include <linux/capability.h>
+
+#define SEV_CMDRESP_CMD			GENMASK(26, 16)
+#define SEV_CMD_COMPLETE		BIT(1)
+#define SEV_CMDRESP_IOC			BIT(0)
+
+struct sev_misc_dev {
+	struct kref refcount;
+	struct miscdevice misc;
+};
+
+struct sev_tio_status;
+
+struct sev_device {
+	struct device *dev;
+	struct psp_device *psp;
+
+	void __iomem *io_regs;
+
+	struct sev_vdata *vdata;
+
+	unsigned int int_rcvd;
+	wait_queue_head_t int_queue;
+	struct sev_misc_dev *misc;
+
+	u8 api_major;
+	u8 api_minor;
+	u8 build;
+
+	void *cmd_buf;
+	void *cmd_buf_backup;
+	bool cmd_buf_active;
+	bool cmd_buf_backup_active;
+
+	bool snp_initialized;
+
+	struct kobject *sev_kobj;
+	struct kobject *verify_mit;
+
+	struct sev_user_data_status sev_plat_status;
+
+	struct sev_user_data_snp_status snp_plat_status;
+	struct snp_feature_info snp_feat_info_0;
+
+	struct tsm_dev *tsmdev;
+	struct sev_tio_status *tio_status;
+};
+
+int sev_dev_init(struct psp_device *psp);
+void sev_dev_destroy(struct psp_device *psp);
+
+int __sev_do_cmd_locked(int cmd, void *data, int *psp_ret);
+
+void sev_pci_init(void);
+void sev_pci_exit(void);
+
+struct page *snp_alloc_hv_fixed_pages(unsigned int num_2mb_pages);
+void snp_free_hv_fixed_pages(struct page *page);
+
+void sev_tsm_init_locked(struct sev_device *sev, void *tio_status_page);
+void sev_tsm_uninit(struct sev_device *sev);
+int sev_tio_cmd_buffer_len(int cmd);
+
+#endif /* __SEV_DEV_H */

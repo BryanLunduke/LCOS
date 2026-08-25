@@ -1,0 +1,63 @@
+.. SPDX-License-Identifier: GPL-2.0
+
+UNSETTING OPTIONS
+=================
+
+The effect of most command line options can be reverted by prepending "no-" to
+the long variant of the option, for example:
+
+$ rtla timerlat top -p 100 --no-period
+
+resets the period back to the default value of 1000 us.
+
+If a command line option sets multiple RTLA parameters at once, the inverted
+option will revert all of them, even if they were not set by the particular
+option. For example, since using "--auto" implies "--trace", specifying
+"--trace --no-auto" will also disable trace output, just like if "--no-trace"
+was specified.
+
+
+SIGINT BEHAVIOR
+===============
+
+On the first SIGINT, RTLA exits after collecting all outstanding samples up to
+the point of receiving the signal.
+
+When receiving more than one SIGINT, RTLA discards any outstanding samples, and
+exits while displaying only samples that have already been processed.
+
+If SIGINT is received during RTLA cleanup, RTLA exits immediately via
+the default signal handler.
+
+Note: For the purpose of SIGINT behavior, the expiry of duration specified via
+the -d/--duration option is treated as equivalent to receiving a SIGINT. For
+example, a SIGINT received after duration expired but samples have not been
+processed yet will drop any outstanding samples.
+
+Also note that when using the timerlat tool in BPF mode, samples are processed
+in-kernel; RTLA only copies them out to display them to the user. A second
+SIGINT does not affect in-kernel sample aggregation.
+
+EXIT STATUS
+===========
+
+::
+
+ 0    Passed: the test did not hit the stop tracing condition
+ 1    Error: invalid argument
+ 2    Failed: the test hit the stop tracing condition
+ 129  Help: either user requested help or incorrect option was specified
+
+REPORTING BUGS
+==============
+Report bugs to <linux-kernel@vger.kernel.org>
+and <linux-trace-devel@vger.kernel.org>
+
+LICENSE
+=======
+**rtla** is Free Software licensed under the GNU GPLv2
+
+COPYING
+=======
+Copyright \(C) 2021 Red Hat, Inc. Free use of this software is granted under
+the terms of the GNU Public License (GPL).

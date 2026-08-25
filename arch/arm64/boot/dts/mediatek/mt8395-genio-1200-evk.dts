@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/*
+ * Copyright (C) 2023 MediaTek Inc.
+ * Author: Ben Lok <ben.lok@mediatek.com>
+ *	   Macpaul Lin <macpaul.lin@mediatek.com>
+ */
+/dts-v1/;
+
+#include "mt8395-genio-common.dtsi"
+
+/ {
+	model = "MediaTek Genio 1200 EVK-P1V2-EMMC";
+	compatible = "mediatek,mt8395-evk", "mediatek,mt8395",
+		     "mediatek,mt8195";
+};

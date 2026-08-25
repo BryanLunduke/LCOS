@@ -1,0 +1,298 @@
+.. SPDX-License-Identifier: GPL-2.0
+.. Copyright © 2025 Microsoft Corporation
+.. Copyright © 2026 Cloudflare, Inc.
+
+================================
+Landlock: system-wide management
+================================
+
+:Author: Mickaël Salaün
+:Date: August 2026
+
+Landlock can leverage the audit framework to log events.
+
+User space documentation can be found here:
+Documentation/userspace-api/landlock.rst.
+
+Audit
+=====
+
+Denied access requests are logged by default for a sandboxed program if `audit`
+is enabled.  This default behavior can be changed with the
+sys_landlock_restrict_self() flags (cf.
+Documentation/userspace-api/landlock.rst), or suppressed on a per-object
+basis by using ``LANDLOCK_ADD_RULE_QUIET`` (ABI 10+).  Landlock logs can
+also be masked thanks to audit rules.  Landlock can generate 2 audit
+record types.
+
+Record types
+------------
+
+AUDIT_LANDLOCK_ACCESS
+    This record type identifies a denied access request to a kernel resource.
+    The ``domain`` field indicates the ID of the domain that blocked the
+    request.  The ``blockers`` field indicates the cause(s) of this denial
+    (separated by a comma), and the following fields identify the kernel object
+    (similar to SELinux).  There may be more than one of this record type per
+    audit event.
+
+    Example with a file link request generating two records in the same event::
+
+        domain=195ba459b blockers=fs.refer path="/usr/bin" dev="vda2" ino=351
+        domain=195ba459b blockers=fs.make_reg,fs.refer path="/usr/local" dev="vda2" ino=365
+
+
+    The ``blockers`` field uses dot-separated prefixes to indicate the type of
+    restriction that caused the denial:
+
+    **fs.*** - Filesystem access rights (ABI 1+):
+        - fs.execute, fs.write_file, fs.read_file, fs.read_dir
+        - fs.remove_dir, fs.remove_file
+        - fs.make_char, fs.make_dir, fs.make_reg, fs.make_sock
+        - fs.make_fifo, fs.make_block, fs.make_sym
+        - fs.refer (ABI 2+)
+        - fs.truncate (ABI 3+)
+        - fs.ioctl_dev (ABI 5+)
+        - fs.resolve_unix (ABI 9+)
+
+    **net.*** - Network access rights (ABI 4+):
+        - net.bind_tcp - TCP port binding was denied
+        - net.connect_tcp - TCP connection was denied
+        - net.bind_udp - UDP port binding was denied
+        - net.connect_send_udp - UDP connection and send was denied
+
+    **scope.*** - IPC scoping restrictions (ABI 6+):
+        - scope.abstract_unix_socket - Abstract UNIX socket connection denied
+        - scope.signal - Signal sending denied
+
+    Multiple blockers can appear in a single event (comma-separated) when
+    multiple access rights are missing. For example, creating a regular file
+    in a directory that lacks both ``make_reg`` and ``refer`` rights would show
+    ``blockers=fs.make_reg,fs.refer``.
+
+    The object identification fields (path, dev, ino for filesystem; opid,
+    ocomm for signals) depend on the type of access being blocked and provide
+    context about what resource was involved in the denial.
+
+
+AUDIT_LANDLOCK_DOMAIN
+    This record type describes the status of a Landlock domain.  The ``status``
+    field can be either ``allocated`` or ``deallocated``.
+
+    The ``allocated`` status is part of the same audit event and follows
+    the first logged ``AUDIT_LANDLOCK_ACCESS`` record of a domain.  It identifies
+    Landlock domain information at the time of the sys_landlock_restrict_self()
+    call with the following fields:
+
+    - the ``domain`` ID
+    - the enforcement ``mode``
+    - the domain creator's ``pid``
+    - the domain creator's ``uid``
+    - the domain creator's executable path (``exe``)
+    - the domain creator's command line (``comm``)
+
+    Example::
+
+        domain=195ba459b status=allocated mode=enforcing pid=300 uid=0 exe="/root/sandboxer" comm="sandboxer"
+
+    The ``deallocated`` status is an event on its own and it identifies a
+    Landlock domain release.  After such event, it is guarantee that the
+    related domain ID will never be reused during the lifetime of the system.
+    The ``domain`` field indicates the ID of the domain which is released, and
+    the ``denials`` field indicates the total number of denied access request,
+    which might not have been logged according to the audit rules and
+    sys_landlock_restrict_self()'s flags.
+
+    Example::
+
+        domain=195ba459b status=deallocated denials=3
+
+
+Event samples
+--------------
+
+Here are two examples of log events (see serial numbers).
+
+In this example a sandboxed program (``kill``) tries to send a signal to the
+init process, which is denied because of the signal scoping restriction
+(``LL_SCOPED=s``)::
+
+  $ LL_FS_RO=/ LL_FS_RW=/ LL_SCOPED=s LL_FORCE_LOG=1 ./sandboxer kill 1
+
+This command generates two events, each identified with a unique serial
+number following a timestamp (``msg=audit(1729738800.268:30)``).  The first
+event (serial ``30``) contains 4 records.  The first record
+(``type=LANDLOCK_ACCESS``) shows an access denied by the domain `1a6fdc66f`.
+The cause of this denial is signal scoping restriction
+(``blockers=scope.signal``).  The process that would have receive this signal
+is the init process (``opid=1 ocomm="systemd"``).
+
+The second record (``type=LANDLOCK_DOMAIN``) describes (``status=allocated``)
+domain `1a6fdc66f`.  This domain was created by process ``286`` executing the
+``/root/sandboxer`` program launched by the root user.
+
+The third record (``type=SYSCALL``) describes the syscall, its provided
+arguments, its result (``success=no exit=-1``), and the process that called it.
+
+The fourth record (``type=PROCTITLE``) shows the command's name as an
+hexadecimal value.  This can be translated with ``python -c
+'print(bytes.fromhex("6B696C6C0031"))'``.
+
+Finally, the last record (``type=LANDLOCK_DOMAIN``) is also the only one from
+the second event (serial ``31``).  It is not tied to a direct user space action
+but an asynchronous one to free resources tied to a Landlock domain
+(``status=deallocated``).  This can be useful to know that the following logs
+will not concern the domain ``1a6fdc66f`` anymore.  This record also summarize
+the number of requests this domain denied (``denials=1``), whether they were
+logged or not.
+
+.. code-block::
+
+  type=LANDLOCK_ACCESS msg=audit(1729738800.268:30): domain=1a6fdc66f blockers=scope.signal opid=1 ocomm="systemd"
+  type=LANDLOCK_DOMAIN msg=audit(1729738800.268:30): domain=1a6fdc66f status=allocated mode=enforcing pid=286 uid=0 exe="/root/sandboxer" comm="sandboxer"
+  type=SYSCALL msg=audit(1729738800.268:30): arch=c000003e syscall=62 success=no exit=-1 [..] ppid=272 pid=286 auid=0 uid=0 gid=0 [...] comm="kill" [...]
+  type=PROCTITLE msg=audit(1729738800.268:30): proctitle=6B696C6C0031
+  type=LANDLOCK_DOMAIN msg=audit(1729738800.324:31): domain=1a6fdc66f status=deallocated denials=1
+
+Here is another example showcasing filesystem access control::
+
+  $ LL_FS_RO=/ LL_FS_RW=/tmp LL_FORCE_LOG=1 ./sandboxer sh -c "echo > /etc/passwd"
+
+The related audit logs contains 8 records from 3 different events (serials 33,
+34 and 35) created by the same domain `1a6fdc679`::
+
+  type=LANDLOCK_ACCESS msg=audit(1729738800.221:33): domain=1a6fdc679 blockers=fs.write_file path="/dev/tty" dev="devtmpfs" ino=9
+  type=LANDLOCK_DOMAIN msg=audit(1729738800.221:33): domain=1a6fdc679 status=allocated mode=enforcing pid=289 uid=0 exe="/root/sandboxer" comm="sandboxer"
+  type=SYSCALL msg=audit(1729738800.221:33): arch=c000003e syscall=257 success=no exit=-13 [...] ppid=272 pid=289 auid=0 uid=0 gid=0 [...] comm="sh" [...]
+  type=PROCTITLE msg=audit(1729738800.221:33): proctitle=7368002D63006563686F203E202F6574632F706173737764
+  type=LANDLOCK_ACCESS msg=audit(1729738800.221:34): domain=1a6fdc679 blockers=fs.write_file path="/etc/passwd" dev="vda2" ino=143821
+  type=SYSCALL msg=audit(1729738800.221:34): arch=c000003e syscall=257 success=no exit=-13 [...] ppid=272 pid=289 auid=0 uid=0 gid=0 [...] comm="sh" [...]
+  type=PROCTITLE msg=audit(1729738800.221:34): proctitle=7368002D63006563686F203E202F6574632F706173737764
+  type=LANDLOCK_DOMAIN msg=audit(1729738800.261:35): domain=1a6fdc679 status=deallocated denials=2
+
+
+Event filtering
+---------------
+
+If you get spammed with audit logs related to Landlock, this is either an
+attack attempt or a bug in the security policy.  We can put in place some
+filters to limit noise with two complementary ways:
+
+- with sys_landlock_restrict_self()'s flags, or
+  ``LANDLOCK_ADD_RULE_QUIET`` (ABI 10+) if we can fix the sandboxed
+  programs,
+- or with audit rules (see :manpage:`auditctl(8)`).
+
+Tracepoints
+===========
+
+Landlock also provides tracepoints as an alternative to audit for
+debugging and observability.  Tracepoints fire unconditionally,
+independent of audit configuration, ``audit_enabled``, and domain log
+flags.  This makes them suitable for always-on monitoring with eBPF or
+for ad-hoc debugging with ``trace-pipe``.
+
+See Documentation/trace/events-landlock.rst for the complete event
+reference: the full event list, how to enable events and read their
+output, the field formats, the ``check_rule`` interpretation guide,
+worked event samples, ftrace filtering, and eBPF access.
+
+.. _landlock_observability:
+
+When to use tracing vs audit
+-----------------------------
+
+Audit and tracing both help diagnose Landlock policy issues:
+
+**Audit** records denied accesses with the blockers, domain, and object
+identification (path, port).  Audit is the standard Linux mechanism for
+security events, with a stable record format that is well established
+and already supported by log management systems, SIEM platforms, and EDR
+solutions.  Audit is always active when the kernel is built with audit
+support, filtered by the Landlock log flags to reduce noise in
+production, and designed for long-term security monitoring and
+compliance.
+
+**Tracing** provides deeper introspection for policy debugging.  In
+addition to denied accesses, trace events cover the complete lifecycle
+of Landlock objects (rulesets, domains) and intermediate rule matching
+during access checks.  Trace events are disabled by default (zero
+overhead) and fire unconditionally.  eBPF
+programs attached to trace events can access the full kernel context
+(ruleset rules, domain hierarchy, process credentials) via BTF, enabling
+richer analysis than the flat fields in audit records.  For example, an
+eBPF-based live monitoring tool can correlate creation, rule-addition,
+and denial events to build a real-time view of all active Landlock
+domains and their policies.  However, BTF-based access depends on
+internal kernel struct layouts which have no stability guarantee.  CO-RE
+(Compile Once, Run Everywhere) provides best-effort field relocation.
+The ftrace printk format is also not a stable ABI, but is
+self-describing via the per-event ``format`` file, allowing tools to
+adapt dynamically.
+
+Observability guarantees and limitations
+-----------------------------------------
+
+Both audit records and trace events are emitted for every denied access,
+with these exceptions:
+
+- **Landlock log flags** (audit only): ``LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF``,
+  ``LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON``, and
+  ``LANDLOCK_RESTRICT_SELF_LOG_SUBDOMAINS_OFF`` control which denials
+  generate audit records.  Trace events fire regardless of these flags.
+
+- **NOAUDIT hooks**: Some LSM hooks suppress logging for speculative
+  permission probes (e.g., reading ``/proc/<pid>/status`` uses
+  ``PTRACE_MODE_NOAUDIT``).  When NOAUDIT is set, neither audit records
+  nor trace events are emitted, and the denial is not counted in
+  ``denials``.  The denial is still enforced.  This avoids performance
+  overhead and noise from speculative probes that test permissions
+  without performing an actual access.
+
+- **Audit rate limiting**: The audit subsystem may silently drop records
+  when the audit queue is full.  Trace events are not rate-limited.
+
+- **Tracepoint disabled**: When a trace event is disabled (the default
+  state), the tracepoint is a no-op with zero overhead.
+
+When both audit and tracing are active, every denial emits a trace event,
+and a denial that the domain's log policy selects additionally produces an
+audit record (subject to the Landlock log flags).  The ``denials`` count in
+``free_domain`` events is incremented for every denial regardless of the
+log flags, so it can exceed the number of audit records (which the log
+flags and audit-side rate-limiting or exclude rules may suppress).
+
+.. _landlock_observability_security:
+
+Observability security considerations
+---------------------------------------
+
+Both audit records and trace events expose information about all
+Landlock-sandboxed processes on the system, including filesystem paths
+being accessed, network ports, and process identities.  System
+administrators must ensure that access to audit logs (controlled by the
+audit subsystem configuration) and to trace events (requiring
+``CAP_SYS_ADMIN`` or ``CAP_BPF`` + ``CAP_PERFMON``) is restricted to
+trusted users.
+
+eBPF programs attached to Landlock trace events have access to the full
+kernel context of each event (ruleset rules, domain hierarchy, process
+credentials) via BTF, exposing sensitive state about every sandboxed
+process.  Restrict this access to trusted users, as for the audit logs.
+
+Audit logs and kernel trace events require elevated privileges and are
+system-wide; they are not designed for per-sandbox unprivileged
+monitoring.
+
+Additional documentation
+========================
+
+* `Linux Audit Documentation`_
+* Documentation/userspace-api/landlock.rst
+* Documentation/trace/events-landlock.rst
+* Documentation/security/landlock.rst
+* https://landlock.io
+
+.. Links
+.. _Linux Audit Documentation:
+   https://github.com/linux-audit/audit-documentation/wiki

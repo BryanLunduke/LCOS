@@ -1,0 +1,537 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote, ToTokens};
+use syn::{
+    parse::{End, Nothing, Parse},
+    parse_quote, parse_quote_spanned,
+    spanned::Spanned,
+    visit_mut::VisitMut,
+    Field, Fields, Generics, Ident, Item, PathSegment, Type, TypePath, Visibility, WhereClause,
+};
+
+use crate::diagnostics::{DiagCtxt, ErrorGuaranteed};
+
+pub(crate) mod kw {
+    syn::custom_keyword!(PinnedDrop);
+}
+
+pub(crate) enum Args {
+    Nothing(Nothing),
+    #[allow(dead_code)]
+    PinnedDrop(kw::PinnedDrop),
+}
+
+impl Parse for Args {
+    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
+        let lh = input.lookahead1();
+        if lh.peek(End) {
+            input.parse().map(Self::Nothing)
+        } else if lh.peek(kw::PinnedDrop) {
+            input.parse().map(Self::PinnedDrop)
+        } else {
+            Err(lh.error())
+        }
+    }
+}
+
+impl ToTokens for Args {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            Self::Nothing(_) => (),
+            Self::PinnedDrop(kw) => kw.to_tokens(tokens),
+        }
+    }
+}
+
+struct FieldInfo<'a> {
+    field: &'a Field,
+    pinned: bool,
+}
+
+pub(crate) fn pin_data(
+    args: Args,
+    input: Item,
+    dcx: &mut DiagCtxt,
+) -> Result<TokenStream, ErrorGuaranteed> {
+    let mut struct_ = match input {
+        Item::Struct(struct_) => struct_,
+        Item::Enum(enum_) => {
+            return Err(dcx.error(
+                enum_.enum_token,
+                "`#[pin_data]` only supports structs for now",
+            ));
+        }
+        Item::Union(union) => {
+            return Err(dcx.error(
+                union.union_token,
+                "`#[pin_data]` only supports structs for now",
+            ));
+        }
+        rest => {
+            return Err(dcx.error(
+                rest,
+                "`#[pin_data]` can only be applied to struct, enum and union definitions",
+            ));
+        }
+    };
+
+    // Handling cfg can gets very complicated, especially for tuple structs. Therefore, resolve all
+    // field cfgs first before continuing.
+    //
+    // We need to perform this after parsing so we can reliably detect field cfgs.
+    for (field_idx, field) in struct_.fields.iter_mut().enumerate() {
+        let cfg: Vec<_> = field
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("cfg"))
+            .map(|a| {
+                a.parse_args::<TokenStream>()
+                    .expect("parse as token stream cannot fail")
+            })
+            .collect();
+
+        if cfg.is_empty() {
+            continue;
+        }
+
+        field.attrs.retain(|a| !a.path().is_ident("cfg"));
+        let cfg_true_struct = quote!(#struct_);
+
+        let punctuated = match &mut struct_.fields {
+            Fields::Named(fields) => &mut fields.named,
+            Fields::Unnamed(fields) => &mut fields.unnamed,
+            Fields::Unit => unreachable!(),
+        };
+        *punctuated = std::mem::take(punctuated)
+            .into_pairs()
+            .enumerate()
+            .filter(|&(i, _)| i != field_idx)
+            .map(|(_, p)| p)
+            .collect();
+        let cfg_false_struct = quote!(#struct_);
+
+        // Resolve one field at a time until we've got no more field cfgs.
+        //
+        // This is linear time because macro invocations with false cfg will not be expanded.
+        return Ok(quote!(
+            #[cfg(all(#(#cfg,)*))]
+            #[::pin_init::pin_data(#args)]
+            #cfg_true_struct
+
+            #[cfg(not(all(#(#cfg,)*)))]
+            #[::pin_init::pin_data(#args)]
+            #cfg_false_struct
+        ));
+    }
+
+    // The generics might contain the `Self` type. Since this macro will define a new type with the
+    // same generics and bounds, this poses a problem: `Self` will refer to the new type as opposed
+    // to this struct definition. Therefore we have to replace `Self` with the concrete name.
+    let mut replacer = {
+        let name = &struct_.ident;
+        let (_, ty_generics, _) = struct_.generics.split_for_impl();
+        SelfReplacer(parse_quote!(#name #ty_generics))
+    };
+    replacer.visit_generics_mut(&mut struct_.generics);
+    replacer.visit_fields_mut(&mut struct_.fields);
+
+    let fields: Vec<FieldInfo<'_>> = struct_
+        .fields
+        .iter_mut()
+        .map(|field| {
+            let len = field.attrs.len();
+            field.attrs.retain(|a| !a.path().is_ident("pin"));
+            let pinned_count = len - field.attrs.len();
+            if pinned_count > 1 {
+                dcx.error(&field, "#[pin] attribute specified more than once");
+            }
+
+            assert!(
+                !field.attrs.iter().any(|a| a.path().is_ident("cfg")),
+                "cfgs should be all resolved at this point"
+            );
+
+            FieldInfo {
+                field: &*field,
+                pinned: pinned_count != 0,
+            }
+        })
+        .collect();
+
+    for field in &fields {
+        let ident = field.field.ident.as_ref().unwrap();
+
+        if !field.pinned && is_phantom_pinned(&field.field.ty) {
+            dcx.warn(
+                field.field,
+                format!(
+                    "The field `{ident}` of type `PhantomPinned` only has an effect \
+                    if it has the `#[pin]` attribute",
+                ),
+            );
+        }
+    }
+
+    let unpin_impl = generate_unpin_impl(&struct_.ident, &struct_.generics, &fields);
+    let drop_impl = generate_drop_impl(&struct_.ident, &struct_.generics, args);
+    let projections =
+        generate_projections(&struct_.vis, &struct_.ident, &struct_.generics, &fields);
+    let the_pin_data =
+        generate_the_pin_data(&struct_.vis, &struct_.ident, &struct_.generics, &fields);
+
+    Ok(quote! {
+        #struct_
+        #projections
+        // We put the rest into this const item, because it then will not be accessible to anything
+        // outside.
+        const _: () = {
+            #the_pin_data
+            #unpin_impl
+            #drop_impl
+        };
+    })
+}
+
+fn is_phantom_pinned(ty: &Type) -> bool {
+    match ty {
+        Type::Path(TypePath { qself: None, path }) => {
+            // Cannot possibly refer to `PhantomPinned` (except alias, but that's on the user).
+            if path.segments.len() > 3 {
+                return false;
+            }
+            // If there is a `::`, then the path needs to be `::core::marker::PhantomPinned` or
+            // `::std::marker::PhantomPinned`.
+            if path.leading_colon.is_some() && path.segments.len() != 3 {
+                return false;
+            }
+            let expected: Vec<&[&str]> = vec![&["PhantomPinned"], &["marker"], &["core", "std"]];
+            for (actual, expected) in path.segments.iter().rev().zip(expected) {
+                if !actual.arguments.is_empty() || expected.iter().all(|e| actual.ident != e) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn generate_unpin_impl(
+    ident: &Ident,
+    generics: &Generics,
+    fields: &[FieldInfo<'_>],
+) -> TokenStream {
+    let (_, ty_generics, _) = generics.split_for_impl();
+    let mut generics_with_pin_lt = generics.clone();
+    generics_with_pin_lt.params.insert(0, parse_quote!('__pin));
+    generics_with_pin_lt.make_where_clause();
+    let (
+        impl_generics_with_pin_lt,
+        ty_generics_with_pin_lt,
+        Some(WhereClause {
+            where_token,
+            predicates,
+        }),
+    ) = generics_with_pin_lt.split_for_impl()
+    else {
+        unreachable!()
+    };
+    let pinned_fields = fields.iter().filter(|f| f.pinned).map(|f| {
+        let ident = f.field.ident.as_ref().unwrap();
+        let ty = &f.field.ty;
+        quote!(
+            #ident: #ty
+        )
+    });
+    quote! {
+        // This struct will be used for the unpin analysis. It is needed, because only structurally
+        // pinned fields are relevant whether the struct should implement `Unpin`.
+        #[allow(
+            dead_code, // The fields below are never used.
+            non_snake_case // The warning will be emitted on the struct definition.
+        )]
+        struct __Unpin #generics_with_pin_lt
+        #where_token
+            #predicates
+        {
+            __phantom_pin: ::pin_init::__internal::PhantomInvariantLifetime<'__pin>,
+            __phantom: ::pin_init::__internal::PhantomInvariant<#ident #ty_generics>,
+            #(#pinned_fields),*
+        }
+
+        #[doc(hidden)]
+        impl #impl_generics_with_pin_lt ::core::marker::Unpin for #ident #ty_generics
+        #where_token
+            __Unpin #ty_generics_with_pin_lt: ::core::marker::Unpin,
+            #predicates
+        {}
+    }
+}
+
+fn generate_drop_impl(ident: &Ident, generics: &Generics, args: Args) -> TokenStream {
+    let (impl_generics, ty_generics, whr) = generics.split_for_impl();
+    let has_pinned_drop = matches!(args, Args::PinnedDrop(_));
+    // We need to disallow normal `Drop` implementation, the exact behavior depends on whether
+    // `PinnedDrop` was specified in `args`.
+    if has_pinned_drop {
+        // When `PinnedDrop` was specified we just implement `Drop` and delegate.
+        quote! {
+            impl #impl_generics ::core::ops::Drop for #ident #ty_generics
+                #whr
+            {
+                fn drop(&mut self) {
+                    // SAFETY: Since this is a destructor, `self` will not move after this function
+                    // terminates, since it is inaccessible.
+                    let pinned = unsafe { ::core::pin::Pin::new_unchecked(self) };
+                    // SAFETY: Since this is a drop function, we can create this token to call the
+                    // pinned destructor of this type.
+                    let token = unsafe { ::pin_init::__internal::OnlyCallFromDrop::new() };
+                    ::pin_init::PinnedDrop::drop(pinned, token);
+                }
+            }
+        }
+    } else {
+        // When no `PinnedDrop` was specified, then we have to prevent implementing drop.
+        quote! {
+            // We prevent this by creating a trait that will be implemented for all types implementing
+            // `Drop`. Additionally we will implement this trait for the struct leading to a conflict,
+            // if it also implements `Drop`
+            trait MustNotImplDrop {}
+            impl<T: ::core::ops::Drop + ?::core::marker::Sized> MustNotImplDrop for T {}
+            impl #impl_generics MustNotImplDrop for #ident #ty_generics
+                #whr
+            {}
+            // We also take care to prevent users from writing a useless `PinnedDrop` implementation.
+            // They might implement `PinnedDrop` correctly for the struct, but forget to give
+            // `PinnedDrop` as the parameter to `#[pin_data]`.
+            trait UselessPinnedDropImpl_you_need_to_specify_PinnedDrop {}
+            impl<T: ::pin_init::PinnedDrop + ?::core::marker::Sized>
+                UselessPinnedDropImpl_you_need_to_specify_PinnedDrop for T {}
+            impl #impl_generics
+                UselessPinnedDropImpl_you_need_to_specify_PinnedDrop for #ident #ty_generics
+                #whr
+            {}
+        }
+    }
+}
+
+fn generate_projections(
+    vis: &Visibility,
+    ident: &Ident,
+    generics: &Generics,
+    fields: &[FieldInfo<'_>],
+) -> TokenStream {
+    let (impl_generics, ty_generics, _) = generics.split_for_impl();
+    let mut generics_with_pin_lt = generics.clone();
+    generics_with_pin_lt.params.insert(0, parse_quote!('__pin));
+    let (_, ty_generics_with_pin_lt, whr) = generics_with_pin_lt.split_for_impl();
+    let projection = format_ident!("{ident}Projection");
+    let this = format_ident!("this");
+
+    let (fields_decl, fields_proj): (Vec<_>, Vec<_>) = fields
+        .iter()
+        .map(|field| {
+            let Field { vis, ident, ty, .. } = &field.field;
+
+            let ident = ident
+                .as_ref()
+                .expect("only structs with named fields are supported");
+            if field.pinned {
+                (
+                    quote!(
+                        #vis #ident: ::core::pin::Pin<&'__pin mut #ty>,
+                    ),
+                    quote!(
+                        // SAFETY: this field is structurally pinned.
+                        #ident: unsafe { ::core::pin::Pin::new_unchecked(&mut #this.#ident) },
+                    ),
+                )
+            } else {
+                (
+                    quote!(
+                        #vis #ident: &'__pin mut #ty,
+                    ),
+                    quote!(
+                        #ident: &mut #this.#ident,
+                    ),
+                )
+            }
+        })
+        .collect();
+    let structurally_pinned_fields_docs = fields
+        .iter()
+        .filter(|f| f.pinned)
+        .map(|f| format!(" - `{}`", f.field.ident.as_ref().unwrap()));
+    let not_structurally_pinned_fields_docs = fields
+        .iter()
+        .filter(|f| !f.pinned)
+        .map(|f| format!(" - `{}`", f.field.ident.as_ref().unwrap()));
+    let docs = format!(" Pin-projections of [`{ident}`]");
+    quote! {
+        #[doc = #docs]
+        // Allow `non_snake_case` since the same warning will be emitted on
+        // the struct definition.
+        #[allow(dead_code, non_snake_case)]
+        #[doc(hidden)]
+        #vis struct #projection #generics_with_pin_lt
+            #whr
+        {
+            #(#fields_decl)*
+            ___pin_phantom_data: ::core::marker::PhantomData<&'__pin mut ()>,
+        }
+
+        impl #impl_generics #ident #ty_generics
+            #whr
+        {
+            /// Pin-projects all fields of `Self`.
+            ///
+            /// These fields are structurally pinned:
+            #(#[doc = #structurally_pinned_fields_docs])*
+            ///
+            /// These fields are **not** structurally pinned:
+            #(#[doc = #not_structurally_pinned_fields_docs])*
+            #[inline]
+            #vis fn project<'__pin>(
+                self: ::core::pin::Pin<&'__pin mut Self>,
+            ) -> #projection #ty_generics_with_pin_lt {
+                // SAFETY: we only give access to `&mut` for fields not structurally pinned.
+                let #this = unsafe { ::core::pin::Pin::get_unchecked_mut(self) };
+                #projection {
+                    #(#fields_proj)*
+                    ___pin_phantom_data: ::core::marker::PhantomData,
+                }
+            }
+        }
+    }
+}
+
+fn generate_the_pin_data(
+    vis: &Visibility,
+    struct_name: &Ident,
+    generics: &Generics,
+    fields: &[FieldInfo<'_>],
+) -> TokenStream {
+    let (impl_generics, ty_generics, whr) = generics.split_for_impl();
+
+    // For every field, we create an initializing projection function according to its projection
+    // type. If a field is structurally pinned, we create a `Slot` with `Pinned` which must be
+    // initialized via `PinInit`; if it is not structurally pinned, then we create a `Slot` with
+    // `Unpinned` which allows initialization via `Init`.
+    let field_accessors = fields
+        .iter()
+        .map(|f| {
+            let Field { vis, ident, ty, .. } = f.field;
+
+            let field_name = ident
+                .as_ref()
+                .expect("only structs with named fields are supported");
+            let pin_marker = if f.pinned {
+                quote!(Pinned)
+            } else {
+                quote!(Unpinned)
+            };
+            quote! {
+                /// # Safety
+                ///
+                /// - `slot` is valid and properly aligned.
+                /// - `(*slot).#field_name` is properly aligned.
+                /// - `(*slot).#field_name` points to uninitialized and exclusively accessed
+                ///   memory.
+                // Allow `non_snake_case` since the same warning will be emitted on
+                // the struct definition.
+                #[allow(non_snake_case)]
+                #[inline(always)]
+                #vis unsafe fn #field_name(
+                    self,
+                    slot: *mut #struct_name #ty_generics,
+                ) -> ::pin_init::__internal::Slot<::pin_init::__internal::#pin_marker, #ty> {
+                    // SAFETY:
+                    // - If `#pin_marker` is `Pinned`, the corresponding field is structurally
+                    //   pinned.
+                    // - Other safety requirements follows the safety requirement.
+                    unsafe { ::pin_init::__internal::Slot::new(&raw mut (*slot).#field_name) }
+                }
+            }
+        })
+        .collect::<TokenStream>();
+    quote! {
+        // We declare this struct which will host all of the projection function for our type. It
+        // will be invariant over all generic parameters which are inherited from the struct.
+        #[doc(hidden)]
+        #vis struct __ThePinData #generics
+            #whr
+        {
+            __phantom: ::pin_init::__internal::PhantomInvariant<#struct_name #ty_generics>,
+        }
+
+        impl #impl_generics ::core::clone::Clone for __ThePinData #ty_generics
+            #whr
+        {
+            #[inline]
+            fn clone(&self) -> Self { *self }
+        }
+
+        impl #impl_generics ::core::marker::Copy for __ThePinData #ty_generics
+            #whr
+        {}
+
+        #[allow(dead_code)] // Some functions might never be used and private.
+        impl #impl_generics __ThePinData #ty_generics
+            #whr
+        {
+            /// Type inference helper function.
+            #[inline(always)]
+            #vis fn __make_closure<__F, __E>(self, f: __F) -> __F
+            where
+                __F: FnOnce(*mut #struct_name #ty_generics) ->
+                    ::core::result::Result<::pin_init::__internal::InitOk, __E>,
+            {
+                f
+            }
+
+            #field_accessors
+        }
+
+        // SAFETY: We have added the correct projection functions above to `__ThePinData` and
+        // we also use the least restrictive generics possible.
+        unsafe impl #impl_generics ::pin_init::__internal::HasPinData for #struct_name #ty_generics
+            #whr
+        {
+            type PinData = __ThePinData #ty_generics;
+
+            #[inline]
+            unsafe fn __pin_data() -> Self::PinData {
+                __ThePinData { __phantom: ::pin_init::__internal::PhantomInvariant::new() }
+            }
+        }
+    }
+}
+
+struct SelfReplacer(PathSegment);
+
+impl VisitMut for SelfReplacer {
+    fn visit_path_mut(&mut self, i: &mut syn::Path) {
+        if i.is_ident("Self") {
+            let span = i.span();
+            let seg = &self.0;
+            *i = parse_quote_spanned!(span=> #seg);
+        } else {
+            syn::visit_mut::visit_path_mut(self, i);
+        }
+    }
+
+    fn visit_path_segment_mut(&mut self, seg: &mut PathSegment) {
+        if seg.ident == "Self" {
+            let span = seg.span();
+            let this = &self.0;
+            *seg = parse_quote_spanned!(span=> #this);
+        } else {
+            syn::visit_mut::visit_path_segment_mut(self, seg);
+        }
+    }
+
+    fn visit_item_mut(&mut self, _: &mut Item) {
+        // Do not descend into items, since items reset/change what `Self` refers to.
+    }
+}

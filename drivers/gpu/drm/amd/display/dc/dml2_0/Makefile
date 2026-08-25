@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: MIT */
+#
+# Copyright 2023 Advanced Micro Devices, Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+# THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+# OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+# ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+#
+# Authors: AMD
+#
+# Makefile for dml2.
+
+dml2_ccflags := $(CC_FLAGS_FPU)
+dml2_rcflags := $(CC_FLAGS_NO_FPU)
+
+ifneq ($(CONFIG_FRAME_WARN),0)
+    ifeq ($(filter y,$(CONFIG_KASAN)$(CONFIG_KCSAN)),y)
+        ifeq ($(CONFIG_CC_IS_CLANG)$(CONFIG_COMPILE_TEST),yy)
+            frame_warn_limit := 4096
+        else
+            frame_warn_limit := 3072
+        endif
+    else
+        frame_warn_limit := 2056
+    endif
+
+    ifeq ($(call test-lt, $(CONFIG_FRAME_WARN), $(frame_warn_limit)),y)
+        frame_warn_flag := -Wframe-larger-than=$(frame_warn_limit)
+    endif
+endif
+
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/src/dml2_core
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/src/dml2_mcg/
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/src/dml2_dpmm/
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/src/dml2_pmo/
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/src/dml2_standalone_libraries/
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/src/inc
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/inc
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/inc/bounding_boxes/
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/src/dml2_utm_soc_bb/
+subdir-ccflags-y += -I$(FULL_AMD_DISPLAY_PATH)/dc/dml2_0/dml21/src/dml2_cga/
+
+# Add FPU flags to all dml2 files by default, remove NO_FPU flags.
+# FPU flags step 1: Find all .c files in dal/dc/dml2_0 and it's subfolders
+
+THIS_MAKEFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
+DML2_ABS_PATH := $(patsubst %/,%,$(dir $(THIS_MAKEFILE_PATH)))
+
+DML2_C_FILES := $(shell find $(DML2_ABS_PATH) -name '*.c')
+
+# FPU flags step 2: Convert to .o and make paths relative to $(AMDDALPATH)/dc/dml2_0/
+DML2_RELATIVE_O_FILES := $(patsubst $(DML2_ABS_PATH)/%,dc/dml2_0/%,$(patsubst %.c,%.o,$(DML2_C_FILES)))
+
+# FPU flags step 3: Apply FPU flags to all .o files from dal/dc/dml2_0 and it's subfolders
+$(foreach obj,$(DML2_RELATIVE_O_FILES),$(eval CFLAGS_$(AMDDALPATH)/$(obj) := $(dml2_ccflags)))
+$(foreach obj,$(DML2_RELATIVE_O_FILES),$(eval CFLAGS_REMOVE_$(AMDDALPATH)/$(obj) := $(dml2_rcflags)))
+
+# FPU flags step 4: Replace CFLAGS per file for files with additional flags beyond dml2_ccflags and dml2_rcflags
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/display_mode_core.o := $(dml2_ccflags) $(frame_warn_flag)
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn4_calcs.o := $(dml2_ccflags) $(frame_warn_flag)
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_utils.o := $(dml2_ccflags) $(frame_warn_flag)
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn5_funcs_mode_programming.o := $(dml2_ccflags) $(frame_warn_flag)
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn5_funcs_mode_support.o := $(dml2_ccflags) $(frame_warn_flag)
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn6_funcs_mode_programming.o := $(dml2_ccflags) $(frame_warn_flag)
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn6_funcs_mode_support.o := $(dml2_ccflags) $(frame_warn_flag)
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/dml2_wrapper.o := $(dml2_rcflags)
+CFLAGS_$(AMDDALPATH)/dc/dml2_0/dml21/dml21_wrapper.o := $(dml2_rcflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/display_mode_core.o := $(dml2_rcflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn4_calcs.o := $(dml2_rcflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_utils.o := $(dml2_rcflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn5_funcs_mode_programming.o := $(dml2_rcflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn5_funcs_mode_support.o := $(dml2_rcflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn6_funcs_mode_programming.o := $(dml2_rcflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn6_funcs_mode_support.o := $(dml2_rcflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/dml2_wrapper.o := $(dml2_ccflags)
+CFLAGS_REMOVE_$(AMDDALPATH)/dc/dml2_0/dml21/dml21_wrapper.o := $(dml2_ccflags)
+
+DML2 = display_mode_core.o display_mode_util.o dml2_wrapper_fpu.o dml2_wrapper.o \
+		dml2_utils.o dml2_policy.o dml2_translation_helper.o dml2_dc_resource_mgmt.o dml2_mall_phantom.o \
+		dml_display_rq_dlg_calc.o
+DML2 += dml_frl_cap_chk.o
+
+AMD_DAL_DML2 = $(addprefix $(AMDDALPATH)/dc/dml2_0/,$(DML2))
+
+AMD_DISPLAY_FILES += $(AMD_DAL_DML2)
+
+
+DML21 := src/dml2_top/dml2_top_interfaces.o
+DML21 += src/dml2_top/dml2_top_soc15.o
+DML21 += src/dml2_core/dml2_core_dcn4.o
+DML21 += src/dml2_core/dml2_core_utils.o
+DML21 += src/dml2_core/dml2_core_factory.o
+DML21 += src/dml2_core/dml2_core_dcn4_calcs.o
+DML21 += src/dml2_dpmm/dml2_dpmm_dcn4.o
+DML21 += src/dml2_dpmm/dml2_dpmm_factory.o
+DML21 += src/dml2_mcg/dml2_mcg_dcn4.o
+DML21 += src/dml2_mcg/dml2_mcg_dcn42.o
+DML21 += src/dml2_mcg/dml2_mcg_factory.o
+DML21 += src/dml2_pmo/dml2_pmo_dcn3.o
+DML21 += src/dml2_pmo/dml2_pmo_factory.o
+DML21 += src/dml2_pmo/dml2_pmo_dcn4_fams2.o
+DML21 += src/dml2_pmo/dml2_pmo_dcn42.o
+DML21 += src/dml2_standalone_libraries/lib_float_math.o
+DML21 += src/dml2_standalone_libraries/lib_frl_cap_check.o
+DML21 += src/dml2_top/dml2_top_utm.o
+DML21 += src/dml2_core/dml2_core_dcn5_calcs_dchub.o
+DML21 += src/dml2_core/dml2_core_dcn5_calcs_display_pipe.o
+DML21 += src/dml2_core/dml2_core_dcn5_calcs_dsc_latency.o
+DML21 += src/dml2_core/dml2_core_dcn5_funcs_initialize.o
+DML21 += src/dml2_core/dml2_core_dcn5_funcs_mode_programming.o
+DML21 += src/dml2_core/dml2_core_dcn5_funcs_mode_support.o
+DML21 += src/dml2_dpmm/dml2_dpmm_dcn5.o
+DML21 += src/dml2_utm_soc_bb/dml2_utm_soc_bb_dcn5.o
+DML21 += src/dml2_utm_soc_bb/dml2_utm_soc_bb_factory.o
+DML21 += src/dml2_cga/dml2_cga_dcn6.o
+DML21 += src/dml2_cga/dml2_cga_factory.o
+DML21 += src/dml2_core/dml2_core_dcn6_calcs_dchub.o
+DML21 += src/dml2_core/dml2_core_dcn6_funcs_initialize.o
+DML21 += src/dml2_core/dml2_core_dcn6_funcs_mode_programming.o
+DML21 += src/dml2_core/dml2_core_dcn6_funcs_mode_support.o
+DML21 += src/dml2_pmo/dml2_pmo_dcn5.o
+DML21 += src/dml2_pmo/dml2_pmo_dcn5_stage_optimizers.o
+DML21 += src/dml2_pmo/dml2_pmo_dcn6.o
+DML21 += src/dml2_pmo/dml2_pmo_dcn6_stage_optimizers.o
+DML21 += src/dml2_standalone_libraries/alternate_pstate_shared_lib.o
+DML21 += src/dml2_utm_soc_bb/dml2_utm_soc_bb_dcn6.o
+DML21 += dml21_translation_helper.o
+DML21 += dml21_wrapper.o
+DML21 += dml21_wrapper_fpu.o
+DML21 += dml21_utils.o
+
+AMD_DAL_DML21 = $(addprefix $(AMDDALPATH)/dc/dml2_0/dml21/,$(DML21))
+
+AMD_DISPLAY_FILES += $(AMD_DAL_DML21)

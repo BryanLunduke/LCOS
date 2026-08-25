@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# ALSA ARM drivers
+
+menuconfig SND_ARM
+	bool "ARM sound devices"
+	depends on ARM
+	default y
+	help
+	  Support for sound devices specific to ARM architectures.
+	  Drivers that are implemented on ASoC can be found in
+	  "ALSA for SoC audio support" section.
+
+if SND_ARM
+
+config SND_ARMAACI
+	tristate "ARM PrimeCell PL041 AC Link support"
+	depends on ARM_AMBA
+	select SND_PCM
+	select SND_AC97_CODEC
+
+endif	# SND_ARM

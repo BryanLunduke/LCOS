@@ -1,0 +1,263 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/*
+ *   Copyright (C) 2019 Samsung Electronics Co., Ltd.
+ */
+
+#ifndef __VFS_CACHE_H__
+#define __VFS_CACHE_H__
+
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/mutex.h>
+#include <linux/rwsem.h>
+#include <linux/spinlock.h>
+#include <linux/idr.h>
+#include <linux/workqueue.h>
+
+#include "vfs.h"
+#include "mgmt/share_config.h"
+
+/* Windows style file permissions for extended response */
+#define	FILE_GENERIC_ALL	0x1F01FF
+#define	FILE_GENERIC_READ	0x120089
+#define	FILE_GENERIC_WRITE	0x120116
+#define	FILE_GENERIC_EXECUTE	0X1200a0
+
+/*
+ * Start volatile/persistent file id allocation at 1. A file id of 0 yields an
+ * SMB2 FileId of {0, 0}, which clients (e.g. Windows, Samba) treat as a null
+ * handle and never close, leaking the open on the server.
+ */
+#define KSMBD_START_FID		1
+#define KSMBD_NO_FID		(INT_MAX)
+#define SMB2_NO_FID		(0xFFFFFFFFFFFFFFFFULL)
+
+struct ksmbd_conn;
+struct ksmbd_session;
+
+struct ksmbd_lock {
+	struct file_lock *fl;
+	struct ksmbd_conn *conn;
+	struct list_head clist;
+	struct list_head flist;
+	struct list_head llist;
+	unsigned int flags;
+	int cmd;
+	int zero_len;
+	unsigned long long start;
+	unsigned long long end;
+};
+
+struct stream {
+	char *name;
+	ssize_t size;
+	loff_t pos;
+};
+
+struct ksmbd_inode {
+	struct rw_semaphore		m_lock;
+	atomic_t			m_count;
+	atomic_t			op_count;
+	/* opinfo count for streams */
+	atomic_t			sop_count;
+	struct dentry			*m_de;
+	unsigned int			m_flags;
+	struct hlist_node		m_hash;
+	struct list_head		m_fp_list;
+	struct list_head		m_op_list;
+	struct oplock_info		*m_opinfo;
+	__le32				m_fattr;
+};
+
+enum {
+	FP_NEW = 0,
+	FP_INITED,
+	FP_CLOSED
+};
+
+/* Owner information for durable handle reconnect */
+struct durable_owner {
+	unsigned int uid;
+	unsigned int gid;
+	char *name;
+};
+
+#define KSMBD_LOCK_SEQ_ARRAY_SIZE	64
+
+struct ksmbd_lock_sequence {
+	bool				valid;
+	u8				sequence;
+};
+
+struct ksmbd_file {
+	struct file			*filp;
+	u64				persistent_id;
+	u64				volatile_id;
+	u64				durable_volatile_id;
+
+	spinlock_t			f_lock;
+
+	struct ksmbd_inode		*f_ci;
+	struct ksmbd_inode		*f_parent_ci;
+	struct oplock_info __rcu	*f_opinfo;
+	struct ksmbd_conn		*conn;
+	struct ksmbd_tree_connect	*tcon;
+
+	atomic_t			refcount;
+	__le32				daccess;
+	__le32				saccess;
+	__le32				coption;
+	__le32				cdoption;
+	__le32				create_file_attributes;
+	__u64				create_time;
+	__u64				change_time;
+	__u64				allocation_size;
+	__u64				itime;
+	__u64				open_mtime;
+
+	bool				is_nt_open;
+	bool				attrib_only;
+	bool				allocation_size_set;
+
+	char				client_guid[16];
+	char				create_guid[16];
+	char				app_instance_id[16];
+
+	struct stream			stream;
+	struct list_head		node;
+	struct list_head		blocked_works;
+	struct list_head		lock_list;
+	/*
+	 * Per-handle FileDispositionInformation delete-pending state for a
+	 * stream handle -- separate from ksmbd_inode's inode-wide m_flags,
+	 * which have no way to record which stream on a multi-stream file
+	 * was actually marked for deletion. See ksmbd_fd_set_delete_pending().
+	 */
+	bool				stream_del_pending;
+
+	unsigned int			durable_timeout;
+	unsigned int			durable_scavenger_timeout;
+	/* CREATE action returned when this durable handle was established. */
+	__le32				create_action;
+
+	/* if ls is happening on directory, below is valid*/
+	struct ksmbd_readdir_data	readdir_data;
+	struct mutex			readdir_lock;
+	int				dot_dotdot[2];
+	unsigned int			f_state;
+	bool				reserve_lease_break;
+	bool				is_durable;
+	bool				is_persistent;
+	bool				is_resilient;
+	bool				has_app_instance_id;
+	bool				app_instance_version_valid;
+	u64				app_instance_version_high;
+	u64				app_instance_version_low;
+	bool				durable_reconnect_disabled;
+	bool				durable_replay_consumed;
+
+	bool                            is_posix_ctxt;
+	struct durable_owner		owner;
+	__le16				channel_sequence;
+	unsigned int			outstanding_requests;
+	unsigned int			outstanding_pre_requests;
+	struct ksmbd_lock_sequence	lock_seq[KSMBD_LOCK_SEQ_ARRAY_SIZE];
+
+	/*
+	 * Pending CHANGE_NOTIFY completions for this handle, sent with
+	 * STATUS_NOTIFY_CLEANUP when the handle is closed.
+	 */
+	struct list_head		notify_pendings;
+};
+
+static inline void set_ctx_actor(struct dir_context *ctx,
+				 filldir_t actor)
+{
+	ctx->actor = actor;
+}
+
+#define KSMBD_NR_OPEN_DEFAULT BITS_PER_LONG
+
+struct ksmbd_file_table {
+	rwlock_t		lock;
+	struct idr		*idr;
+};
+
+static inline bool has_file_id(u64 id)
+{
+	return id < KSMBD_NO_FID;
+}
+
+static inline bool ksmbd_stream_fd(struct ksmbd_file *fp)
+{
+	return fp->stream.name != NULL;
+}
+
+int ksmbd_init_file_table(struct ksmbd_file_table *ft);
+void ksmbd_destroy_file_table(struct ksmbd_session *sess);
+int ksmbd_close_fd(struct ksmbd_work *work, u64 id);
+struct ksmbd_file *ksmbd_lookup_fd_fast(struct ksmbd_work *work, u64 id);
+struct ksmbd_file *ksmbd_lookup_foreign_fd(struct ksmbd_work *work, u64 id);
+struct ksmbd_file *ksmbd_lookup_fd_slow(struct ksmbd_work *work, u64 id,
+					u64 pid);
+int ksmbd_vfs_set_durable_owner(struct ksmbd_file *fp,
+				struct ksmbd_user *user);
+struct ksmbd_file *ksmbd_file_get(struct ksmbd_file *fp);
+void ksmbd_fd_put(struct ksmbd_work *work, struct ksmbd_file *fp);
+struct ksmbd_inode *ksmbd_inode_lookup_lock(struct dentry *d);
+void ksmbd_inode_put(struct ksmbd_inode *ci);
+bool ksmbd_close_disconnected_durable_delete_on_close(struct dentry *dentry);
+struct ksmbd_file *ksmbd_lookup_global_fd(unsigned long long id);
+struct ksmbd_file *ksmbd_lookup_durable_fd(unsigned long long id);
+void ksmbd_put_durable_fd(struct ksmbd_file *fp);
+int ksmbd_invalidate_durable_fd(unsigned long long id);
+bool ksmbd_has_other_active_fd(struct ksmbd_file *fp);
+bool ksmbd_has_stream_without_delete_share(struct ksmbd_file *fp);
+struct ksmbd_file *ksmbd_lookup_fd_app_instance_id(char *app_instance_id);
+int ksmbd_close_fd_app_instance_id(char *app_instance_id);
+struct ksmbd_file *ksmbd_lookup_fd_cguid(char *cguid);
+struct ksmbd_file *ksmbd_lookup_fd_inode(struct dentry *dentry);
+bool ksmbd_has_other_nonposix_open(struct dentry *dentry);
+bool ksmbd_has_nonposix_open_child(struct ksmbd_file *old_fp);
+unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp);
+struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp);
+void ksmbd_launch_ksmbd_durable_scavenger(void);
+void ksmbd_stop_durable_scavenger(void);
+bool ksmbd_durable_scavenger_active(void);
+void ksmbd_close_tree_conn_fds(struct ksmbd_work *work);
+void ksmbd_close_session_fds(struct ksmbd_work *work);
+int ksmbd_close_inode_fds(struct ksmbd_work *work, struct inode *inode);
+int ksmbd_init_global_file_table(void);
+void ksmbd_free_global_file_table(void);
+void ksmbd_set_fd_limit(unsigned long limit);
+int ksmbd_update_fstate(struct ksmbd_file_table *ft, struct ksmbd_file *fp,
+			unsigned int state);
+bool ksmbd_vfs_compare_durable_owner(struct ksmbd_file *fp,
+		struct ksmbd_user *user);
+
+/*
+ * INODE hash
+ */
+int __init ksmbd_inode_hash_init(void);
+void ksmbd_release_inode_hash(void);
+
+enum KSMBD_INODE_STATUS {
+	KSMBD_INODE_STATUS_OK,
+	KSMBD_INODE_STATUS_UNKNOWN,
+	KSMBD_INODE_STATUS_PENDING_DELETE,
+};
+
+int ksmbd_query_inode_status(struct dentry *dentry);
+bool ksmbd_inode_pending_delete(struct ksmbd_file *fp);
+void ksmbd_set_inode_pending_delete(struct ksmbd_file *fp);
+void ksmbd_clear_inode_pending_delete(struct ksmbd_file *fp);
+void ksmbd_fd_set_delete_on_close(struct ksmbd_file *fp,
+				  int file_info);
+void ksmbd_fd_set_delete_pending(struct ksmbd_file *fp);
+void ksmbd_fd_clear_delete_pending(struct ksmbd_file *fp);
+int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp);
+int ksmbd_validate_name_reconnect(struct ksmbd_share_config *share,
+				  struct ksmbd_file *fp, char *name);
+int ksmbd_init_file_cache(void);
+void ksmbd_exit_file_cache(void);
+#endif /* __VFS_CACHE_H__ */

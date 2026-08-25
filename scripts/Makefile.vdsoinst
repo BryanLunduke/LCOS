@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# ==========================================================================
+# Install unstripped copies of vDSO
+# ==========================================================================
+
+PHONY := __default
+__default:
+	@:
+
+include $(srctree)/scripts/Kbuild.include
+
+install-dir := $(MODLIB)/vdso
+
+define gen_install_rules
+
+dest := $(install-dir)/$$(patsubst %.dbg,%,$$(notdir $(1)))
+
+__default: $$(dest)
+$$(dest): $(1) FORCE
+	$$(call cmd,install)
+
+build-id-file := $$(shell $(READELF) -n $(1) 2>/dev/null | sed -n 's@^.*Build ID: \(..\)\(.*\)@\1/\2@p')
+
+ifneq ($$(build-id-file),)
+link := $(install-dir)/.build-id/$$(build-id-file).debug
+
+__default: $$(link)
+$$(link): $$(dest) FORCE
+	$$(call cmd,symlink)
+endif
+
+endef
+
+$(foreach x, $(sort $(INSTALL_FILES)), $(eval $(call gen_install_rules,$(x))))
+
+quiet_cmd_install = INSTALL $@
+      cmd_install = mkdir -p $(dir $@); cp $< $@
+
+quiet_cmd_symlink = SYMLINK $@
+      cmd_symlink = mkdir -p $(dir $@); ln -sf --relative $< $@
+
+PHONY += FORCE
+FORCE:
+
+.PHONY: $(PHONY)

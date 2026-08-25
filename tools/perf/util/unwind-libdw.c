@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: GPL-2.0
+#include <assert.h>
+#include <linux/compiler.h>
+#include <elfutils/libdw.h>
+#include <elfutils/libdwfl.h>
+#include <inttypes.h>
+#include <errno.h>
+#include "debug.h"
+#include "dso.h"
+#include <dwarf-regs.h>
+#include "unwind.h"
+#include "unwind-libdw.h"
+#include "machine.h"
+#include "map.h"
+#include "symbol.h"
+#include "thread.h"
+#include <linux/types.h>
+#include <linux/zalloc.h>
+#include "event.h"
+#include "perf_regs.h"
+#include "callchain.h"
+#include "util/env.h"
+
+/*
+ * The dwfl thread argument passed to functions like memory_read. Memory has to
+ * be allocated to persist of multiple uses of the dwfl.
+ */
+struct dwfl_ui_thread_info {
+	/* Back link to the dwfl. */
+	Dwfl *dwfl;
+	/* The current unwind info, only 1 is supported. */
+	struct unwind_info *ui;
+};
+
+static char *debuginfo_path;
+
+static int __find_debuginfo(Dwfl_Module *mod __maybe_unused, void **userdata,
+			    const char *modname __maybe_unused, Dwarf_Addr base __maybe_unused,
+			    const char *file_name, const char *debuglink_file __maybe_unused,
+			    GElf_Word debuglink_crc __maybe_unused, char **debuginfo_file_name)
+{
+	const struct dso *dso = *userdata;
+
+	assert(dso);
+	if (dso__symsrc_filename(dso) && strcmp(file_name, dso__symsrc_filename(dso)))
+		*debuginfo_file_name = strdup(dso__symsrc_filename(dso));
+	return -1;
+}
+
+void libdw__invalidate_dwfl(struct maps *maps, void *arg)
+{
+	struct dwfl_ui_thread_info *dwfl_ui_ti = arg;
+
+	if (!dwfl_ui_ti)
+		return;
+
+	assert(dwfl_ui_ti->ui == NULL);
+	maps__set_libdw_addr_space_dwfl(maps, NULL);
+	dwfl_end(dwfl_ui_ti->dwfl);
+	free(dwfl_ui_ti);
+}
+
+static const Dwfl_Callbacks offline_callbacks = {
+	.find_debuginfo		= __find_debuginfo,
+	.debuginfo_path		= &debuginfo_path,
+	.section_address	= dwfl_offline_section_address,
+	// .find_elf is not set as we use dwfl_report_elf() instead.
+};
+
+static int __report_module(struct addr_location *al, u64 ip,
+			    struct unwind_info *ui)
+{
+	Dwfl_Module *mod;
+	struct dso *dso = NULL;
+	Dwarf_Addr base;
+	/*
+	 * Some callers will use al->sym, so we can't just use the
+	 * cheaper thread__find_map() here.
+	 */
+	thread__find_symbol(ui->thread, PERF_RECORD_MISC_USER, ip, al);
+
+	if (al->map)
+		dso = map__dso(al->map);
+
+	if (!dso)
+		return 0;
+
+	/*
+	 * The generated JIT DSO files only map the code segment without
+	 * ELF headers.  Since JIT codes used to be packed in a memory
+	 * segment, calculating the base address using pgoff falls into
+	 * a different code in another DSO.  So just use the map->start
+	 * directly to pick the correct one.
+	 */
+	if (!strncmp(dso__long_name(dso), "/tmp/jitted-", 12))
+		base = map__start(al->map);
+	else
+		base = map__start(al->map) - map__pgoff(al->map);
+
+	mod = dwfl_addrmodule(ui->dwfl, ip);
+	if (mod) {
+		Dwarf_Addr s;
+
+		dwfl_module_info(mod, NULL, &s, NULL, NULL, NULL, NULL, NULL);
+		if (s != base)
+			mod = NULL;
+	}
+
+	if (!mod) {
+		char filename[PATH_MAX];
+
+		__symbol__join_symfs(filename, sizeof(filename), dso__long_name(dso));
+		/* Don't hang up on device files like /dev/dri/renderD128. */
+		if (is_regular_file(filename)) {
+			mod = dwfl_report_elf(ui->dwfl, dso__short_name(dso), filename, -1,
+					      base, false);
+		}
+	}
+	if (!mod) {
+		char filename[PATH_MAX];
+
+		if (dso__build_id_filename(dso, filename, sizeof(filename), false))
+			mod = dwfl_report_elf(ui->dwfl, dso__short_name(dso), filename, -1,
+					      base, false);
+	}
+
+	if (mod) {
+		void **userdatap;
+
+		dwfl_module_info(mod, &userdatap, NULL, NULL, NULL, NULL, NULL, NULL);
+		*userdatap = dso;
+	}
+
+	return mod && dwfl_addrmodule(ui->dwfl, ip) == mod ? 0 : -1;
+}
+
+static int report_module(u64 ip, struct unwind_info *ui)
+{
+	struct addr_location al;
+	int res;
+
+	addr_location__init(&al);
+	res = __report_module(&al, ip, ui);
+	addr_location__exit(&al);
+	return res;
+}
+
+/*
+ * Store all entries within entries array,
+ * we will process it after we finish unwind.
+ */
+static int entry(u64 ip, struct unwind_info *ui)
+
+{
+	struct unwind_entry *e = &ui->entries[ui->idx++];
+	struct addr_location al;
+
+	addr_location__init(&al);
+	if (__report_module(&al, ip, ui)) {
+		addr_location__exit(&al);
+		return -1;
+	}
+
+	e->ip	  = ip;
+	e->ms.thread = thread__get(al.thread);
+	e->ms.map = map__get(al.map);
+	e->ms.sym = al.sym;
+
+	pr_debug("unwind: %s:ip = 0x%" PRIx64 " (0x%" PRIx64 ")\n",
+		 al.sym ? al.sym->name : "''",
+		 ip,
+		 al.map ? map__map_ip(al.map, ip) : (u64) 0);
+	addr_location__exit(&al);
+	return 0;
+}
+
+static pid_t next_thread(Dwfl *dwfl __maybe_unused, void *arg, void **thread_argp)
+{
+	struct dwfl_ui_thread_info *dwfl_ui_ti = arg;
+
+	/* We want only single thread to be processed. */
+	if (*thread_argp != NULL)
+		return 0;
+
+	assert(dwfl_ui_ti->ui != NULL);
+	*thread_argp = arg;
+	return thread__tid(dwfl_ui_ti->ui->thread);
+}
+
+static bool get_thread(Dwfl *dwfl __maybe_unused, pid_t tid, void *arg,
+		       void **thread_argp)
+{
+	struct dwfl_ui_thread_info *dwfl_ui_ti = arg;
+
+	assert(dwfl_ui_ti->ui != NULL);
+	if (tid != thread__tid(dwfl_ui_ti->ui->thread))
+		return false;
+
+	*thread_argp = arg;
+	return true;
+}
+
+static int access_dso_mem(struct unwind_info *ui, Dwarf_Addr addr,
+			  Dwarf_Word *data)
+{
+	struct addr_location al;
+	ssize_t size;
+	struct dso *dso;
+
+	addr_location__init(&al);
+	if (!thread__find_map(ui->thread, PERF_RECORD_MISC_USER, addr, &al)) {
+		pr_debug("unwind: no map for %lx\n", (unsigned long)addr);
+		goto out_fail;
+	}
+	dso = map__dso(al.map);
+	if (!dso)
+		goto out_fail;
+
+	size = dso__data_read_addr(dso, al.map, ui->machine, addr, (u8 *) data, sizeof(*data));
+
+	addr_location__exit(&al);
+	return !(size == sizeof(*data));
+out_fail:
+	addr_location__exit(&al);
+	return -1;
+}
+
+static bool memory_read(Dwfl *dwfl __maybe_unused, Dwarf_Addr addr, Dwarf_Word *result,
+			void *arg)
+{
+	struct dwfl_ui_thread_info *dwfl_ui_ti = arg;
+	struct unwind_info *ui = dwfl_ui_ti->ui;
+	struct stack_dump *stack = &ui->sample->user_stack;
+	u64 start, end;
+	int offset;
+	int ret;
+
+	if (!ui->sample->user_regs)
+		return false;
+
+	ret = perf_reg_value(&start, ui->sample->user_regs,
+			     perf_arch_reg_sp(ui->e_machine));
+	if (ret)
+		return false;
+
+	end = start + stack->size;
+
+	/* Check overflow. */
+	if (addr + sizeof(Dwarf_Word) < addr)
+		return false;
+
+	if (addr < start || addr + sizeof(Dwarf_Word) > end) {
+		ret = access_dso_mem(ui, addr, result);
+		if (ret) {
+			pr_debug("unwind: access_mem 0x%" PRIx64 " not inside range"
+				 " 0x%" PRIx64 "-0x%" PRIx64 "\n",
+				addr, start, end);
+			return false;
+		}
+		return true;
+	}
+
+	offset  = addr - start;
+	*result = *(Dwarf_Word *)&stack->data[offset];
+	pr_debug("unwind: access_mem addr 0x%" PRIx64 ", val %lx, offset %d\n",
+		 addr, (unsigned long)*result, offset);
+	return true;
+}
+
+static bool libdw_set_initial_registers(Dwfl_Thread *thread, void *arg)
+{
+	struct dwfl_ui_thread_info *dwfl_ui_ti = arg;
+	struct unwind_info *ui = dwfl_ui_ti->ui;
+	struct regs_dump *user_regs = perf_sample__user_regs(ui->sample);
+	Dwarf_Word *dwarf_regs;
+	int max_dwarf_reg = 0;
+	bool ret;
+	uint16_t e_machine = ui->e_machine;
+	int e_flags = ui->e_flags;
+	uint64_t ip_perf_reg = perf_arch_reg_ip(e_machine);
+	Dwarf_Word val = 0;
+
+
+	/*
+	 * For every possible perf register in the bitmap determine the dwarf
+	 * register and use to compute the max.
+	 */
+	for (int perf_reg = 0; perf_reg < 64; perf_reg++) {
+		if (user_regs->mask & (1ULL << perf_reg)) {
+			int dwarf_reg =
+				get_dwarf_regnum_for_perf_regnum(perf_reg, e_machine,
+								 e_flags,
+								 /*only_libdw_supported=*/true);
+			if (dwarf_reg > max_dwarf_reg)
+				max_dwarf_reg = dwarf_reg;
+		}
+	}
+
+	dwarf_regs = calloc(max_dwarf_reg + 1, sizeof(*dwarf_regs));
+	if (!dwarf_regs)
+		return false;
+
+	for (int perf_reg = 0; perf_reg < 64; perf_reg++) {
+		if (user_regs->mask & (1ULL << perf_reg)) {
+			int dwarf_reg =
+				get_dwarf_regnum_for_perf_regnum(perf_reg, e_machine,
+								 e_flags,
+								 /*only_libdw_supported=*/true);
+			if (dwarf_reg >= 0) {
+				val = 0;
+				if (perf_reg_value(&val, user_regs, perf_reg) == 0)
+					dwarf_regs[dwarf_reg] = val;
+			}
+		}
+	}
+	if (perf_reg_value(&val, user_regs, ip_perf_reg) == 0)
+		dwfl_thread_state_register_pc(thread, val);
+
+	ret = dwfl_thread_state_registers(thread, 0, max_dwarf_reg + 1, dwarf_regs);
+	free(dwarf_regs);
+	return ret;
+}
+
+static const Dwfl_Thread_Callbacks callbacks = {
+	.next_thread           = next_thread,
+	.get_thread            = get_thread,
+	.memory_read           = memory_read,
+	.set_initial_registers = libdw_set_initial_registers,
+};
+
+static int
+frame_callback(Dwfl_Frame *state, void *arg)
+{
+	struct unwind_info *ui = arg;
+	Dwarf_Addr pc;
+	bool isactivation;
+
+	if (!dwfl_frame_pc(state, &pc, NULL)) {
+		if (!ui->best_effort)
+			pr_err("%s", dwfl_errmsg(-1));
+		return DWARF_CB_ABORT;
+	}
+
+	// report the module before we query for isactivation
+	report_module(pc, ui);
+
+	if (!dwfl_frame_pc(state, &pc, &isactivation)) {
+		if (!ui->best_effort)
+			pr_err("%s", dwfl_errmsg(-1));
+		return DWARF_CB_ABORT;
+	}
+
+	if (!isactivation)
+		--pc;
+
+	return entry(pc, ui) || !(--ui->max_stack) ?
+	       DWARF_CB_ABORT : DWARF_CB_OK;
+}
+
+int libdw__get_entries(unwind_entry_cb_t cb, void *arg,
+			struct thread *thread,
+			struct perf_sample *data,
+			int max_stack,
+			bool best_effort)
+{
+	struct maps *maps = thread__maps(thread);
+	struct machine *machine = maps__machine(maps);
+	uint32_t e_flags = 0;
+	uint16_t e_machine = thread__e_machine(thread, machine, &e_flags);
+	struct dwfl_ui_thread_info *dwfl_ui_ti;
+	static struct unwind_info *ui;
+	Dwfl *dwfl;
+	Dwarf_Word ip;
+	int err = -EINVAL, i, entries;
+
+	if (!data->user_regs || !data->user_regs->regs)
+		return 0;
+
+	ui = zalloc(sizeof(*ui) + sizeof(ui->entries[0]) * max_stack);
+	if (!ui)
+		return -ENOMEM;
+
+	*ui = (struct unwind_info){
+		.sample		= data,
+		.thread		= thread,
+		.machine	= machine,
+		.cb		= cb,
+		.arg		= arg,
+		.max_stack	= max_stack,
+		.e_machine	= e_machine,
+		.e_flags	= e_flags,
+		.best_effort    = best_effort
+	};
+
+	dwfl_ui_ti = maps__libdw_addr_space_dwfl(maps);
+	if (dwfl_ui_ti) {
+		dwfl = dwfl_ui_ti->dwfl;
+	} else {
+		dwfl_ui_ti = zalloc(sizeof(*dwfl_ui_ti));
+		dwfl = dwfl_begin(&offline_callbacks);
+		if (!dwfl)
+			goto out;
+
+		dwfl_ui_ti->dwfl = dwfl;
+		maps__set_libdw_addr_space_dwfl(maps, dwfl_ui_ti);
+	}
+	assert(dwfl_ui_ti->ui == NULL);
+	assert(dwfl_ui_ti->dwfl == dwfl);
+	assert(dwfl_ui_ti == maps__libdw_addr_space_dwfl(maps));
+	dwfl_ui_ti->ui = ui;
+	ui->dwfl = dwfl;
+
+	err = perf_reg_value(&ip, data->user_regs, perf_arch_reg_ip(e_machine));
+	if (err)
+		goto out;
+
+	err = report_module(ip, ui);
+	if (err)
+		goto out;
+
+	dwfl_attach_state(dwfl, /*elf=*/NULL, thread__pid(thread), &callbacks,
+			  /* Dwfl thread function argument*/dwfl_ui_ti);
+	// Ignore thread already attached error.
+
+	err = dwfl_getthread_frames(dwfl, thread__tid(thread), frame_callback,
+				    /* Dwfl frame function argument*/ui);
+
+	if (err && ui->max_stack != max_stack)
+		err = 0;
+
+	/*
+	 * Display what we got based on the order setup.
+	 */
+	for (i = 0; i < ui->idx && !err; i++) {
+		int j = i;
+
+		if (callchain_param.order == ORDER_CALLER)
+			j = ui->idx - i - 1;
+
+		err = ui->entries[j].ip ? ui->cb(&ui->entries[j], ui->arg) : 0;
+	}
+
+ out:
+	if (err)
+		pr_debug("unwind: failed with '%s'\n", dwfl_errmsg(-1));
+
+	for (i = 0; i < ui->idx; i++)
+		map_symbol__exit(&ui->entries[i].ms);
+
+	dwfl_ui_ti->ui = NULL;
+	entries = (int)ui->idx;
+	free(ui);
+	/*
+	 * Unwinder return contract:
+	 *  > 0 : unwinding succeeded (stops fallback). If we found frames but hit an error
+	 *        (e.g. truncated stack), report success to preserve existing frames.
+	 *    0 : unwinding failed without yielding frames. Ignore non-fatal errors
+	 *        (e.g. missing debug info, DWARF corruption) to allow fallback unwinder or
+	 *        kernel callchain resolution to proceed.
+	 *  < 0 : fatal error (e.g. -ENOMEM). Aborts unwinding entirely.
+	 */
+	if (err)
+		return (err == -ENOMEM) ? -ENOMEM : (entries > 0 ? 1 : 0);
+	return entries;
+}

@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Makefile for Linux CIFS/SMB2/SMB3 VFS client
+#
+ccflags-y += -I$(src)		# needed for trace events
+obj-$(CONFIG_CIFS) += cifs.o
+
+cifs-y := trace.o cifsfs.o cifs_debug.o connect.o dir.o file.o \
+	  inode.o link.o misc.o netmisc.o smbencrypt.o transport.o \
+	  cached_dir.o cifs_unicode.o cifsencrypt.o \
+	  readdir.o ioctl.o sess.o export.o unc.o winucase.o \
+	  smb2ops.o smb2maperror.o smb2transport.o \
+	  smb2misc.o smb2pdu.o smb2inode.o smb2file.o cifsacl.o fs_context.o \
+	  dns_resolve.o cifs_spnego_negtokeninit.asn1.o asn1.o \
+	  namespace.o reparse.o
+
+$(obj)/asn1.o: $(obj)/cifs_spnego_negtokeninit.asn1.h
+
+$(obj)/cifs_spnego_negtokeninit.asn1.o: $(obj)/cifs_spnego_negtokeninit.asn1.c $(obj)/cifs_spnego_negtokeninit.asn1.h
+
+cifs-$(CONFIG_CIFS_XATTR) += xattr.o
+
+cifs-$(CONFIG_CIFS_UPCALL) += cifs_spnego.o
+
+cifs-$(CONFIG_CIFS_DFS_UPCALL) += dfs_cache.o dfs.o
+
+cifs-$(CONFIG_CIFS_SWN_UPCALL) += netlink.o cifs_swn.o
+
+cifs-$(CONFIG_CIFS_FSCACHE) += fscache.o
+
+cifs-$(CONFIG_CIFS_SMB_DIRECT) += smbdirect.o
+
+cifs-$(CONFIG_CIFS_ROOT) += cifsroot.o
+
+cifs-$(CONFIG_CIFS_ALLOW_INSECURE_LEGACY) += \
+	cifssmb.o \
+	smb1debug.o \
+	smb1encrypt.o \
+	smb1maperror.o \
+	smb1misc.o \
+	smb1ops.o \
+	smb1session.o \
+	smb1transport.o
+
+cifs-$(CONFIG_CIFS_COMPRESSION) += compress.o
+
+ifneq ($(CONFIG_CIFS_ALLOW_INSECURE_LEGACY),)
+#
+# Build the SMB1 error mapping tables from nterr.h and smberr.h
+#
+smb1-gen-y := smb1_mapping_table.c \
+	      smb1_err_dos_map.c \
+	      smb1_err_srv_map.c
+
+$(obj)/smb1_mapping_table.c: $(src)/nterr.h $(src)/gen_smb1_mapping FORCE
+	$(call if_changed,gen_smb1_mapping)
+
+$(obj)/smb1_err_%.c: $(src)/smberr.h $(src)/gen_smb1_mapping FORCE
+	$(call if_changed,gen_smb1_mapping)
+
+$(obj)/smb1maperror.o: $(addprefix $(obj)/, $(smb1-gen-y))
+
+quiet_cmd_gen_smb1_mapping = GEN     $@
+      cmd_gen_smb1_mapping = perl $(src)/gen_smb1_mapping $< $@
+endif
+
+#
+# Build the SMB2 error mapping table from smb2status.h
+#
+$(obj)/smb2_mapping_table.c: $(src)/../common/smb2status.h \
+			     $(src)/gen_smb2_mapping FORCE
+	$(call if_changed,gen_smb2_mapping)
+
+$(obj)/smb2maperror.o: $(obj)/smb2_mapping_table.c
+
+quiet_cmd_gen_smb2_mapping = GEN     $@
+      cmd_gen_smb2_mapping = perl $(src)/gen_smb2_mapping $< $@
+
+obj-$(CONFIG_SMB1_KUNIT_TESTS) += smb1maperror_test.o
+obj-$(CONFIG_SMB_KUNIT_TESTS) += smb2maperror_test.o
+
+# Let Kbuild handle tracking and cleaning
+targets += smb2_mapping_table.c $(smb1-gen-y)

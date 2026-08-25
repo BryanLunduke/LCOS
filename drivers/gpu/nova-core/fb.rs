@@ -1,0 +1,344 @@
+// SPDX-License-Identifier: GPL-2.0
+
+use core::ops::{
+    Deref,
+    Range, //
+};
+
+use kernel::{
+    device,
+    dma::CoherentHandle,
+    fmt,
+    io::Io,
+    prelude::*,
+    ptr::{
+        Alignable,
+        Alignment, //
+    },
+    sizes::*, //
+};
+
+use crate::{
+    driver::Bar0,
+    firmware::gsp::GspFirmware,
+    gpu::Chipset,
+    gsp,
+    num::FromSafeCast,
+    vgpu::VgpuState, //
+};
+
+mod hal;
+mod regs;
+
+/// Type holding the sysmem flush memory page, a page of memory to be written into the
+/// `NV_PFB_NISO_FLUSH_SYSMEM_ADDR*` registers and used to maintain memory coherency.
+///
+/// A system memory page is required for `sysmembar`, which is a GPU-initiated hardware
+/// memory-barrier operation that flushes all pending GPU-side memory writes that were done through
+/// PCIE to system memory. It is required for falcons to be reset as the reset operation involves a
+/// reset handshake. When the falcon acknowledges a reset, it writes into system memory. To ensure
+/// this write is visible to the host and prevent driver timeouts, the falcon must perform a
+/// sysmembar operation to flush its writes.
+///
+/// Because of this, the sysmem flush memory page must be registered as early as possible during
+/// driver initialization, and before any falcon is reset.
+///
+pub(crate) struct SysmemFlush<'sys> {
+    /// Chipset we are operating on.
+    chipset: Chipset,
+    device: &'sys device::Device,
+    bar: Bar0<'sys>,
+    /// Keep the page alive as long as we need it.
+    page: CoherentHandle,
+}
+
+impl<'sys> SysmemFlush<'sys> {
+    /// Allocate a memory page and register it as the sysmem flush page.
+    pub(crate) fn register(
+        dev: &'sys device::Device<device::Bound>,
+        bar: Bar0<'sys>,
+        chipset: Chipset,
+    ) -> Result<Self> {
+        let page = CoherentHandle::alloc(dev, kernel::page::PAGE_SIZE, GFP_KERNEL)?;
+
+        hal::fb_hal(chipset).write_sysmem_flush_page(bar, page.dma_address())?;
+
+        Ok(Self {
+            chipset,
+            device: dev,
+            bar,
+            page,
+        })
+    }
+}
+
+impl Drop for SysmemFlush<'_> {
+    fn drop(&mut self) {
+        let hal = hal::fb_hal(self.chipset);
+
+        if hal.read_sysmem_flush_page(self.bar) == self.page.dma_address() {
+            let _ = hal.write_sysmem_flush_page(self.bar, 0).inspect_err(|e| {
+                dev_warn!(
+                    &self.device,
+                    "failed to unregister sysmem flush page: {:?}\n",
+                    e
+                )
+            });
+        } else {
+            // Another page has been registered after us for some reason - warn as this is a bug.
+            dev_warn!(
+                &self.device,
+                "attempt to unregister a sysmem flush page that is not active\n"
+            );
+        }
+    }
+}
+
+pub(crate) struct FbRange(Range<u64>);
+
+impl FbRange {
+    pub(crate) fn len(&self) -> u64 {
+        self.0.end - self.0.start
+    }
+}
+
+impl From<Range<u64>> for FbRange {
+    fn from(range: Range<u64>) -> Self {
+        Self(range)
+    }
+}
+
+impl Deref for FbRange {
+    type Target = Range<u64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Debug for FbRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Use alternate format ({:#?}) to include size, compact format ({:?}) for just the range.
+        if f.alternate() {
+            let size = self.len();
+
+            if size < u64::SZ_1M {
+                let size_kib = size / u64::SZ_1K;
+                f.write_fmt(fmt!(
+                    "{:#x}..{:#x} ({} KiB)",
+                    self.0.start,
+                    self.0.end,
+                    size_kib
+                ))
+            } else {
+                let size_mib = size / u64::SZ_1M;
+                f.write_fmt(fmt!(
+                    "{:#x}..{:#x} ({} MiB)",
+                    self.0.start,
+                    self.0.end,
+                    size_mib
+                ))
+            }
+        } else {
+            f.write_fmt(fmt!("{:#x}..{:#x}", self.0.start, self.0.end))
+        }
+    }
+}
+
+/// Layout of the GPU framebuffer memory.
+///
+/// Contains ranges of GPU memory reserved for a given purpose during the GSP boot process.
+#[derive(Debug)]
+pub(crate) struct FbRanges {
+    /// Range of the framebuffer. Starts at `0`.
+    pub(crate) fb: FbRange,
+    /// VGA workspace, small area of reserved memory at the end of the framebuffer.
+    pub(crate) vga_workspace: FbRange,
+    /// FRTS range.
+    pub(crate) frts: FbRange,
+    /// Memory area containing the GSP bootloader image.
+    pub(crate) boot: FbRange,
+    /// Memory area containing the GSP firmware image.
+    pub(crate) elf: FbRange,
+    /// WPR2 heap.
+    pub(crate) wpr2_heap: FbRange,
+    /// WPR2 region range, starting with an instance of `GspFwWprMeta`.
+    pub(crate) wpr2: FbRange,
+    /// Non-WPR heap, located just below WPR2.
+    pub(crate) non_wpr_heap: FbRange,
+    /// Number of VF partitions.
+    pub(crate) vf_partition_count: u8,
+    /// PMU reserved memory size, in bytes.
+    pub(crate) pmu_reserved_size: u32,
+}
+
+impl FbRanges {
+    /// Computes concrete framebuffer ranges required on non-FSP booting architectures.
+    pub(crate) fn new(
+        chipset: Chipset,
+        bar: Bar0<'_>,
+        gsp_fw: &GspFirmware,
+        vgpu_state: VgpuState,
+    ) -> Result<Self> {
+        let hal = hal::fb_hal(chipset);
+
+        let fb = {
+            let fb_size = hal.vidmem_size(bar);
+
+            FbRange(0..fb_size)
+        };
+
+        let vga_workspace = {
+            let vga_base = {
+                const NV_PRAMIN_SIZE: u64 = u64::SZ_1M;
+                let base = fb.end - NV_PRAMIN_SIZE;
+
+                if hal.supports_display(bar) {
+                    match bar
+                        .read(regs::NV_PDISP_VGA_WORKSPACE_BASE)
+                        .vga_workspace_addr()
+                    {
+                        Some(addr) => {
+                            if addr < base {
+                                const VBIOS_WORKSPACE_SIZE: u64 = u64::SZ_128K;
+
+                                // Point workspace address to end of framebuffer.
+                                fb.end - VBIOS_WORKSPACE_SIZE
+                            } else {
+                                addr
+                            }
+                        }
+                        None => base,
+                    }
+                } else {
+                    base
+                }
+            };
+
+            FbRange(vga_base..fb.end)
+        };
+
+        let frts = {
+            const FRTS_DOWN_ALIGN: Alignment = Alignment::new::<SZ_128K>();
+            let frts_size: u64 = hal.frts_size();
+            let frts_base = vga_workspace.start.align_down(FRTS_DOWN_ALIGN) - frts_size;
+
+            FbRange(frts_base..frts_base + frts_size)
+        };
+
+        let boot = {
+            const BOOTLOADER_DOWN_ALIGN: Alignment = Alignment::new::<SZ_4K>();
+            let bootloader_size = u64::from_safe_cast(gsp_fw.bootloader.ucode.size());
+            let bootloader_base = (frts.start - bootloader_size).align_down(BOOTLOADER_DOWN_ALIGN);
+
+            FbRange(bootloader_base..bootloader_base + bootloader_size)
+        };
+
+        let elf = {
+            const ELF_DOWN_ALIGN: Alignment = Alignment::new::<SZ_64K>();
+            let elf_size = u64::from_safe_cast(gsp_fw.size);
+            let elf_addr = (boot.start - elf_size).align_down(ELF_DOWN_ALIGN);
+
+            FbRange(elf_addr..elf_addr + elf_size)
+        };
+
+        let (vf_partition_count, wpr2_heap_size) = wpr2_heap_params(chipset, vgpu_state, fb.end)?;
+
+        let wpr2_heap = {
+            const WPR2_HEAP_DOWN_ALIGN: Alignment = Alignment::new::<SZ_1M>();
+            let wpr2_heap_addr = elf
+                .start
+                .checked_sub(wpr2_heap_size)
+                .ok_or(EOVERFLOW)?
+                .align_down(WPR2_HEAP_DOWN_ALIGN);
+
+            FbRange(wpr2_heap_addr..(elf.start).align_down(WPR2_HEAP_DOWN_ALIGN))
+        };
+
+        let wpr2 = {
+            const WPR2_DOWN_ALIGN: Alignment = Alignment::new::<SZ_1M>();
+            let wpr2_addr = (wpr2_heap.start - u64::from_safe_cast(size_of::<gsp::GspFwWprMeta>()))
+                .align_down(WPR2_DOWN_ALIGN);
+
+            FbRange(wpr2_addr..frts.end)
+        };
+
+        let non_wpr_heap = {
+            let non_wpr_heap_size = hal.non_wpr_heap_size();
+            FbRange(wpr2.start - non_wpr_heap_size..wpr2.start)
+        };
+
+        Ok(Self {
+            fb,
+            vga_workspace,
+            frts,
+            boot,
+            elf,
+            wpr2_heap,
+            wpr2,
+            non_wpr_heap,
+            vf_partition_count,
+            pmu_reserved_size: hal.pmu_reserved_size(),
+        })
+    }
+}
+
+/// Reads the WPR2 memory region registers and returns the range if set.
+/// Returns `None` if the WPR2 region is not set.
+pub(crate) fn wpr2_range(bar: Bar0<'_>) -> Option<Range<u64>> {
+    let wpr2_hi = bar.read(regs::NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+
+    if !wpr2_hi.is_wpr2_set() {
+        return None;
+    }
+
+    let wpr2_lo = bar.read(regs::NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+
+    Some(wpr2_lo.lower_bound()..wpr2_hi.higher_bound())
+}
+
+/// Computes the number of VF partitions and the WPR2 heap size from the vGPU state.
+fn wpr2_heap_params(chipset: Chipset, vgpu_state: VgpuState, fb_size: u64) -> Result<(u8, u64)> {
+    Ok(match vgpu_state {
+        VgpuState::Disabled => (
+            0,
+            gsp::LibosParams::from_chipset(chipset).wpr_heap_size(chipset, fb_size)?,
+        ),
+        VgpuState::Enabled { total_vfs } => (
+            u8::try_from(total_vfs.get()).map_err(|_| EINVAL)?,
+            gsp::LibosParams::vgpu_wpr_heap_size(),
+        ),
+    })
+}
+
+/// Framebuffer region sizes needed for GSP-FMC boot.
+#[derive(Debug)]
+pub(crate) struct FbSizes {
+    /// FRTS size, in bytes.
+    pub(crate) frts_size: u64,
+    /// WPR2 heap size, in bytes.
+    pub(crate) wpr2_heap_size: u64,
+    /// Non-WPR heap size, in bytes.
+    pub(crate) non_wpr_heap_size: u64,
+    /// PMU reserved memory size, in bytes.
+    pub(crate) pmu_reserved_size: u32,
+    /// Number of VF partitions.
+    pub(crate) vf_partition_count: u8,
+}
+
+impl FbSizes {
+    /// Computes the framebuffer region sizes for GSP-FMC boot.
+    pub(crate) fn new(chipset: Chipset, bar: Bar0<'_>, vgpu_state: VgpuState) -> Result<Self> {
+        let hal = hal::fb_hal(chipset);
+        let fb_size = hal.vidmem_size(bar);
+        let (vf_partition_count, wpr2_heap_size) = wpr2_heap_params(chipset, vgpu_state, fb_size)?;
+
+        Ok(Self {
+            frts_size: hal.frts_size(),
+            wpr2_heap_size,
+            non_wpr_heap_size: hal.non_wpr_heap_size(),
+            pmu_reserved_size: hal.pmu_reserved_size(),
+            vf_partition_count,
+        })
+    }
+}

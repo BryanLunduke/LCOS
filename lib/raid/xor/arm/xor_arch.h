@@ -1,0 +1,17 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ *  Copyright (C) 2001 Russell King
+ */
+#include <asm/neon.h>
+#include "xor-neon.h"
+
+static __always_inline void __init arch_xor_init(void)
+{
+	xor_register(&xor_block_arm4regs);
+	xor_register(&xor_block_8regs);
+	xor_register(&xor_block_32regs);
+#ifdef CONFIG_KERNEL_MODE_NEON
+	if (cpu_has_neon())
+		xor_register(&xor_block_neon);
+#endif
+}

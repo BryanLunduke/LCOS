@@ -1,0 +1,153 @@
+/*
+ * Copyright (c) 2023, 2026, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ *
+ */
+
+#ifndef SHARE_OOPS_INSTANCEKLASSFLAGS_HPP
+#define SHARE_OOPS_INSTANCEKLASSFLAGS_HPP
+
+#include "runtime/atomicAccess.hpp"
+
+class ClassLoaderData;
+
+// The InstanceKlassFlags class contains the parse-time and writeable flags associated with
+// an InstanceKlass, and their associated accessors.
+// _flags are parse-time and constant in the InstanceKlass after that.  _status are set at runtime and
+// require atomic access.
+// These flags are JVM internal and not part of the AccessFlags classfile specification.
+
+class InstanceKlassFlags {
+  friend class VMStructs;
+
+#define IK_FLAGS_DO(flag)  \
+    flag(rewritten                          , 1 << 0) /* methods rewritten. */ \
+    flag(has_nonstatic_fields               , 1 << 1) /* for sizing with UseCompressedOops */ \
+    flag(should_verify_class                , 1 << 2) /* allow caching of preverification */ \
+    flag(is_contended                       , 1 << 3) /* marked with contended annotation */ \
+    flag(has_nonstatic_concrete_methods     , 1 << 4) /* class/superclass/implemented interfaces has non-static, concrete methods */ \
+    flag(declares_nonstatic_concrete_methods, 1 << 5) /* directly declares non-static, concrete methods */ \
+    flag(shared_loading_failed              , 1 << 6) /* class has been loaded from shared archive */ \
+    flag(defined_by_boot_loader             , 1 << 7) /* defining class loader is boot class loader */ \
+    flag(defined_by_platform_loader         , 1 << 8) /* defining class loader is platform class loader */ \
+    flag(defined_by_app_loader              , 1 << 9) /* defining class loader is app class loader */ \
+    flag(has_contended_annotations          , 1 << 10) /* has @Contended annotation */ \
+    flag(has_localvariable_table            , 1 << 11) /* has localvariable information */ \
+    flag(has_miranda_methods                , 1 << 12) /* True if this class has miranda methods in it's vtable */ \
+    flag(has_final_method                   , 1 << 13) /* True if klass has final method */ \
+    flag(has_inlined_fields                 , 1 << 14) /* has inlined fields and related embedded section is not empty */ \
+    flag(is_empty_inline_type               , 1 << 15) /* empty inline type (*) */ \
+    flag(is_naturally_atomic                , 1 << 16) /* loaded/stored in one instruction*/ \
+    flag(must_be_atomic                     , 1 << 17) /* doesn't allow tearing */ \
+    flag(has_loosely_consistent_annotation  , 1 << 18) /* the class has the LooselyConsistentValue annotation WARNING: it doesn't automatically mean that the class allows tearing */ \
+    flag(has_strict_static_fields           , 1 << 19) /* True if strict static fields declared */ \
+    flag(trust_final_fields                 , 1 << 20) /* All instance final fields in this class should be trusted */ \
+    flag(has_null_restricted_static_fields  , 1 << 21) /* True if static null restricted fields declared */ \
+    flag(fail_over_verified                 , 1 << 22) /* class failed split verification but passed inference verification */ \
+    /* end of list */
+
+    // (*) An inline type is considered empty if it contains no non-static fields or
+    //  if it contains only empty inline fields. Note that JITs have a slightly different
+    //  definition: empty inline fields must be flat otherwise the container won't
+    //  be considered empty.
+
+public:
+#define IK_FLAGS_ENUM_NAME(name, value)    _misc_##name = value,
+  enum {
+    IK_FLAGS_DO(IK_FLAGS_ENUM_NAME)
+  };
+#undef IK_FLAGS_ENUM_NAME
+
+private:
+#define IK_STATUS_DO(status)  \
+    status(is_being_redefined                , 1 << 0) /* True if the klass is being redefined */ \
+    status(has_resolved_methods              , 1 << 1) /* True if the klass has resolved MethodHandle methods */ \
+    status(has_been_redefined                , 1 << 2) /* class has been redefined */ \
+    status(is_scratch_class                  , 1 << 3) /* class is the redefined scratch class */ \
+    status(is_marked_dependent               , 1 << 4) /* class is the redefined scratch class */ \
+    status(has_init_deps_processed           , 1 << 5) /* all init dependencies are processed */ \
+    /* end of list */
+
+#define IK_STATUS_ENUM_NAME(name, value)    _misc_##name = value,
+  enum {
+    IK_STATUS_DO(IK_STATUS_ENUM_NAME)
+  };
+#undef IK_STATUS_ENUM_NAME
+
+  u2 builtin_loader_type_bits() const {
+    return _misc_defined_by_boot_loader|_misc_defined_by_platform_loader|_misc_defined_by_app_loader;
+  }
+
+  // These flags are write-once before the class is published and then read-only so don't require atomic updates.
+  u4 _flags;
+
+  // These flags are written during execution so require atomic stores
+  u1 _status;
+
+ public:
+
+  InstanceKlassFlags() : _flags(0), _status(0) {}
+
+  // Create getters and setters for the flag values.
+#define IK_FLAGS_GET_SET(name, ignore)          \
+  bool name() const { return (_flags & _misc_##name) != 0; } \
+  void set_##name(bool b) {         \
+    assert_is_safe(name());         \
+    if (b) _flags |= _misc_##name; \
+  }
+  IK_FLAGS_DO(IK_FLAGS_GET_SET)
+#undef IK_FLAGS_GET_SET
+
+  bool defined_by_other_loaders() const {
+    return (_flags & builtin_loader_type_bits()) == 0;
+  }
+
+  void set_class_loader_type(const ClassLoaderData* cld);
+
+  u4 flags() const { return _flags; }
+
+  static u4 is_empty_inline_type_value() {
+    return _misc_is_empty_inline_type;
+  }
+
+  void assert_is_safe(bool set) NOT_DEBUG_RETURN;
+
+  // Create getters and setters for the status values.
+#define IK_STATUS_GET_SET(name, ignore)          \
+  bool name() const { return (_status & _misc_##name) != 0; } \
+  void set_##name(bool b) {         \
+    if (b) { \
+      atomic_set_bits(_misc_##name); \
+    } else { \
+      atomic_clear_bits(_misc_##name); \
+    } \
+  }
+  IK_STATUS_DO(IK_STATUS_GET_SET)
+#undef IK_STATUS_GET_SET
+
+  void atomic_set_bits(u1 bits)   { AtomicAccess::fetch_then_or(&_status, bits); }
+  void atomic_clear_bits(u1 bits) { AtomicAccess::fetch_then_and(&_status, (u1)(~bits)); }
+  void print_on(outputStream* st) const;
+
+  static ByteSize flags_offset() { return byte_offset_of(InstanceKlassFlags, _flags); }
+};
+
+#endif // SHARE_OOPS_INSTANCEKLASSFLAGS_HPP

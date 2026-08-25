@@ -1,0 +1,203 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright © 2024 Intel Corporation
+ */
+
+#include <drm/drm_managed.h>
+#include <drm/drm_print.h>
+
+#include "xe_device.h"
+#include "xe_gt_stats.h"
+
+/**
+ * DOC: Xe GT Statistics
+ *
+ * Overview
+ * ========
+ *
+ * The Xe driver exposes per-GT statistics through the debugfs filesystem at::
+ *
+ *   /sys/kernel/debug/dri/<device>/gt<id>/stats
+ *
+ * This interface requires the kernel to be built with ``CONFIG_DEBUG_FS=y``.
+ *
+ * Reading statistics
+ * ==================
+ *
+ * Reading the file prints all available statistics, one per line, in
+ * ``name: value`` format::
+ *
+ *   $ cat /sys/kernel/debug/dri/0/gt0/stats
+ *   svm_pagefault_count: 0
+ *   tlb_inval_count: 1234
+ *   ...
+ *
+ * All values are 64-bit unsigned integers aggregated across all CPUs.
+ * Counters accumulate since the driver was loaded or since the last explicit
+ * reset.  Timing counters use microseconds as their unit; data volume counters
+ * use KiB.
+ *
+ * Resetting statistics
+ * ====================
+ *
+ * Writing a boolean true value to the file resets all counters to zero::
+ *
+ *   echo 1 > /sys/kernel/debug/dri/0/gt0/stats
+ *
+ * Any value accepted by ``kstrtobool()`` (e.g. ``1``, ``y``, ``yes``,
+ * ``on``) triggers the reset.  Resetting while the GPU is active may yield
+ * unpredictable intermediate values; it is recommended to reset only when
+ * the GPU is idle.
+ */
+
+static void xe_gt_stats_fini(struct drm_device *drm, void *arg)
+{
+	struct xe_gt *gt = arg;
+
+	free_percpu(gt->stats);
+}
+
+/**
+ * xe_gt_stats_init() - Initialize GT statistics
+ * @gt: GT structure
+ *
+ * Allocate per-CPU GT statistics. Using per-CPU stats allows increments
+ * to occur without cross-CPU atomics.
+ *
+ * Return: 0 on success, -ENOMEM on failure.
+ */
+int xe_gt_stats_init(struct xe_gt *gt)
+{
+	gt->stats = alloc_percpu(struct xe_gt_stats);
+	if (!gt->stats)
+		return -ENOMEM;
+
+	return drmm_add_action_or_reset(&gt_to_xe(gt)->drm, xe_gt_stats_fini,
+					gt);
+}
+
+/**
+ * xe_gt_stats_incr - Increments the specified stats counter
+ * @gt: GT structure
+ * @id: xe_gt_stats_id type id that needs to be incremented
+ * @incr: value to be incremented with
+ *
+ * Increments the specified stats counter.
+ */
+void xe_gt_stats_incr(struct xe_gt *gt, const enum xe_gt_stats_id id, int incr)
+{
+	if (id >= __XE_GT_STATS_NUM_IDS)
+		return;
+
+	this_cpu_add(gt->stats->counters[id], incr);
+}
+
+#define DEF_STAT_STR(ID, name) [XE_GT_STATS_ID_##ID] = name
+
+static const char *const stat_description[__XE_GT_STATS_NUM_IDS] = {
+	DEF_STAT_STR(SVM_PAGEFAULT_COUNT, "svm_pagefault_count"),
+	DEF_STAT_STR(TLB_INVAL, "tlb_inval_count"),
+	DEF_STAT_STR(SVM_TLB_INVAL_COUNT, "svm_tlb_inval_count"),
+	DEF_STAT_STR(SVM_TLB_INVAL_US, "svm_tlb_inval_us"),
+	DEF_STAT_STR(VMA_PAGEFAULT_COUNT, "vma_pagefault_count"),
+	DEF_STAT_STR(VMA_PAGEFAULT_KB, "vma_pagefault_kb"),
+	DEF_STAT_STR(INVALID_PREFETCH_PAGEFAULT_COUNT, "invalid_prefetch_pagefault_count"),
+	DEF_STAT_STR(SVM_4K_PAGEFAULT_COUNT, "svm_4K_pagefault_count"),
+	DEF_STAT_STR(SVM_64K_PAGEFAULT_COUNT, "svm_64K_pagefault_count"),
+	DEF_STAT_STR(SVM_2M_PAGEFAULT_COUNT, "svm_2M_pagefault_count"),
+	DEF_STAT_STR(SVM_4K_VALID_PAGEFAULT_COUNT, "svm_4K_valid_pagefault_count"),
+	DEF_STAT_STR(SVM_64K_VALID_PAGEFAULT_COUNT, "svm_64K_valid_pagefault_count"),
+	DEF_STAT_STR(SVM_2M_VALID_PAGEFAULT_COUNT, "svm_2M_valid_pagefault_count"),
+	DEF_STAT_STR(SVM_4K_PAGEFAULT_US, "svm_4K_pagefault_us"),
+	DEF_STAT_STR(SVM_64K_PAGEFAULT_US, "svm_64K_pagefault_us"),
+	DEF_STAT_STR(SVM_2M_PAGEFAULT_US, "svm_2M_pagefault_us"),
+	DEF_STAT_STR(SVM_4K_MIGRATE_COUNT, "svm_4K_migrate_count"),
+	DEF_STAT_STR(SVM_64K_MIGRATE_COUNT, "svm_64K_migrate_count"),
+	DEF_STAT_STR(SVM_2M_MIGRATE_COUNT, "svm_2M_migrate_count"),
+	DEF_STAT_STR(SVM_4K_MIGRATE_US, "svm_4K_migrate_us"),
+	DEF_STAT_STR(SVM_64K_MIGRATE_US, "svm_64K_migrate_us"),
+	DEF_STAT_STR(SVM_2M_MIGRATE_US, "svm_2M_migrate_us"),
+	DEF_STAT_STR(SVM_DEVICE_COPY_US, "svm_device_copy_us"),
+	DEF_STAT_STR(SVM_4K_DEVICE_COPY_US, "svm_4K_device_copy_us"),
+	DEF_STAT_STR(SVM_64K_DEVICE_COPY_US, "svm_64K_device_copy_us"),
+	DEF_STAT_STR(SVM_2M_DEVICE_COPY_US, "svm_2M_device_copy_us"),
+	DEF_STAT_STR(SVM_CPU_COPY_US, "svm_cpu_copy_us"),
+	DEF_STAT_STR(SVM_4K_CPU_COPY_US, "svm_4K_cpu_copy_us"),
+	DEF_STAT_STR(SVM_64K_CPU_COPY_US, "svm_64K_cpu_copy_us"),
+	DEF_STAT_STR(SVM_2M_CPU_COPY_US, "svm_2M_cpu_copy_us"),
+	DEF_STAT_STR(SVM_DEVICE_COPY_KB, "svm_device_copy_kb"),
+	DEF_STAT_STR(SVM_4K_DEVICE_COPY_KB, "svm_4K_device_copy_kb"),
+	DEF_STAT_STR(SVM_64K_DEVICE_COPY_KB, "svm_64K_device_copy_kb"),
+	DEF_STAT_STR(SVM_2M_DEVICE_COPY_KB, "svm_2M_device_copy_kb"),
+	DEF_STAT_STR(SVM_CPU_COPY_KB, "svm_cpu_copy_kb"),
+	DEF_STAT_STR(SVM_4K_CPU_COPY_KB, "svm_4K_cpu_copy_kb"),
+	DEF_STAT_STR(SVM_64K_CPU_COPY_KB, "svm_64K_cpu_copy_kb"),
+	DEF_STAT_STR(SVM_2M_CPU_COPY_KB, "svm_2M_cpu_copy_kb"),
+	DEF_STAT_STR(SVM_4K_GET_PAGES_US, "svm_4K_get_pages_us"),
+	DEF_STAT_STR(SVM_64K_GET_PAGES_US, "svm_64K_get_pages_us"),
+	DEF_STAT_STR(SVM_2M_GET_PAGES_US, "svm_2M_get_pages_us"),
+	DEF_STAT_STR(SVM_4K_BIND_US, "svm_4K_bind_us"),
+	DEF_STAT_STR(SVM_64K_BIND_US, "svm_64K_bind_us"),
+	DEF_STAT_STR(SVM_2M_BIND_US, "svm_2M_bind_us"),
+	DEF_STAT_STR(HW_ENGINE_GROUP_SUSPEND_LR_QUEUE_COUNT,
+		     "hw_engine_group_suspend_lr_queue_count"),
+	DEF_STAT_STR(HW_ENGINE_GROUP_SKIP_LR_QUEUE_COUNT,
+		     "hw_engine_group_skip_lr_queue_count"),
+	DEF_STAT_STR(HW_ENGINE_GROUP_WAIT_DMA_QUEUE_COUNT,
+		     "hw_engine_group_wait_dma_queue_count"),
+	DEF_STAT_STR(HW_ENGINE_GROUP_SUSPEND_LR_QUEUE_US,
+		     "hw_engine_group_suspend_lr_queue_us"),
+	DEF_STAT_STR(HW_ENGINE_GROUP_WAIT_DMA_QUEUE_US,
+		     "hw_engine_group_wait_dma_queue_us"),
+	DEF_STAT_STR(PRL_4K_ENTRY_COUNT, "prl_4k_entry_count"),
+	DEF_STAT_STR(PRL_64K_ENTRY_COUNT, "prl_64k_entry_count"),
+	DEF_STAT_STR(PRL_2M_ENTRY_COUNT, "prl_2m_entry_count"),
+	DEF_STAT_STR(PRL_ISSUED_COUNT, "prl_issued_count"),
+	DEF_STAT_STR(PRL_ABORTED_COUNT, "prl_aborted_count"),
+};
+
+/**
+ * xe_gt_stats_print_info - Print the GT stats
+ * @gt: GT structure
+ * @p: drm_printer where it will be printed out.
+ *
+ * This prints out all the available GT stats.
+ */
+int xe_gt_stats_print_info(struct xe_gt *gt, struct drm_printer *p)
+{
+	enum xe_gt_stats_id id;
+
+	for (id = 0; id < __XE_GT_STATS_NUM_IDS; ++id) {
+		u64 total = 0;
+		int cpu;
+
+		for_each_possible_cpu(cpu) {
+			struct xe_gt_stats *s = per_cpu_ptr(gt->stats, cpu);
+
+			total += s->counters[id];
+		}
+
+		drm_printf(p, "%s: %lld\n", stat_description[id], total);
+	}
+
+	return 0;
+}
+
+/**
+ * xe_gt_stats_clear() - Clear the GT stats
+ * @gt: GT structure
+ *
+ * Clear (zero) all available GT stats. Note that if the stats are being
+ * updated while this function is running, the results may be unpredictable.
+ * Intended to be called on an idle GPU.
+ */
+void xe_gt_stats_clear(struct xe_gt *gt)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct xe_gt_stats *s = per_cpu_ptr(gt->stats, cpu);
+
+		memset(s, 0, sizeof(*s));
+	}
+}

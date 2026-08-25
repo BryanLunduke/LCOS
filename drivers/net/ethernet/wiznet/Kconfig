@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# WIZnet devices configuration
+#
+
+config NET_VENDOR_WIZNET
+	bool "WIZnet devices"
+	default y
+	help
+	  If you have a network (Ethernet) card belonging to this class, say Y.
+
+	  Note that the answer to this question doesn't directly affect the
+	  kernel: saying N will just cause the configurator to skip all
+	  the questions about WIZnet devices. If you say Y, you will be asked
+	  for your specific card in the following questions.
+
+if NET_VENDOR_WIZNET
+
+config WIZNET_W5100
+	tristate "WIZnet W5100/W5200/W5500 Ethernet support for SPI mode"
+	depends on SPI
+	help
+	  Support for WIZnet W5100 chips.
+
+	  W5100 is a single chip with integrated 10/100 Ethernet MAC,
+	  PHY and hardware TCP/IP stack, but this driver is limited to
+	  the MAC and PHY functions only, onchip TCP/IP is unused.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called w5100.
+
+endif # NET_VENDOR_WIZNET

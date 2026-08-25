@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/cache.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/pid_namespace.h>
+#include "internal.h"
+
+/*
+ * /proc/self:
+ */
+static const char *proc_self_get_link(struct dentry *dentry,
+				      struct inode *inode,
+				      struct delayed_call *done)
+{
+	struct pid_namespace *ns = proc_pid_ns(inode->i_sb);
+	pid_t tgid = task_tgid_nr_ns(current, ns);
+	char *name;
+
+	if (!tgid)
+		return ERR_PTR(-ENOENT);
+	/* max length of unsigned int in decimal + NULL term */
+	name = kmalloc(10 + 1, dentry ? GFP_KERNEL : GFP_ATOMIC);
+	if (unlikely(!name))
+		return dentry ? ERR_PTR(-ENOMEM) : ERR_PTR(-ECHILD);
+	sprintf(name, "%u", tgid);
+	set_delayed_call(done, kfree_link, name);
+	return name;
+}
+
+static const struct inode_operations proc_self_inode_operations = {
+	.get_link	= proc_self_get_link,
+};
+
+unsigned self_inum __ro_after_init;
+
+int proc_setup_self(struct super_block *s)
+{
+	struct dentry *self;
+	int ret = -ENOMEM;
+
+	self = d_alloc_name(s->s_root, "self");
+	if (self) {
+		struct inode *inode = new_inode(s);
+		if (inode) {
+			inode->i_ino = self_inum;
+			simple_inode_init_ts(inode);
+			inode->i_mode = S_IFLNK | S_IRWXUGO;
+			inode->i_uid = GLOBAL_ROOT_UID;
+			inode->i_gid = GLOBAL_ROOT_GID;
+			inode->i_op = &proc_self_inode_operations;
+			d_make_persistent(self, inode);
+			ret = 0;
+		}
+		dput(self);
+	}
+
+	if (ret)
+		pr_err("proc_fill_super: can't allocate /proc/self\n");
+
+	return ret;
+}
+
+void __init proc_self_init(void)
+{
+	proc_alloc_inum(&self_inum);
+}

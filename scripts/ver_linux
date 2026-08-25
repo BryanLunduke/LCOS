@@ -1,0 +1,97 @@
+#!/usr/bin/awk -f
+# SPDX-License-Identifier: GPL-2.0
+# Before running this script please ensure that your PATH is
+# typical as you use for compilation/installation. I use
+# /bin /sbin /usr/bin /usr/sbin /usr/local/bin, but it may
+# differ on your system.
+
+BEGIN {
+	usage = "If some fields are empty or look unusual you may have an old version.\n"
+	usage = usage "Compare to the current minimal requirements in Documentation/process/changes.rst\n"
+	print usage
+
+	system("uname -a")
+	printf("\n")
+
+	vernum = "[0-9]+([.]?[0-9]+)+"
+	libc = "libc[.]so[.][0-9]+$"
+	libcpp = "(libg|stdc)[+]+[.]so([.][0-9]+)+$"
+
+	printversion("bash", version("bash --version"))
+	printversion("bc", version("bc --version"))
+	printversion("bindgen", version("bindgen --version"))
+	printversion("binutils", version("ld -v"))
+	printversion("bison", version("bison --version"))
+	printversion("btrfs-progs", version("btrfs --version"))
+	printversion("Clang", version("clang --version"))
+	printversion("Console-tools", version("loadkeys -V"))
+	printversion("Dynamic linker (ldd)", version("ldd --version"))
+	printversion("e2fsprogs", version("e2fsck -V"))
+	printversion("flex", version("flex --version"))
+	printversion("gdb", version("gdb -version"))
+	printversion("GNU awk", version("gawk --version"))
+	printversion("GNU C", version("gcc -dumpversion"))
+	printversion("GNU make", version("make --version"))
+	printversion("GNU tar", version("tar --version"))
+	printversion("GRUB2", version("grub2-install --version"))
+	printversion("GRUB", version("grub-install --version"))
+	printversion("gtags", version("gtags --version"))
+	printversion("iptables", version("iptables -V"))
+	printversion("Isdn4k-utils", version("isdnctrl"))
+	printversion("jfsutils", version("fsck.jfs -V"))
+	printversion("Kbd", version("loadkeys -V"))
+	printversion("kmod", version("kmod -V"))
+
+	while ("ldconfig -p 2>/dev/null" | getline > 0)
+		if ($NF ~ libc || $NF ~ libcpp)
+			if (!seen[ver = version("readlink " $NF)]++)
+				printversion("Linux C" ($NF ~ libcpp? "++" : "") " Library", ver)
+
+	printversion("mcelog", version("mcelog --version"))
+	printversion("mkimage", version("mkimage --version"))
+	printversion("Module-init-tools", version("depmod -V"))
+	printversion("Mount", version("mount --version"))
+	printversion("Net-tools", version("ifconfig --version"))
+	printversion("nfs-utils", version("showmount --version"))
+	printversion("openssl", version("openssl version"))
+	printversion("pahole", version("pahole --version"))
+	printversion("Pcmcia-cs", version("cardmgr -V"))
+	printversion("pcmciautils", version("pccardctl -V"))
+	printversion("PPP", version("pppd --version"))
+	printversion("procps", version("ps --version"))
+	printversion("Python", version("python3 -V"))
+	printversion("quota-tools", version("quota -V"))
+	printversion("Rust", version("rustc --version"))
+	printversion("Sh-utils", version("expr --v"))
+	printversion("Sphinx", version("sphinx-build --version"))
+	printversion("squashfs-tools", version("mksquashfs -version"))
+	printversion("udev", version("udevadm --version"))
+	printversion("util-linux", version("mount --version"))
+	printversion("Wireless-tools", version("iwconfig --version"))
+	printversion("xfsprogs", version("xfs_db -V"))
+
+	while ("sort /proc/modules" | getline > 0) {
+		mods = mods sep $1
+		sep = " "
+	}
+	printversion("Modules Loaded", mods)
+}
+
+function version(cmd,    ver) {
+	cmd = cmd " 2>&1"
+	while (cmd | getline > 0) {
+		if (match($0, vernum)) {
+			ver = substr($0, RSTART, RLENGTH)
+			break
+		}
+	}
+	close(cmd)
+	return ver
+}
+
+function printversion(name, value,  ofmt) {
+	if (value != "") {
+		ofmt = "%-20s\t%s\n"
+		printf(ofmt, name, value)
+	}
+}
