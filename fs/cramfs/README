@@ -1,0 +1,107 @@
+Notes on Filesystem Layout
+--------------------------
+
+These notes describe what mkcramfs generates.  Kernel requirements are
+a bit looser, e.g. it doesn't care if the <file_data> items are
+swapped around (though it does care that directory entries (inodes) in
+a given directory are contiguous, as this is used by readdir).
+
+All data is currently in host-endian format; neither mkcramfs nor the
+kernel ever do swabbing.  (See section `Block Size' below.)
+
+<filesystem>:
+	<superblock>
+	<directory_structure>
+	<data>
+
+<superblock>: struct cramfs_super (see cramfs_fs.h).
+
+<directory_structure>:
+	For each file:
+		struct cramfs_inode (see cramfs_fs.h).
+		Filename.  Not generally null-terminated, but it is
+		 null-padded to a multiple of 4 bytes.
+
+The order of inode traversal is described as "width-first" (not to be
+confused with breadth-first); i.e. like depth-first but listing all of
+a directory's entries before recursing down its subdirectories: the
+same order as `ls -AUR' (but without the /^\..*:$/ directory header
+lines); put another way, the same order as `find -type d -exec
+ls -AU1 {} \;'.
+
+Beginning in 2.4.7, directory entries are sorted.  This optimization
+allows cramfs_lookup to return more quickly when a filename does not
+exist, speeds up user-space directory sorts, etc.
+
+<data>:
+	One <file_data> for each file that's either a symlink or a
+	 regular file of non-zero st_size.
+
+<file_data>:
+	nblocks * <block_pointer>
+	 (where nblocks = (st_size - 1) / blksize + 1)
+	nblocks * <block>
+	padding to multiple of 4 bytes
+
+The i'th <block_pointer> for a file stores the byte offset of the
+*end* of the i'th <block> (i.e. one past the last byte, which is the
+same as the start of the (i+1)'th <block> if there is one).  The first
+<block> immediately follows the last <block_pointer> for the file.
+<block_pointer>s are each 32 bits long.
+
+When the CRAMFS_FLAG_EXT_BLOCK_POINTERS capability bit is set, each
+<block_pointer>'s top bits may contain special flags as follows:
+
+CRAMFS_BLK_FLAG_UNCOMPRESSED (bit 31):
+	The block data is not compressed and should be copied verbatim.
+
+CRAMFS_BLK_FLAG_DIRECT_PTR (bit 30):
+	The <block_pointer> stores the actual block start offset and not
+	its end, shifted right by 2 bits. The block must therefore be
+	aligned to a 4-byte boundary. The block size is either blksize
+	if CRAMFS_BLK_FLAG_UNCOMPRESSED is also specified, otherwise
+	the compressed data length is included in the first 2 bytes of
+	the block data. This is used to allow discontiguous data layout
+	and specific data block alignments e.g. for XIP applications.
+
+
+The order of <file_data>'s is a depth-first descent of the directory
+tree, i.e. the same order as `find -size +0 \( -type f -o -type l \)
+-print'.
+
+
+<block>: The i'th <block> is the output of zlib's compress function
+applied to the i'th blksize-sized chunk of the input data if the
+corresponding CRAMFS_BLK_FLAG_UNCOMPRESSED <block_ptr> bit is not set,
+otherwise it is the input data directly.
+(For the last <block> of the file, the input may of course be smaller.)
+Each <block> may be a different size.  (See <block_pointer> above.)
+
+<block>s are merely byte-aligned, not generally u32-aligned.
+
+When CRAMFS_BLK_FLAG_DIRECT_PTR is specified then the corresponding
+<block> may be located anywhere and not necessarily contiguous with
+the previous/next blocks. In that case it is minimally u32-aligned.
+If CRAMFS_BLK_FLAG_UNCOMPRESSED is also specified then the size is always
+blksize except for the last block which is limited by the file length.
+If CRAMFS_BLK_FLAG_DIRECT_PTR is set and CRAMFS_BLK_FLAG_UNCOMPRESSED
+is not set then the first 2 bytes of the block contains the size of the
+remaining block data as this cannot be determined from the placement of
+logically adjacent blocks.
+
+
+Holes
+-----
+
+This kernel supports cramfs holes (i.e. [efficient representation of]
+blocks in uncompressed data consisting entirely of NUL bytes), but by
+default mkcramfs doesn't test for & create holes, since cramfs in
+kernels up to at least 2.3.39 didn't support holes.  Run mkcramfs
+with -z if you want it to create files that can have holes in them.
+
+
+Tools
+-----
+
+The cramfs user-space tools, including mkcramfs and cramfsck, are
+located at <https://github.com/npitre/cramfs-tools>.

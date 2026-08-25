@@ -1,0 +1,323 @@
+/*
+ * Copyright 2020 Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#ifndef __SMU_CMN_H__
+#define __SMU_CMN_H__
+
+#include "amdgpu_smu.h"
+
+extern const struct smu_msg_ops smu_msg_v1_ops;
+
+int smu_msg_wait_response(struct smu_msg_ctl *ctl, u32 timeout_us);
+int smu_msg_send_async_locked(struct smu_msg_ctl *ctl,
+			      enum smu_message_type msg, u32 param);
+
+#if defined(SWSMU_CODE_LAYER_L2) || defined(SWSMU_CODE_LAYER_L3) || defined(SWSMU_CODE_LAYER_L4)
+
+#define FDO_PWM_MODE_STATIC  1
+#define FDO_PWM_MODE_STATIC_RPM 5
+
+#define SMU_IH_INTERRUPT_ID_TO_DRIVER                   0xFE
+#define SMU_IH_INTERRUPT_CONTEXT_ID_BACO                0x2
+#define SMU_IH_INTERRUPT_CONTEXT_ID_AC                  0x3
+#define SMU_IH_INTERRUPT_CONTEXT_ID_DC                  0x4
+#define SMU_IH_INTERRUPT_CONTEXT_ID_AUDIO_D0            0x5
+#define SMU_IH_INTERRUPT_CONTEXT_ID_AUDIO_D3            0x6
+#define SMU_IH_INTERRUPT_CONTEXT_ID_THERMAL_THROTTLING  0x7
+#define SMU_IH_INTERRUPT_CONTEXT_ID_FAN_ABNORMAL        0x8
+#define SMU_IH_INTERRUPT_CONTEXT_ID_FAN_RECOVERY        0x9
+
+#define SMU_IGNORE_IF_VERSION 0xFFFFFFFF
+
+#define smu_cmn_init_soft_gpu_metrics(ptr, frev, crev)                   \
+	do {                                                             \
+		typecheck(struct gpu_metrics_v##frev##_##crev *, (ptr)); \
+		struct gpu_metrics_v##frev##_##crev *tmp = (ptr);        \
+		struct metrics_table_header *header =                    \
+			(struct metrics_table_header *)tmp;              \
+		memset(header, 0xFF, sizeof(*tmp));                      \
+		header->format_revision = frev;                          \
+		header->content_revision = crev;                         \
+		header->structure_size = sizeof(*tmp);                   \
+	} while (0)
+
+#define smu_cmn_init_partition_metrics(ptr, fr, cr)                        \
+	do {                                                               \
+		typecheck(struct amdgpu_partition_metrics_v##fr##_##cr *,  \
+			  (ptr));                                          \
+		struct amdgpu_partition_metrics_v##fr##_##cr *tmp = (ptr); \
+		struct metrics_table_header *header =                      \
+			(struct metrics_table_header *)tmp;                \
+		memset(header, 0xFF, sizeof(*tmp));                        \
+		header->format_revision = fr;                              \
+		header->content_revision = cr;                             \
+		header->structure_size = sizeof(*tmp);                     \
+	} while (0)
+
+#define smu_cmn_init_baseboard_temp_metrics(ptr, fr, cr)                        \
+	do {                                                                    \
+		typecheck(struct amdgpu_baseboard_temp_metrics_v##fr##_##cr *,  \
+			  (ptr));                                               \
+		struct amdgpu_baseboard_temp_metrics_v##fr##_##cr *tmp = (ptr); \
+		struct metrics_table_header *header =                           \
+			(struct metrics_table_header *)tmp;                     \
+		memset(header, 0xFF, sizeof(*tmp));                             \
+		header->format_revision = fr;                                   \
+		header->content_revision = cr;                                  \
+		header->structure_size = sizeof(*tmp);                          \
+	} while (0)
+
+#define smu_cmn_init_gpuboard_temp_metrics(ptr, fr, cr)                         \
+	do {                                                                    \
+		typecheck(struct amdgpu_gpuboard_temp_metrics_v##fr##_##cr *,   \
+			  (ptr));                                               \
+		struct amdgpu_gpuboard_temp_metrics_v##fr##_##cr *tmp = (ptr);  \
+		struct metrics_table_header *header =                           \
+			(struct metrics_table_header *)tmp;                     \
+		memset(header, 0xFF, sizeof(*tmp));                             \
+		header->format_revision = fr;                                   \
+		header->content_revision = cr;                                  \
+		header->structure_size = sizeof(*tmp);                          \
+	} while (0)
+
+#define SMU_DPM_PCIE_GEN_IDX(gen)	smu_cmn_dpm_pcie_gen_idx((gen))
+#define SMU_DPM_PCIE_WIDTH_IDX(width)	smu_cmn_dpm_pcie_width_idx((width))
+
+#define smu_cmn_update_table(smu, table_index, argument, table_data, drv2smu) \
+	smu_cmn_update_table_read_arg((smu), (table_index), (argument), (table_data), NULL, (drv2smu))
+
+extern const int link_speed[];
+
+/* Helper to Convert from PCIE Gen 1/2/3/4/5/6 to 0.1 GT/s speed units */
+static inline int pcie_gen_to_speed(uint32_t gen)
+{
+	return ((gen == 0) ? link_speed[0] : link_speed[gen - 1]);
+}
+
+static inline bool smu_cmn_custom_params_count_valid(u32 max_idx, u32 params_count)
+{
+	return max_idx == params_count;
+}
+
+static inline bool smu_cmn_custom_params_clock_valid(long clock_idx, long clock_count)
+{
+	return clock_idx >= 0 && clock_idx < clock_count;
+}
+
+int smu_cmn_send_smc_msg_with_param(struct smu_context *smu,
+				    enum smu_message_type msg,
+				    uint32_t param,
+				    uint32_t *read_arg);
+
+int smu_cmn_send_smc_msg_with_params_ext(struct smu_context *smu,
+					 enum smu_message_type msg,
+					 const uint32_t *params,
+					 size_t num_params,
+					 uint32_t *read_args,
+					 size_t num_read_args,
+					 uint32_t flags,
+					 uint32_t timeout);
+
+static inline int smu_cmn_send_smc_msg_with_params(struct smu_context *smu,
+						   enum smu_message_type msg,
+						   const uint32_t *params,
+						   size_t num_params,
+						   uint32_t *read_args,
+						   size_t num_read_args)
+{
+	return smu_cmn_send_smc_msg_with_params_ext(smu, msg,
+						    params, num_params,
+						    read_args, num_read_args,
+						    0, 0);
+}
+
+int smu_cmn_send_smc_msg(struct smu_context *smu,
+			 enum smu_message_type msg,
+			 uint32_t *read_arg);
+
+int smu_cmn_send_debug_smc_msg(struct smu_context *smu,
+			 uint32_t msg);
+
+int smu_cmn_send_debug_smc_msg_with_param(struct smu_context *smu,
+			 uint32_t msg, uint32_t param);
+
+int smu_cmn_wait_for_response(struct smu_context *smu);
+
+int smu_cmn_to_asic_specific_index(struct smu_context *smu,
+				   enum smu_cmn2asic_mapping_type type,
+				   uint32_t index);
+
+int smu_cmn_feature_is_supported(struct smu_context *smu,
+				 enum smu_feature_mask mask);
+
+int smu_cmn_feature_is_enabled(struct smu_context *smu,
+			       enum smu_feature_mask mask);
+
+bool smu_cmn_clk_dpm_is_enabled(struct smu_context *smu,
+				enum smu_clk_type clk_type);
+
+int smu_cmn_get_enabled_mask(struct smu_context *smu,
+			     struct smu_feature_bits *feature_mask);
+
+uint64_t smu_cmn_get_indep_throttler_status(
+					const unsigned long dep_status,
+					const uint8_t *throttler_map);
+
+int smu_cmn_feature_update_enable_state(struct smu_context *smu,
+					uint64_t feature_mask,
+					bool enabled);
+
+int smu_cmn_feature_set_enabled(struct smu_context *smu,
+				enum smu_feature_mask mask,
+				bool enable);
+
+size_t smu_cmn_get_pp_feature_mask(struct smu_context *smu,
+				   char *buf);
+
+int smu_cmn_set_pp_feature_mask(struct smu_context *smu,
+				uint64_t new_mask);
+
+int smu_cmn_disable_all_features_with_exception(struct smu_context *smu,
+						enum smu_feature_mask mask);
+
+int smu_cmn_get_smc_version(struct smu_context *smu,
+			    uint32_t *if_version,
+			    uint32_t *smu_version);
+
+int smu_cmn_update_table_read_arg(struct smu_context *smu,
+				  enum smu_table_id table_index,
+				  int argument,
+				  void *table_data,
+				  uint32_t *read_arg,
+				  bool drv2smu);
+
+int smu_cmn_vram_cpy(struct smu_context *smu, void *dst,
+		     const void *src, size_t len);
+
+int smu_cmn_write_watermarks_table(struct smu_context *smu);
+
+int smu_cmn_write_pptable(struct smu_context *smu);
+
+int smu_cmn_get_metrics_table(struct smu_context *smu,
+			      void *metrics_table,
+			      bool bypass_cache);
+
+int smu_cmn_get_combo_pptable(struct smu_context *smu);
+
+int smu_cmn_set_mp1_state(struct smu_context *smu,
+			  enum pp_mp1_state mp1_state);
+
+bool smu_cmn_is_audio_func_enabled(struct amdgpu_device *adev);
+void smu_cmn_generic_soc_policy_desc(struct smu_dpm_policy *policy);
+void smu_cmn_generic_plpd_policy_desc(struct smu_dpm_policy *policy);
+
+void smu_cmn_get_backend_workload_mask(struct smu_context *smu,
+				       u32 workload_mask,
+				       u32 *backend_workload_mask);
+
+int smu_cmn_print_dpm_clk_levels(struct smu_context *smu,
+				  struct smu_dpm_table *dpm_table,
+				  uint32_t cur_clk,
+				  char *buf, int *offset);
+
+int smu_cmn_print_pcie_levels(struct smu_context *smu,
+			       struct smu_pcie_table *pcie_table,
+			       uint32_t cur_gen, uint32_t cur_lane,
+			       char *buf, int *offset);
+void smu_cmn_reset_custom_level(struct smu_context *smu);
+
+int smu_cmn_dpm_pcie_gen_idx(int gen);
+int smu_cmn_dpm_pcie_width_idx(int width);
+int smu_cmn_check_fw_version(struct smu_context *smu);
+
+int smu_cmn_get_pptable_from_firmware(struct smu_context *smu, void **table,
+				      uint32_t *size, uint32_t pptable_id);
+
+/*SMU gpu metrics */
+
+/* Attribute ID mapping */
+#define SMU_MATTR(X) AMDGPU_METRICS_ATTR_ID_##X
+/* Type ID mapping */
+#define SMU_MTYPE(X) AMDGPU_METRICS_TYPE_##X
+/* Unit ID mapping */
+#define SMU_MUNIT(X) AMDGPU_METRICS_UNIT_##X
+
+/* Map TYPEID to C type */
+#define SMU_CTYPE(TYPEID) SMU_CTYPE_##TYPEID
+
+#define SMU_CTYPE_AMDGPU_METRICS_TYPE_U8 u8
+#define SMU_CTYPE_AMDGPU_METRICS_TYPE_S8 s8
+#define SMU_CTYPE_AMDGPU_METRICS_TYPE_U16 u16
+#define SMU_CTYPE_AMDGPU_METRICS_TYPE_S16 s16
+#define SMU_CTYPE_AMDGPU_METRICS_TYPE_U32 u32
+#define SMU_CTYPE_AMDGPU_METRICS_TYPE_S32 s32
+#define SMU_CTYPE_AMDGPU_METRICS_TYPE_U64 u64
+#define SMU_CTYPE_AMDGPU_METRICS_TYPE_S64 s64
+
+/* struct members */
+#define SMU_METRICS_SCALAR(ID, UNIT, TYPEID, NAME) \
+	u64 NAME##_ftype;                          \
+	SMU_CTYPE(TYPEID) NAME
+
+#define SMU_METRICS_ARRAY(ID, UNIT, TYPEID, NAME, SIZE) \
+	u64 NAME##_ftype;                               \
+	SMU_CTYPE(TYPEID) NAME[SIZE]
+
+/* Init functions for scalar/array fields - init to 0xFFs */
+#define SMU_METRICS_INIT_SCALAR(ID, UNIT, TYPEID, NAME)               \
+	do {                                                          \
+		obj->NAME##_ftype =                                   \
+			AMDGPU_METRICS_ENC_ATTR(UNIT, TYPEID, ID, 1); \
+		obj->NAME = (SMU_CTYPE(TYPEID)) ~0;                   \
+		count++;                                              \
+	} while (0)
+
+#define SMU_METRICS_INIT_ARRAY(ID, UNIT, TYPEID, NAME, SIZE)             \
+	do {                                                             \
+		obj->NAME##_ftype =                                      \
+			AMDGPU_METRICS_ENC_ATTR(UNIT, TYPEID, ID, SIZE); \
+		memset(obj->NAME, 0xFF, sizeof(obj->NAME));              \
+		count++;                                                 \
+	} while (0)
+
+/* Declare Metrics Class and Template object */
+#define DECLARE_SMU_METRICS_CLASS(CLASSNAME, SMU_METRICS_FIELD_LIST)           \
+	struct __packed CLASSNAME {                                            \
+		struct metrics_table_header header;                            \
+		int attr_count;                                                \
+		SMU_METRICS_FIELD_LIST(SMU_METRICS_SCALAR, SMU_METRICS_ARRAY); \
+	};                                                                     \
+	static inline void CLASSNAME##_init(struct CLASSNAME *obj,             \
+					    uint8_t frev, uint8_t crev)        \
+	{                                                                      \
+		int count = 0;                                                 \
+		memset(obj, 0xFF, sizeof(*obj));                               \
+		obj->header.format_revision = frev;                            \
+		obj->header.content_revision = crev;                           \
+		obj->header.structure_size = sizeof(*obj);                     \
+		SMU_METRICS_FIELD_LIST(SMU_METRICS_INIT_SCALAR,                \
+				       SMU_METRICS_INIT_ARRAY)                 \
+		obj->attr_count = count;                                       \
+	}
+
+#endif
+#endif

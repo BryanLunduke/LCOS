@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Copyright (c) 2020, AngeloGioacchino Del Regno <kholk11@gmail.com>
+ * Copyright (c) 2020, Konrad Dybcio <konradybcio@gmail.com>
+ * Copyright (c) 2020, Martin Botka <martin.botka1@gmail.com>
+ */
+
+#include "sdm660.dtsi"
+
+/delete-node/ &remoteproc_cdsp;
+/delete-node/ &cdsp_smmu;
+/delete-node/ &cdsp_region;
+
+/ {
+	/delete-node/ smp2p-cdsp;
+
+	reserved-memory {
+		buffer_mem: tzbuffer@94a00000 {
+			reg = <0x0 0x94a00000 0x00 0x100000>;
+			no-map;
+		};
+	};
+};
+
+&adreno_gpu {
+	compatible = "qcom,adreno-509.0", "qcom,adreno";
+	/* Adreno 509 shares the frequency table with 512 */
+};

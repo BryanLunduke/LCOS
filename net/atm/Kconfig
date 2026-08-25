@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Asynchronous Transfer Mode (ATM)
+#
+
+config ATM
+	tristate "Asynchronous Transfer Mode (ATM)"
+	help
+	  ATM is a high-speed networking technology for Local Area Networks
+	  and Wide Area Networks.  It uses a fixed packet size and is
+	  connection oriented, allowing for the negotiation of minimum
+	  bandwidth requirements.
+
+	  In order to participate in an ATM network, your Linux box needs an
+	  ATM networking card. If you have that, say Y here and to the driver
+	  of your ATM card below.
+
+	  Note that you need a set of user-space programs to actually make use
+	  of ATM.  See the file <file:Documentation/networking/atm.rst> for
+	  further details.
+
+config ATM_BR2684
+	tristate "RFC1483/2684 Bridged protocols"
+	depends on ATM && INET
+	help
+	  ATM PVCs can carry ethernet PDUs according to RFC2684 (formerly 1483)
+	  This device will act like an ethernet from the kernels point of view,
+	  with the traffic being carried by ATM PVCs (currently 1 PVC/device).
+	  This is sometimes used over DSL lines.  If in doubt, say N.
+
+config ATM_BR2684_IPFILTER
+	bool "Per-VC IP filter kludge"
+	depends on ATM_BR2684
+	help
+	  This is an experimental mechanism for users who need to terminate a
+	  large number of IP-only vcc's.  Do not enable this unless you are sure
+	  you know what you are doing.

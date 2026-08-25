@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+#include "msm8916-samsung-fortuna-common.dtsi"
+
+/* IST3038 instead of Zinitix BT541 */
+/delete-node/ &touchscreen;
+
+&blsp_i2c5 {
+	touchscreen: touchscreen@50 {
+		compatible = "imagis,ist3038";
+		reg = <0x50>;
+
+		interrupts-extended = <&tlmm 13 IRQ_TYPE_EDGE_FALLING>;
+
+		touchscreen-size-x = <480>;
+		touchscreen-size-y = <800>;
+
+		vdd-supply = <&reg_vdd_tsp_a>;
+		vddio-supply = <&pm8916_l6>;
+
+		pinctrl-0 = <&tsp_int_default>;
+		pinctrl-names = "default";
+
+		linux,keycodes = <KEY_APPSELECT KEY_BACK>;
+	};
+};
+
+/* On rossa backlight is controlled with MIPI DCS commands */
+&clk_pwm {
+	status = "disabled";
+};
+
+&clk_pwm_backlight {
+	status = "disabled";
+};
+
+&s3fwrn5_nfc {
+	status = "okay";
+};
+
+&st_accel {
+	compatible = "st,lis2hh12";
+	mount-matrix = "1",  "0", "0",
+		       "0", "-1", "0",
+		       "0",  "0", "1";
+	status = "okay";
+};

@@ -1,0 +1,121 @@
+if ARCH_MXC || COMPILE_TEST
+
+config DRM_IMX_LDB_HELPER
+	tristate
+
+config DRM_IMX8MP_DW_HDMI_BRIDGE
+	tristate "Freescale i.MX8MP HDMI-TX bridge support"
+	depends on OF
+	depends on COMMON_CLK
+	select DRM_DW_HDMI
+	select OF_OVERLAY
+	select DRM_DISPLAY_CONNECTOR
+	imply DRM_IMX8MP_HDMI_PAI
+	imply DRM_IMX8MP_HDMI_PVI
+	imply PHY_FSL_SAMSUNG_HDMI_PHY
+	help
+	  Choose this to enable support for the internal HDMI encoder found
+	  on the i.MX8MP SoC.
+
+config DRM_IMX8MP_DW_HDMI_BRIDGE_CONNECTOR_FIXUP
+	bool
+	default y
+	depends on DRM_IMX_LCDIF
+	depends on DRM_IMX8MP_DW_HDMI_BRIDGE
+	depends on OF
+	help
+	  Modifies at early boot the live device tree of boards using the
+	  i.MX8MP fsl,imx8mp-hdmi-tx adding a hdmi-connector node linked to
+	  the hdmi-tx. This is needed to support bridge-connector usage in
+	  the i.MX8MP LCDIF driver.
+
+	  You need this if you use the i.MX8MP HDMI output and your board
+	  device tree file does not have an hdmi-connector node connected
+	  to it.
+
+config DRM_IMX8MP_HDMI_PAI
+	tristate "Freescale i.MX8MP HDMI PAI bridge support"
+	depends on OF
+	select DRM_DW_HDMI
+	select REGMAP
+	select REGMAP_MMIO
+	help
+	  Choose this to enable support for the internal HDMI TX Parallel
+	  Audio Interface found on the Freescale i.MX8MP SoC.
+
+config DRM_IMX8MP_HDMI_PVI
+	tristate "Freescale i.MX8MP HDMI PVI bridge support"
+	depends on OF
+	help
+	  Choose this to enable support for the internal HDMI TX Parallel
+	  Video Interface found on the Freescale i.MX8MP SoC.
+
+config DRM_IMX8QM_LDB
+	tristate "Freescale i.MX8QM LVDS display bridge"
+	depends on OF
+	depends on COMMON_CLK
+	select DRM_IMX_LDB_HELPER
+	select DRM_KMS_HELPER
+	help
+	  Choose this to enable the internal LVDS Display Bridge(LDB) found in
+	  Freescale i.MX8qm processor.  Official name of LDB is pixel mapper.
+
+config DRM_IMX8QXP_LDB
+	tristate "Freescale i.MX8QXP LVDS display bridge"
+	depends on OF
+	depends on COMMON_CLK
+	select DRM_IMX_LDB_HELPER
+	select DRM_KMS_HELPER
+	help
+	  Choose this to enable the internal LVDS Display Bridge(LDB) found in
+	  Freescale i.MX8qxp processor.  Official name of LDB is pixel mapper.
+
+config DRM_IMX8QXP_PIXEL_COMBINER
+	tristate "Freescale i.MX8QM/QXP pixel combiner"
+	depends on OF
+	depends on COMMON_CLK
+	select DRM_KMS_HELPER
+	help
+	  Choose this to enable pixel combiner found in
+	  Freescale i.MX8qm/qxp processors.
+
+config DRM_IMX8QXP_PIXEL_LINK
+	tristate "Freescale i.MX8QM/QXP display pixel link"
+	depends on OF
+	depends on IMX_SCU
+	select DRM_KMS_HELPER
+	help
+	  Choose this to enable display pixel link found in
+	  Freescale i.MX8qm/qxp processors.
+
+config DRM_IMX8QXP_PIXEL_LINK_TO_DPI
+	tristate "Freescale i.MX8QXP pixel link to display pixel interface"
+	depends on OF
+	select DRM_KMS_HELPER
+	help
+	  Choose this to enable pixel link to display pixel interface(PXL2DPI)
+	  found in Freescale i.MX8qxp processor.
+
+config DRM_IMX93_MIPI_DSI
+	tristate "Freescale i.MX93 specific extensions for Synopsys DW MIPI DSI"
+	depends on OF
+	depends on COMMON_CLK
+	select DRM_DW_MIPI_DSI
+	select GENERIC_PHY
+	select GENERIC_PHY_MIPI_DPHY
+	help
+	  Choose this to enable MIPI DSI controller found in Freescale i.MX93
+	  processor.
+
+config DRM_IMX93_PARALLEL_DISP_FMT_CONVERTER
+	tristate "NXP i.MX91/i.MX93 parallel display format converter"
+	depends on OF
+	select DRM_KMS_HELPER
+	help
+	  On i.MX93 and i.MX91 SoCs the parallel display format output is
+	  controlled via the MEDIAMIX BLK-CTRL DISPLAY_MUX.
+
+	  Say 'Y' or 'M' if you use the parallel display output path on a
+	  i.MX93 or i.MX91 SoC.
+
+endif # ARCH_MXC || COMPILE_TEST

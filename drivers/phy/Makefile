@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Makefile for the phy drivers.
+#
+
+obj-$(CONFIG_PHY_COMMON_PROPS)		+= phy-common-props.o
+obj-$(CONFIG_PHY_COMMON_PROPS_TEST)	+= phy-common-props-test.o
+obj-$(CONFIG_GENERIC_PHY)		+= phy-core.o
+obj-$(CONFIG_GENERIC_PHY_MIPI_DPHY)	+= phy-core-mipi-dphy.o
+obj-$(CONFIG_PHY_AIROHA_PCIE)		+= phy-airoha-pcie.o
+obj-$(CONFIG_PHY_CAN_TRANSCEIVER)	+= phy-can-transceiver.o
+obj-$(CONFIG_PHY_ECONET_PCIE)		+= phy-econet-pcie.o
+obj-$(CONFIG_PHY_EYEQ5_ETH)		+= phy-eyeq5-eth.o
+obj-$(CONFIG_PHY_GOOGLE_USB)		+= phy-google-usb.o
+obj-$(CONFIG_USB_LGM_PHY)		+= phy-lgm-usb.o
+obj-$(CONFIG_PHY_LPC18XX_USB_OTG)	+= phy-lpc18xx-usb-otg.o
+obj-$(CONFIG_PHY_NXP_PTN3222)		+= phy-nxp-ptn3222.o
+obj-$(CONFIG_PHY_NXP_TJA1145)		+= phy-nxp-tja1145.o
+obj-$(CONFIG_PHY_PISTACHIO_USB)		+= phy-pistachio-usb.o
+obj-$(CONFIG_PHY_SNPS_EUSB2)		+= phy-snps-eusb2.o
+obj-$(CONFIG_PHY_XGENE)			+= phy-xgene.o
+
+obj-$(CONFIG_GENERIC_PHY)		+= allwinner/	\
+					   amlogic/	\
+					   apple/	\
+					   axiado/	\
+					   broadcom/	\
+					   cadence/	\
+					   canaan/	\
+					   eswin/	\
+					   freescale/	\
+					   hisilicon/	\
+					   ingenic/	\
+					   intel/	\
+					   lantiq/	\
+					   marvell/	\
+					   mediatek/	\
+					   microchip/	\
+					   motorola/	\
+					   mscc/	\
+					   nuvoton/	\
+					   qualcomm/	\
+					   ralink/	\
+					   realtek/	\
+					   renesas/	\
+					   rockchip/	\
+					   samsung/	\
+					   socionext/	\
+					   sophgo/	\
+					   spacemit/	\
+					   st/		\
+					   starfive/	\
+					   sunplus/	\
+					   tegra/	\
+					   ti/		\
+					   xilinx/

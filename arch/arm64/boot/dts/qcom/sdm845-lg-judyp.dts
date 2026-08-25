@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * SDM845 LG V35 (judyp) device tree.
+ *
+ * Copyright (c) 2022, The Linux Foundation. All rights reserved.
+ */
+
+/dts-v1/;
+
+#include "sdm845-lg-common.dtsi"
+
+/ {
+	model = "LG V35 ThinQ";
+	compatible = "lg,judyp", "qcom,sdm845";
+
+	chosen {
+		framebuffer {
+			compatible = "simple-framebuffer";
+			memory-region = <&framebuffer_mem>;
+			width = <1440>;
+			height = <2880>;
+			stride = <(1440 * 4)>;
+			format = "a8r8g8b8";
+		};
+	};
+};
+
+&adsp_pas {
+	firmware-name = "qcom/sdm845/LG/judyp/adsp.mbn";
+};
+
+&bluetooth {
+	/*
+	 * This path is relative to the qca/
+	 * subdir under lib/firmware.
+	 */
+	firmware-name = "judyp/crnv21.bin";
+};
+
+&cdsp_pas {
+	firmware-name = "qcom/sdm845/LG/judyp/cdsp.mbn";
+};
+
+&gpu_zap_shader {
+	firmware-name = "qcom/sdm845/LG/judyp/a630_zap.mbn";
+};
+
+&ipa {
+	firmware-name = "qcom/sdm845/LG/judyp/ipa_fws.mbn";
+};
+
+&mss_pil {
+	firmware-name = "qcom/sdm845/LG/judyp/mba.mbn", "qcom/sdm845/LG/judyp/modem.mbn";
+};
+
+&venus {
+	firmware-name = "qcom/sdm845/LG/judyp/venus.mbn";
+};
+
+&wifi {
+	qcom,calibration-variant = "lg_judyp";
+};

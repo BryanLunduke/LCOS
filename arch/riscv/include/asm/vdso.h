@@ -1,0 +1,58 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * Copyright (C) 2012 ARM Limited
+ * Copyright (C) 2014 Regents of the University of California
+ * Copyright (C) 2017 SiFive
+ */
+
+#ifndef _ASM_RISCV_VDSO_H
+#define _ASM_RISCV_VDSO_H
+
+/*
+ * All systems with an MMU have a VDSO, but systems without an MMU don't
+ * support shared libraries and therefore don't have one.
+ */
+
+#define __VDSO_PAGES    4
+
+#ifndef __ASSEMBLER__
+
+#ifdef CONFIG_MMU
+#include <generated/vdso-offsets.h>
+#else
+extern size_t __vdso_alternatives_start_offset, __vdso_alternatives_end_offset;
+#endif
+
+#ifdef CONFIG_RISCV_USER_CFI
+#include <generated/vdso-cfi-offsets.h>
+#else
+extern size_t __vdso_alternatives_start_cfi_offset, __vdso_alternatives_end_cfi_offset;
+#endif
+
+#ifdef CONFIG_RISCV_USER_CFI
+#define VDSO_SYMBOL(base, name)							\
+	  (riscv_has_extension_unlikely(RISCV_ISA_EXT_ZIMOP) ?			\
+	  (void __user *)((unsigned long)(base) + __vdso_##name##_cfi_offset) :	\
+	  (void __user *)((unsigned long)(base) + __vdso_##name##_offset))
+#else
+#define VDSO_SYMBOL(base, name)							\
+	  ((void __user *)((unsigned long)(base) + __vdso_##name##_offset))
+#endif
+
+#ifdef CONFIG_COMPAT
+#include <generated/compat_vdso-offsets.h>
+
+#define COMPAT_VDSO_SYMBOL(base, name)						\
+	(void __user *)((unsigned long)(base) + compat__vdso_##name##_offset)
+
+#else
+extern size_t compat__vdso_alternatives_start_offset, compat__vdso_alternatives_end_offset;
+#endif /* CONFIG_COMPAT */
+
+extern char vdso_start[], vdso_end[];
+extern char vdso_cfi_start[], vdso_cfi_end[];
+extern char compat_vdso_start[], compat_vdso_end[];
+
+#endif /* !__ASSEMBLER__ */
+
+#endif /* _ASM_RISCV_VDSO_H */

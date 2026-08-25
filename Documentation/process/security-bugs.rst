@@ -1,0 +1,372 @@
+.. _securitybugs:
+
+Security bugs
+=============
+
+Linux kernel developers take security very seriously.  As such, we'd
+like to know when a security bug is found so that it can be fixed and
+disclosed as quickly as possible.
+
+Preparing your report
+---------------------
+
+Like with any bug report, a security bug report requires a lot of analysis work
+from the developers, so the more information you can share about the issue, the
+better.  Please review the procedure outlined in
+Documentation/admin-guide/reporting-issues.rst if you are unclear about what
+information is helpful.  The following information are absolutely necessary in
+**any** security bug report:
+
+  * **affected kernel version range**: with no version indication, your report
+    will not be processed.  Note that a time-dependent version such as "latest
+    mainline" is not acceptable.  A stable identifier such as a commit ID or an
+    exact version is required.  Versions designating kernels not coming from
+    kernel.org (such as distro kernels) are meaningless to maintainers and
+    will not be processed.  A significant part of reports are for bugs that
+    have already been fixed, so it is extremely important that vulnerabilities
+    are verified on recent versions (development tree or latest stable
+    version), at least by verifying that the code has not changed since the
+    version where it was detected.
+
+  * **description of the problem**: a detailed description of the problem, with
+    traces showing its manifestation, and why you consider that the observed
+    behavior as a problem in the kernel, is necessary.
+
+  * **reproducer**: developers will need to be able to reproduce the problem to
+    consider a fix as effective.  This includes both a way to trigger the issue
+    and a way to confirm it happens.  A reproducer with low complexity
+    dependencies will be needed (source code, shell script, sequence of
+    instructions, file-system image etc).  Binary-only executables are not
+    accepted.  Working exploits are extremely helpful and will not be released
+    without consent from the reporter, unless they are already public.  By
+    definition if an issue cannot be reproduced, it is not exploitable, thus it
+    is not a security bug.
+
+  * **conditions**: if the bug depends on certain configuration options,
+    sysctls, permissions, timing, code modifications etc, these should be
+    indicated.
+
+In addition, the following information are highly desirable:
+
+  * **suspected location of the bug**: the file names and functions where the
+    bug is suspected to be present are very important, at least to help forward
+    the report to the appropriate maintainers.  When not possible (for example,
+    "system freezes each time I run this command"), the security team will help
+    identify the source of the bug.
+
+  * **a proposed fix**: bug reporters who have analyzed the cause of a bug in
+    the source code almost always have an accurate idea on how to fix it,
+    because they spent a long time studying it and its implications.  Proposing
+    a tested fix will save maintainers a lot of time, even if the fix ends up
+    not being the right one, because it helps understand the bug.  When
+    proposing a tested fix, please always format it in a way that can be
+    immediately merged (see Documentation/process/submitting-patches.rst).
+    This will save some back-and-forth exchanges if it is accepted, and you
+    will be credited for finding and fixing this issue.  Note that in this case
+    only a ``Signed-off-by:`` tag is needed, without ``Reported-by:`` when the
+    reporter and author are the same.
+
+  * **mitigations**: very often during a bug analysis, some ways of mitigating
+    the issue appear. It is useful to share them, as they can be helpful to
+    keep end users protected during the time it takes them to apply the fix.
+
+What qualifies as a security bug
+--------------------------------
+
+It is important that most bugs are handled publicly so as to involve the widest
+possible audience and find the best solution.  By nature, bugs that are handled
+in closed discussions between a small set of participants are less likely to
+produce the best possible fix (e.g., risk of missing valid use cases, limited
+testing abilities).
+
+It turns out that the majority of the bugs reported via the security team are
+just regular bugs that have been improperly qualified as security bugs due to
+a lack of awareness of the Linux kernel's threat model, as described in
+Documentation/process/threat-model.rst, and ought to have been sent through
+the normal channels described in Documentation/admin-guide/reporting-issues.rst
+instead.
+
+The security list exists for urgent bugs that grant an attacker a capability
+they are not supposed to have on a correctly configured production system, and
+can be easily exploited, representing an imminent threat to many users.  Before
+reporting, consider whether the issue actually crosses a trust boundary on such
+a system.
+
+**If you resorted to AI assistance to identify a bug, you must treat it as
+public**. While you may have valid reasons to believe it is not, the security
+team's experience shows that bugs discovered this way systematically surface
+simultaneously across multiple researchers, often on the same day. In this
+case, do not publicly share a reproducer, as this could cause unintended harm;
+just mention that one is available and maintainers might ask for it privately
+if they need it.
+
+If you are unsure whether an issue qualifies, err on the side of reporting
+privately: the security team would rather triage a borderline report than miss
+a real vulnerability.  Reporting ordinary bugs to the security list, however,
+does not make them move faster and consumes triage capacity that other reports
+need.
+
+Identifying contacts
+--------------------
+
+The most effective way to report a security bug is to send it directly to the
+affected subsystem's maintainers and Cc: the Linux kernel security team.  Do
+not send it to a public list at this stage, unless you have good reasons to
+consider the issue as being public or trivial to discover (e.g. result of a
+widely available automated vulnerability scanning tool that can be repeated by
+anyone, or use of AI-based tools).
+
+If you're sending a report for issues affecting multiple parts in the kernel,
+even if they're fairly similar issues, please send individual messages (think
+that maintainers will not all work on the issues at the same time). The only
+exception is when an issue concerns closely related parts maintained by the
+exact same subset of maintainers, and these parts are expected to be fixed all
+at once by the same commit, then it may be acceptable to report them at once.
+
+One difficulty for most first-time reporters is to figure the right list of
+recipients to send a report to.  In the Linux kernel, all official maintainers
+are trusted, so the consequences of accidentally including the wrong maintainer
+are essentially a bit more noise for that person, i.e. nothing dramatic.  As
+such, a suitable method to figure the list of maintainers (which kernel
+security officers use) is to rely on the get_maintainer.pl script, tuned to
+only report maintainers.  This script, when passed a file name, will look for
+its path in the MAINTAINERS file to figure a hierarchical list of relevant
+maintainers.  Calling it a first time with the finest level of filtering will
+most of the time return a short list of this specific file's maintainers::
+
+  $ ./scripts/get_maintainer.pl --no-l --no-r --pattern-depth 1 \
+    drivers/example.c
+  Developer One <dev1@example.com> (maintainer:example driver)
+  Developer Two <dev2@example.org> (maintainer:example driver)
+
+These two maintainers should then receive the message.  If the command does not
+return anything, it means the affected file is part of a wider subsystem, so we
+should be less specific::
+
+  $ ./scripts/get_maintainer.pl --no-l --no-r drivers/example.c
+  Developer One <dev1@example.com> (maintainer:example subsystem)
+  Developer Two <dev2@example.org> (maintainer:example subsystem)
+  Developer Three <dev3@example.com> (maintainer:example subsystem [GENERAL])
+  Developer Four <dev4@example.org> (maintainer:example subsystem [GENERAL])
+
+Here, picking the first, most specific ones, is sufficient.  When the list is
+long, it is possible to produce a comma-delimited e-mail address list on a
+single line suitable for use in the To: field of a mailer like this::
+
+  $ ./scripts/get_maintainer.pl --no-tree --no-l --no-r --no-n --m \
+    --no-git-fallback --no-substatus --no-rolestats --no-multiline \
+    --pattern-depth 1 drivers/example.c
+  dev1@example.com, dev2@example.org
+
+or this for the wider list::
+
+  $ ./scripts/get_maintainer.pl --no-tree --no-l --no-r --no-n --m \
+    --no-git-fallback --no-substatus --no-rolestats --no-multiline \
+    drivers/example.c
+  dev1@example.com, dev2@example.org, dev3@example.com, dev4@example.org
+
+If at this point you're still facing difficulties spotting the right
+maintainers, **and only in this case**, it's possible to send your report to
+the Linux kernel security team only.  Your message will be triaged, and you
+will receive instructions about whom to contact, if needed.  Your message may
+equally be forwarded as-is to the relevant maintainers.
+
+Responsible use of AI to find bugs
+----------------------------------
+
+A significant fraction of bug reports submitted to the security team are
+actually the result of code reviews assisted by AI tools. While this can be an
+efficient means to find bugs in rarely explored areas, it causes an overload on
+maintainers, who are sometimes forced to ignore such reports due to their poor
+quality or accuracy. As such, reporters must be particularly cautious about a
+number of points which tend to make these reports needlessly difficult to
+handle:
+
+  * **Length**: AI-generated reports tend to be excessively long, containing
+    multiple sections and excessive detail. This makes it difficult to spot
+    important information such as affected files, versions, and impact. Please
+    ensure that a clear summary of the problem and all critical details are
+    presented first. Do not require triage engineers to scan multiple pages of
+    text. Configure your tools to produce concise, human-style reports.
+
+  * **Formatting**: Most AI-generated reports are littered with Markdown tags.
+    These decorations complicate the search for important information and do
+    not survive the quoting processes involved in forwarding or replying.
+    Please **always convert your report to plain text** without any formatting
+    decorations before sending it.
+
+  * **Impact Evaluation**: Many AI-generated reports lack an understanding
+    of the kernel's threat model (see Documentation/process/threat-model.rst)
+    and go to great lengths inventing theoretical consequences. This adds
+    noise and complicates triage. Please stick to verifiable facts (e.g.,
+    "this bug permits any user to gain CAP_NET_ADMIN") without enumerating
+    speculative implications. Have your tool read this documentation as
+    part of the evaluation process.
+
+  * **Reproducer**: AI-based tools are often capable of generating reproducers.
+    Please always ensure your tool provides one and **test it thoroughly**. If
+    the reproducer does not work, or if the tool cannot produce one, the
+    validity of the report should be seriously questioned. Note that since the
+    report will be posted to a public list, the reproducer should only be
+    shared upon maintainers' request.
+
+  * **Propose a Fix**: Many AI tools are actually better at writing code than
+    evaluating it. Please ask your tool to propose a fix and **test it** before
+    reporting the problem. If the fix cannot be tested because it relies on
+    rare hardware or almost extinct network protocols, the issue is likely not
+    a security bug. In any case, if a fix is proposed, it must adhere to
+    Documentation/process/submitting-patches.rst and include a 'Fixes:' tag
+    designating the commit that introduced the bug.
+
+Failure to consider these points exposes your report to the risk of being
+ignored.
+
+Use common sense when evaluating the report. If the affected file has not been
+touched for more than one year and is maintained by a single individual, it is
+likely that usage has declined and exposed users are virtually non-existent
+(e.g., drivers for very old hardware, obsolete filesystems). In such cases,
+there is no need to consume a maintainer's time with an unimportant report. If
+the issue is clearly trivial and publicly discoverable, you should report it
+directly to the public mailing lists.
+
+At the very least, when using an AI assistant to find and report bugs, make the
+assistant read this file and threat-model.rst before proceeding, and have it
+follow the procedure described in coding-assistants.rst: work on an up-to-date
+mainline tree and note the commit ID, verify the bug is real, write a fix,
+build it warning-free and checkpatch-clean, commit it with a Fixes tag, and
+identify the maintainers with get_maintainer.pl.
+
+On top of that procedure, the AI assistant **MUST**:
+
+1. Prepare a plain-text report explaining the problem. It must contain the
+   four items listed at the top of this file as absolutely necessary: the
+   affected version or commit ID noted while following the procedure above,
+   the description of the problem, the reproducer or its status, and the
+   triggering conditions.
+2. Start the report with a temporary section listing the recipients' addresses
+   (maintainers+list for the patch, maintainers only for the report and
+   reproducer), and with instructions reminding the reporter to check that
+   their email client is properly setup (see email-clients.rst), and leave it
+   to the reporter to remove that temporary section.
+
+A more detailed process is covered at https://github.com/masoncl/kres.git.
+
+Sending the report
+------------------
+
+Reports are to be sent over e-mail exclusively.  Please use a working e-mail
+address, preferably the same that you want to appear in ``Reported-by`` tags
+if any.  If unsure, send your report to yourself first.
+
+The security team and maintainers almost always require additional
+information beyond what was initially provided in a report and rely on
+active and efficient collaboration with the reporter to perform further
+testing (e.g., verifying versions, configuration options, mitigations, or
+patches). Before contacting the security team, the reporter must ensure
+they are available to explain their findings, engage in discussions, and
+run additional tests.  Reports where the reporter does not respond promptly
+or cannot effectively discuss their findings may be abandoned if the
+communication does not quickly improve.
+
+The report must be sent to maintainers.  If there are two or fewer
+recipients in your message, you must also always Cc: the Linux kernel
+security team who will ensure the message is delivered to the proper
+people, and will be able to assist small maintainer teams with processes
+they may not be familiar with.  For larger teams, Cc: the Linux kernel
+security team for your first few reports or when seeking specific help,
+such as when resending a message which got no response within a week.
+Once you have become comfortable with the process for a few reports, it is
+no longer necessary to Cc: the security list when sending to large teams.
+The Linux kernel security team can be contacted by email at
+<security@kernel.org>.  This is a private list of security officers
+who will help verify the bug report and assist developers working on a fix.
+It is possible that the security team will bring in extra help from area
+maintainers to understand and fix the security vulnerability.
+
+Please send **plain text** emails without attachments where possible.
+It is much harder to have a context-quoted discussion about a complex
+issue if all the details are hidden away in attachments.  Think of it like a
+:doc:`regular patch submission <../process/submitting-patches>`
+(even if you don't have a patch yet): describe the problem and impact, list
+reproduction steps, and follow it with a proposed fix, all in plain text.
+Markdown, HTML and RST formatted reports are particularly frowned upon since
+they're quite hard to read for humans and encourage to use dedicated viewers,
+sometimes online, which by definition is not acceptable for a confidential
+security report. Note that some mailers tend to mangle formatting of plain
+text by default, please consult Documentation/process/email-clients.rst for
+more info.
+
+Disclosure and embargoed information
+------------------------------------
+
+The security list is not a disclosure channel.  For that, see Coordination
+below.
+
+Once a robust fix has been developed, the release process starts.  Fixes
+for publicly known bugs are released immediately.
+
+Although our preference is to release fixes for publicly undisclosed bugs
+as soon as they become available, this may be postponed at the request of
+the reporter or an affected party for up to 7 calendar days from the start
+of the release process, with an exceptional extension to 14 calendar days
+if it is agreed that the criticality of the bug requires more time.  The
+only valid reason for deferring the publication of a fix is to accommodate
+the logistics of QA and large scale rollouts which require release
+coordination.
+
+While embargoed information may be shared with trusted individuals in
+order to develop a fix, such information will not be published alongside
+the fix or on any other disclosure channel without the permission of the
+reporter.  This includes but is not limited to the original bug report
+and followup discussions (if any), exploits, CVE information or the
+identity of the reporter.
+
+In other words our only interest is in getting bugs fixed.  All other
+information submitted to the security list and any followup discussions
+of the report are treated confidentially even after the embargo has been
+lifted, in perpetuity.
+
+Coordination with other groups
+------------------------------
+
+While the kernel security team solely focuses on getting bugs fixed,
+other groups focus on fixing issues in distros and coordinating
+disclosure between operating system vendors.  Coordination is usually
+handled by the "linux-distros" mailing list and disclosure by the
+public "oss-security" mailing list, both of which are closely related
+and presented in the linux-distros wiki:
+<https://oss-security.openwall.org/wiki/mailing-lists/distros>
+
+Please note that the respective policies and rules are different since
+the 3 lists pursue different goals.  Coordinating between the kernel
+security team and other teams is difficult since for the kernel security
+team occasional embargoes (as subject to a maximum allowed number of
+days) start from the availability of a fix, while for "linux-distros"
+they start from the initial post to the list regardless of the
+availability of a fix.
+
+As such, the kernel security team strongly recommends that as a reporter
+of a potential security issue you DO NOT contact the "linux-distros"
+mailing list UNTIL a fix is accepted by the affected code's maintainers
+and you have read the distros wiki page above and you fully understand
+the requirements that contacting "linux-distros" will impose on you and
+the kernel community.  This also means that in general it doesn't make
+sense to Cc: both lists at once, except maybe for coordination if and
+while an accepted fix has not yet been merged.  In other words, until a
+fix is accepted do not Cc: "linux-distros", and after it's merged do not
+Cc: the kernel security team.
+
+CVE assignment
+--------------
+
+The security team does not assign CVEs, nor do we require them for
+reports or fixes, as this can needlessly complicate the process and may
+delay the bug handling.  If a reporter wishes to have a CVE identifier
+assigned for a confirmed issue, they can contact the :doc:`kernel CVE
+assignment team<../process/cve>` to obtain one.
+
+Non-disclosure agreements
+-------------------------
+
+The Linux kernel security team is not a formal body and therefore unable
+to enter any non-disclosure agreements.

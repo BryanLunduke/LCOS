@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/interconnect/qcom,msm8974.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm MSM8974 Network-On-Chip Interconnect
+
+maintainers:
+  - Brian Masney <masneyb@onstation.org>
+
+description: |
+  The Qualcomm MSM8974 interconnect providers support setting system
+  bandwidth requirements between various network-on-chip fabrics.
+
+properties:
+  reg:
+    maxItems: 1
+
+  compatible:
+    enum:
+      - qcom,msm8974-bimc
+      - qcom,msm8974-cnoc
+      - qcom,msm8974-mmssnoc
+      - qcom,msm8974-ocmemnoc
+      - qcom,msm8974-pnoc
+      - qcom,msm8974-snoc
+
+  clock-names:
+    items:
+      - const: bus
+
+  clocks:
+    items:
+      - description: Bus Clock
+
+required:
+  - compatible
+  - reg
+
+unevaluatedProperties: false
+
+allOf:
+  - $ref: qcom,rpm-common.yaml#
+  - if:
+      properties:
+        compatible:
+          const: qcom,msm8974-mmssnoc
+    then:
+      required:
+        - clocks
+        - clock-names
+    else:
+      properties:
+        clocks: false
+        clock-names: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/qcom,rpmcc.h>
+
+    interconnect@fc380000 {
+        reg = <0xfc380000 0x6a000>;
+        compatible = "qcom,msm8974-bimc";
+        #interconnect-cells = <1>;
+    };

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config VDSO_DATASTORE
+	bool
+
+config GENERIC_GETTIMEOFDAY
+	bool
+	select VDSO_DATASTORE
+	help
+	  This is a generic implementation of gettimeofday vdso.
+	  Each architecture that enables this feature has to
+	  provide the fallback implementation.
+
+config GENERIC_VDSO_OVERFLOW_PROTECT
+	bool
+	help
+	  Select to add multiplication overflow protection to the VDSO
+	  time getter functions for the price of an extra conditional
+	  in the hotpath.
+
+config VDSO_GETRANDOM
+	bool
+	select VDSO_DATASTORE
+	help
+	  Selected by architectures that support vDSO getrandom().

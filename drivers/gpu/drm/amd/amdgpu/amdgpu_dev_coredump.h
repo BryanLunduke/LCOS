@@ -1,0 +1,75 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Copyright 2024 Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+#ifndef __AMDGPU_DEV_COREDUMP_H__
+#define __AMDGPU_DEV_COREDUMP_H__
+
+#include "amdgpu.h"
+
+#ifdef CONFIG_DEV_COREDUMP
+
+#define AMDGPU_COREDUMP_VERSION "1"
+
+struct amdgpu_coredump_ring {
+	u64				rptr;
+	u64				wptr;
+	u32				*ring_dw;
+	u32				ring_index;
+};
+
+struct amdgpu_coredump_ib_info {
+	uint64_t			gpu_addr;
+	u32				ib_size_dw;
+};
+
+struct amdgpu_coredump_info {
+	struct amdgpu_device            *adev;
+	struct amdgpu_task_info         reset_task_info;
+	struct timespec64               reset_time;
+
+	bool                            skip_vram_check;
+	bool                            reset_vram_lost;
+	struct amdgpu_ring              *ring;
+
+	struct amdgpu_coredump_ring	*rings;
+	u32				num_rings;
+
+	/* Readable form of coredevdump, generate once to speed up
+	 * reading it (see drm_coredump_printer's documentation).
+	 */
+	ssize_t				formatted_size;
+	char				*formatted;
+
+	unsigned int			pasid;
+	unsigned int			vmid;
+	int				num_ibs;
+	struct amdgpu_coredump_ib_info	ibs[] __counted_by(num_ibs);
+};
+#endif
+
+void amdgpu_coredump(struct amdgpu_device *adev, bool skip_vram_check,
+		     bool vram_lost, struct amdgpu_job *job);
+void amdgpu_coredump_init(struct amdgpu_device *adev);
+void amdgpu_coredump_fini(struct amdgpu_device *adev);
+#endif

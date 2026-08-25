@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config COMMON_CLK_PIC32
+	def_bool COMMON_CLK && MACH_PIC32
+
+config MCHP_CLK_MPFS
+	bool "Clk driver for PolarFire SoC"
+	depends on ARCH_MICROCHIP || COMPILE_TEST
+	default y
+	depends on MFD_SYSCON
+	select AUXILIARY_BUS
+	select REGMAP_MMIO
+	help
+	  Supports Clock Configuration for PolarFire SoC

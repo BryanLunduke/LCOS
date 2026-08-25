@@ -1,0 +1,723 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include "cgroup.h"
+#include "counts.h"
+#include "cputopo.h"
+#include "evsel.h"
+#include "pmu.h"
+#include "print-events.h"
+#include "smt.h"
+#include "stat.h"
+#include "time-utils.h"
+#include "tool_pmu.h"
+#include "tsc.h"
+#include <api/fs/fs.h>
+#include <api/io.h>
+#include <internal/threadmap.h>
+#include <perf/threadmap.h>
+#include <fcntl.h>
+#include <strings.h>
+
+#define INVALID_START_TIME ~0ULL
+
+static const char *const tool_pmu__event_names[TOOL_PMU__EVENT_MAX] = {
+	NULL,
+	"duration_time",
+	"user_time",
+	"system_time",
+	"has_pmem",
+	"num_cores",
+	"num_cpus",
+	"num_cpus_online",
+	"num_dies",
+	"num_packages",
+	"slots",
+	"smt_on",
+	"system_tsc_freq",
+	"core_wide",
+	"target_cpu",
+};
+
+bool tool_pmu__skip_event(const char *name __maybe_unused)
+{
+#if !defined(__aarch64__)
+	/* The slots event should only appear on arm64. */
+	if (strcasecmp(name, "slots") == 0)
+		return true;
+#endif
+#if !defined(__i386__) && !defined(__x86_64__)
+	/* The system_tsc_freq event should only appear on x86. */
+	if (strcasecmp(name, "system_tsc_freq") == 0)
+		return true;
+#endif
+	return false;
+}
+
+int tool_pmu__num_skip_events(void)
+{
+	int num = 0;
+
+#if !defined(__aarch64__)
+	num++;
+#endif
+#if !defined(__i386__) && !defined(__x86_64__)
+	num++;
+#endif
+	return num;
+}
+
+const char *tool_pmu__event_to_str(enum tool_pmu_event ev)
+{
+	if ((ev > TOOL_PMU__EVENT_NONE && ev < TOOL_PMU__EVENT_MAX) &&
+	    !tool_pmu__skip_event(tool_pmu__event_names[ev]))
+		return tool_pmu__event_names[ev];
+
+	return NULL;
+}
+
+enum tool_pmu_event tool_pmu__str_to_event(const char *str)
+{
+	int i;
+
+	if (tool_pmu__skip_event(str))
+		return TOOL_PMU__EVENT_NONE;
+
+	tool_pmu__for_each_event(i) {
+		if (!strcasecmp(str, tool_pmu__event_names[i]))
+			return i;
+	}
+	return TOOL_PMU__EVENT_NONE;
+}
+
+bool perf_pmu__is_tool(const struct perf_pmu *pmu)
+{
+	return pmu && pmu->type == PERF_PMU_TYPE_TOOL;
+}
+
+bool evsel__is_tool(const struct evsel *evsel)
+{
+	return perf_pmu__is_tool(evsel->pmu);
+}
+
+enum tool_pmu_event evsel__tool_event(const struct evsel *evsel)
+{
+	if (!evsel__is_tool(evsel))
+		return TOOL_PMU__EVENT_NONE;
+
+	return (enum tool_pmu_event)evsel->core.attr.config;
+}
+
+const char *evsel__tool_pmu_event_name(const struct evsel *evsel)
+{
+	return tool_pmu__event_to_str(evsel->core.attr.config);
+}
+
+static bool read_until_char(struct io *io, char e)
+{
+	int c;
+
+	do {
+		c = io__get_char(io);
+		if (c == -1)
+			return false;
+	} while (c != e);
+	return true;
+}
+
+static int read_stat_field(int fd, struct perf_cpu cpu, int field, __u64 *val)
+{
+	char buf[256];
+	struct io io;
+	int i;
+
+	io__init(&io, fd, buf, sizeof(buf));
+
+	/* Skip lines to relevant CPU. */
+	for (i = -1; i < cpu.cpu; i++) {
+		if (!read_until_char(&io, '\n'))
+			return -EINVAL;
+	}
+	/* Skip to "cpu". */
+	if (io__get_char(&io) != 'c') return -EINVAL;
+	if (io__get_char(&io) != 'p') return -EINVAL;
+	if (io__get_char(&io) != 'u') return -EINVAL;
+
+	/* Skip N of cpuN. */
+	if (!read_until_char(&io, ' '))
+		return -EINVAL;
+
+	i = 1;
+	while (true) {
+		if (io__get_dec(&io, val) != ' ')
+			break;
+		if (field == i)
+			return 0;
+		i++;
+	}
+	return -EINVAL;
+}
+
+static int read_pid_stat_field(int fd, int field, __u64 *val)
+{
+	char buf[256];
+	struct io io;
+	int c, i;
+
+	io__init(&io, fd, buf, sizeof(buf));
+	if (io__get_dec(&io, val) != ' ')
+		return -EINVAL;
+	if (field == 1)
+		return 0;
+
+	/* Skip comm. */
+	if (io__get_char(&io) != '(' || !read_until_char(&io, ')'))
+		return -EINVAL;
+	if (field == 2)
+		return -EINVAL; /* String can't be returned. */
+
+	/* Skip state */
+	if (io__get_char(&io) != ' ' || io__get_char(&io) == -1)
+		return -EINVAL;
+	if (field == 3)
+		return -EINVAL; /* String can't be returned. */
+
+	/* Loop over numeric fields*/
+	if (io__get_char(&io) != ' ')
+		return -EINVAL;
+
+	i = 4;
+	while (true) {
+		c = io__get_dec(&io, val);
+		if (c == -1)
+			return -EINVAL;
+		if (c == -2) {
+			/* Assume a -ve was read */
+			c = io__get_dec(&io, val);
+			*val *= -1;
+		}
+		if (c != ' ')
+			return -EINVAL;
+		if (field == i)
+			return 0;
+		i++;
+	}
+	return -EINVAL;
+}
+
+int evsel__tool_pmu_prepare_open(struct evsel *evsel,
+				 struct perf_cpu_map *cpus,
+				 int nthreads)
+{
+	enum tool_pmu_event ev = evsel__tool_event(evsel);
+
+	if (ev == TOOL_PMU__EVENT_SYSTEM_TIME || ev == TOOL_PMU__EVENT_USER_TIME) {
+		if (!evsel->process_time.start_times) {
+			evsel->process_time.start_times =
+				xyarray__new(perf_cpu_map__nr(cpus), nthreads, sizeof(__u64));
+			if (!evsel->process_time.start_times)
+				return -ENOMEM;
+		}
+		if (!evsel->process_time.accumulated_times) {
+			evsel->process_time.accumulated_times =
+				xyarray__new(perf_cpu_map__nr(cpus), nthreads, sizeof(__u64));
+			if (!evsel->process_time.accumulated_times)
+				return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
+#define FD(e, x, y) (*(int *)xyarray__entry(e->core.fd, x, y))
+
+static int tool_pmu__read_stat(struct evsel *evsel, int cpu_map_idx, int thread, __u64 *val)
+{
+	enum tool_pmu_event ev = evsel__tool_event(evsel);
+	bool system = ev == TOOL_PMU__EVENT_SYSTEM_TIME;
+	int fd = FD(evsel, cpu_map_idx, thread);
+	int err = 0;
+
+	if (fd < 0) {
+		*val = 0;
+		return 0;
+	}
+
+	lseek(fd, 0, SEEK_SET);
+	if (evsel->pid_stat) {
+		if (cpu_map_idx == 0)
+			err = read_pid_stat_field(fd, system ? 15 : 14, val);
+		else
+			*val = 0;
+	} else {
+		if (thread == 0) {
+			struct perf_cpu cpu = perf_cpu_map__cpu(evsel->core.cpus, cpu_map_idx);
+
+			err = read_stat_field(fd, cpu, system ? 3 : 1, val);
+		} else {
+			*val = 0;
+		}
+	}
+	return err;
+}
+
+int evsel__tool_pmu_open(struct evsel *evsel,
+			 struct perf_thread_map *threads,
+			 int start_cpu_map_idx, int end_cpu_map_idx)
+{
+	enum tool_pmu_event ev = evsel__tool_event(evsel);
+	int pid = -1, idx = 0, thread = 0, nthreads, err = 0, old_errno;
+
+	if (ev == TOOL_PMU__EVENT_NUM_CPUS)
+		return 0;
+
+	if (ev == TOOL_PMU__EVENT_DURATION_TIME) {
+		if (evsel->core.attr.sample_period) /* no sampling */
+			return -EINVAL;
+		evsel->duration_time.accumulated_time = 0;
+		if (evsel->core.attr.disabled) {
+			evsel->disabled = true;
+			evsel->duration_time.start_time = INVALID_START_TIME;
+		} else {
+			evsel->disabled = false;
+			evsel->duration_time.start_time = rdclock();
+		}
+		return 0;
+	}
+
+	if (evsel->cgrp)
+		pid = evsel->cgrp->fd;
+
+	nthreads = perf_thread_map__nr(threads);
+	for (idx = start_cpu_map_idx; idx < end_cpu_map_idx; idx++) {
+		for (thread = 0; thread < nthreads; thread++) {
+			if (!evsel->cgrp && !evsel->core.system_wide)
+				pid = perf_thread_map__pid(threads, thread);
+
+			if (ev == TOOL_PMU__EVENT_USER_TIME || ev == TOOL_PMU__EVENT_SYSTEM_TIME) {
+				__u64 *start_time = NULL;
+				__u64 *accumulated_time = NULL;
+				int fd;
+
+				if (evsel->core.attr.sample_period) {
+					/* no sampling */
+					err = -EINVAL;
+					goto out_close;
+				}
+				if (pid > -1) {
+					char buf[64];
+
+					snprintf(buf, sizeof(buf), "/proc/%d/stat", pid);
+					fd = open(buf, O_RDONLY);
+					evsel->pid_stat = true;
+				} else {
+					fd = open("/proc/stat", O_RDONLY);
+				}
+				FD(evsel, idx, thread) = fd;
+				if (fd < 0) {
+					err = -errno;
+					goto out_close;
+				}
+				start_time = xyarray__entry(evsel->process_time.start_times, idx,
+							    thread);
+				accumulated_time = xyarray__entry(
+					evsel->process_time.accumulated_times, idx, thread);
+				*accumulated_time = 0;
+
+				if (evsel->core.attr.disabled) {
+					evsel->disabled = true;
+					*start_time = INVALID_START_TIME;
+				} else {
+					evsel->disabled = false;
+					err = tool_pmu__read_stat(evsel, idx, thread, start_time);
+					if (err) {
+						close(fd);
+						FD(evsel, idx, thread) = -1;
+						goto out_close;
+					}
+				}
+			}
+		}
+	}
+	return 0;
+out_close:
+	if (err)
+		threads->err_thread = thread;
+
+	old_errno = errno;
+	do {
+		while (--thread >= 0) {
+			if (FD(evsel, idx, thread) >= 0)
+				close(FD(evsel, idx, thread));
+			FD(evsel, idx, thread) = -1;
+		}
+		thread = nthreads;
+	} while (--idx >= 0);
+	errno = old_errno;
+	return err;
+}
+
+#if !defined(__i386__) && !defined(__x86_64__)
+u64 arch_get_tsc_freq(void)
+{
+	return 0;
+}
+#endif
+
+#if !defined(__aarch64__)
+u64 tool_pmu__cpu_slots_per_cycle(void)
+{
+	return 0;
+}
+#endif
+
+static bool has_pmem(void)
+{
+	static bool has_pmem, cached;
+	const char *sysfs = sysfs__mountpoint();
+	char path[PATH_MAX];
+
+	if (!cached) {
+		snprintf(path, sizeof(path), "%s/firmware/acpi/tables/NFIT", sysfs);
+		has_pmem = access(path, F_OK) == 0;
+		cached = true;
+	}
+	return has_pmem;
+}
+
+bool tool_pmu__read_event(enum tool_pmu_event ev,
+			  struct evsel *evsel,
+			  bool system_wide,
+			  const char *user_requested_cpu_list,
+			  u64 *result)
+{
+	const struct cpu_topology *topology;
+
+	switch (ev) {
+	case TOOL_PMU__EVENT_HAS_PMEM:
+		*result = has_pmem() ? 1 : 0;
+		return true;
+
+	case TOOL_PMU__EVENT_NUM_CORES:
+		topology = online_topology();
+		*result = topology->core_cpus_lists;
+		return true;
+
+	case TOOL_PMU__EVENT_NUM_CPUS:
+		if (!evsel || perf_cpu_map__is_empty(evsel->core.cpus)) {
+			/* No evsel to be specific to. */
+			*result = cpu__max_present_cpu().cpu;
+		} else if (!perf_cpu_map__has_any_cpu(evsel->core.cpus)) {
+			/* Evsel just has specific CPUs. */
+			*result = perf_cpu_map__nr(evsel->core.cpus);
+		} else {
+			/*
+			 * "Any CPU" event that can be scheduled on any CPU in
+			 * the PMU's cpumask. The PMU cpumask should be saved in
+			 * pmu_cpus. If not present fall back to max.
+			 */
+			if (!perf_cpu_map__is_empty(evsel->core.pmu_cpus))
+				*result = perf_cpu_map__nr(evsel->core.pmu_cpus);
+			else
+				*result = cpu__max_present_cpu().cpu;
+		}
+		return true;
+
+	case TOOL_PMU__EVENT_NUM_CPUS_ONLINE: {
+		struct perf_cpu_map *online = cpu_map__online();
+
+		if (!online)
+			return false;
+
+		if (!evsel || perf_cpu_map__is_empty(evsel->core.cpus)) {
+			/* No evsel to be specific to. */
+			*result = perf_cpu_map__nr(online);
+		} else if (!perf_cpu_map__has_any_cpu(evsel->core.cpus)) {
+			/* Evsel just has specific CPUs. */
+			struct perf_cpu_map *tmp =
+				perf_cpu_map__intersect(online, evsel->core.cpus);
+
+			*result = perf_cpu_map__nr(tmp);
+			perf_cpu_map__put(tmp);
+		} else {
+			/*
+			 * "Any CPU" event that can be scheduled on any CPU in
+			 * the PMU's cpumask. The PMU cpumask should be saved in
+			 * pmu_cpus, if not present then just the online cpu
+			 * mask.
+			 */
+			if (!perf_cpu_map__is_empty(evsel->core.pmu_cpus)) {
+				struct perf_cpu_map *tmp =
+					perf_cpu_map__intersect(online, evsel->core.pmu_cpus);
+
+				*result = perf_cpu_map__nr(tmp);
+				perf_cpu_map__put(tmp);
+			} else {
+				*result = perf_cpu_map__nr(online);
+			}
+		}
+		perf_cpu_map__put(online);
+		return true;
+	}
+	case TOOL_PMU__EVENT_NUM_DIES:
+		topology = online_topology();
+		*result = topology->die_cpus_lists;
+		return true;
+
+	case TOOL_PMU__EVENT_NUM_PACKAGES:
+		topology = online_topology();
+		*result = topology->package_cpus_lists;
+		return true;
+
+	case TOOL_PMU__EVENT_SLOTS:
+		*result = tool_pmu__cpu_slots_per_cycle();
+		return *result ? true : false;
+
+	case TOOL_PMU__EVENT_SMT_ON:
+		*result = smt_on() ? 1 : 0;
+		return true;
+
+	case TOOL_PMU__EVENT_SYSTEM_TSC_FREQ:
+		*result = arch_get_tsc_freq();
+		return true;
+
+	case TOOL_PMU__EVENT_CORE_WIDE:
+		*result = core_wide(system_wide, user_requested_cpu_list) ? 1 : 0;
+		return true;
+
+	case TOOL_PMU__EVENT_TARGET_CPU:
+		*result = system_wide || (user_requested_cpu_list != NULL) ? 1 : 0;
+		return true;
+
+	case TOOL_PMU__EVENT_NONE:
+	case TOOL_PMU__EVENT_DURATION_TIME:
+	case TOOL_PMU__EVENT_USER_TIME:
+	case TOOL_PMU__EVENT_SYSTEM_TIME:
+	case TOOL_PMU__EVENT_MAX:
+	default:
+		return false;
+	}
+}
+
+static void perf_counts__update(struct perf_counts_values *count,
+				const struct perf_counts_values *old_count,
+				bool raw, u64 val)
+{
+	/*
+	 * The values of enabled and running must make a ratio of 100%. The
+	 * exact values don't matter as long as they are non-zero to avoid
+	 * issues with evsel__count_has_error.
+	 */
+	if (old_count) {
+		count->val = raw ? val : old_count->val + val;
+		count->run = old_count->run + 1;
+		count->ena = old_count->ena + 1;
+		count->lost = old_count->lost;
+	} else {
+		count->val = val;
+		count->run++;
+		count->ena++;
+		count->lost = 0;
+	}
+}
+int evsel__tool_pmu_enable_cpu(struct evsel *evsel, int cpu_map_idx)
+{
+	enum tool_pmu_event ev = evsel__tool_event(evsel);
+	int thread, nthreads;
+
+	if (!evsel->disabled)
+		return 0;
+
+	if (ev == TOOL_PMU__EVENT_DURATION_TIME) {
+		if (cpu_map_idx == 0)
+			evsel->duration_time.start_time = rdclock();
+		return 0;
+	}
+
+	if (ev == TOOL_PMU__EVENT_USER_TIME || ev == TOOL_PMU__EVENT_SYSTEM_TIME) {
+		nthreads = xyarray__max_y(evsel->process_time.start_times);
+		for (thread = 0; thread < nthreads; thread++) {
+			__u64 *start_time = xyarray__entry(evsel->process_time.start_times,
+							   cpu_map_idx, thread);
+			__u64 val;
+			int err;
+
+			err = tool_pmu__read_stat(evsel, cpu_map_idx, thread, &val);
+			if (!err)
+				*start_time = val;
+			else
+				*start_time = INVALID_START_TIME;
+		}
+	}
+	return 0;
+}
+
+int evsel__tool_pmu_enable(struct evsel *evsel)
+{
+	unsigned int idx;
+	int err = 0;
+
+	if (!evsel->disabled)
+		return 0;
+
+	for (idx = 0; idx < perf_cpu_map__nr(evsel->core.cpus); idx++) {
+		err = evsel__tool_pmu_enable_cpu(evsel, idx);
+		if (err)
+			break;
+	}
+	return err;
+}
+
+int evsel__tool_pmu_disable_cpu(struct evsel *evsel, int cpu_map_idx)
+{
+	enum tool_pmu_event ev = evsel__tool_event(evsel);
+	int thread, nthreads;
+
+	if (evsel->disabled)
+		return 0;
+
+	if (ev == TOOL_PMU__EVENT_DURATION_TIME) {
+		if (cpu_map_idx == 0) {
+			__u64 delta = rdclock() - evsel->duration_time.start_time;
+
+			evsel->duration_time.accumulated_time += delta;
+		}
+		return 0;
+	}
+
+	if (ev == TOOL_PMU__EVENT_USER_TIME || ev == TOOL_PMU__EVENT_SYSTEM_TIME) {
+		nthreads = xyarray__max_y(evsel->process_time.start_times);
+		for (thread = 0; thread < nthreads; thread++) {
+			__u64 *start_time = xyarray__entry(evsel->process_time.start_times,
+							   cpu_map_idx, thread);
+			__u64 *accumulated_time = xyarray__entry(
+				evsel->process_time.accumulated_times, cpu_map_idx, thread);
+			__u64 val;
+			int err;
+
+			err = tool_pmu__read_stat(evsel, cpu_map_idx, thread, &val);
+			if (!err) {
+				if (*start_time != INVALID_START_TIME && val >= *start_time)
+					*accumulated_time += (val - *start_time);
+			}
+			*start_time = INVALID_START_TIME;
+		}
+	}
+	return 0;
+}
+
+int evsel__tool_pmu_disable(struct evsel *evsel)
+{
+	unsigned int idx;
+	int err = 0;
+
+	if (evsel->disabled)
+		return 0;
+
+	for (idx = 0; idx < perf_cpu_map__nr(evsel->core.cpus); idx++) {
+		err = evsel__tool_pmu_disable_cpu(evsel, idx);
+		if (err)
+			break;
+	}
+	return err;
+}
+
+int evsel__tool_pmu_read(struct evsel *evsel, int cpu_map_idx, int thread)
+{
+	__u64 delta_start = 0;
+	int err = 0;
+	struct perf_counts_values *count, *old_count = NULL;
+	bool adjust = false;
+	enum tool_pmu_event ev = evsel__tool_event(evsel);
+
+	count = perf_counts(evsel->counts, cpu_map_idx, thread);
+	if (evsel->prev_raw_counts)
+		old_count = perf_counts(evsel->prev_raw_counts, cpu_map_idx, thread);
+
+	switch (ev) {
+	case TOOL_PMU__EVENT_HAS_PMEM:
+	case TOOL_PMU__EVENT_NUM_CORES:
+	case TOOL_PMU__EVENT_NUM_CPUS:
+	case TOOL_PMU__EVENT_NUM_CPUS_ONLINE:
+	case TOOL_PMU__EVENT_NUM_DIES:
+	case TOOL_PMU__EVENT_NUM_PACKAGES:
+	case TOOL_PMU__EVENT_SLOTS:
+	case TOOL_PMU__EVENT_SMT_ON:
+	case TOOL_PMU__EVENT_CORE_WIDE:
+	case TOOL_PMU__EVENT_TARGET_CPU:
+	case TOOL_PMU__EVENT_SYSTEM_TSC_FREQ: {
+		u64 val = 0;
+
+		if (cpu_map_idx == 0 && thread == 0) {
+			if (!tool_pmu__read_event(ev, evsel,
+						  stat_config.system_wide,
+						  stat_config.user_requested_cpu_list,
+						  &val)) {
+				count->lost++;
+				val = 0;
+			}
+		}
+		perf_counts__update(count, old_count, /*raw=*/false, val);
+		return 0;
+	}
+	case TOOL_PMU__EVENT_DURATION_TIME:
+		if (cpu_map_idx == 0 && thread == 0) {
+			delta_start = evsel->duration_time.accumulated_time;
+			if (!evsel->disabled &&
+			    evsel->duration_time.start_time != INVALID_START_TIME)
+				delta_start += (rdclock() - evsel->duration_time.start_time);
+		} else {
+			delta_start = 0;
+		}
+		break;
+	case TOOL_PMU__EVENT_USER_TIME:
+	case TOOL_PMU__EVENT_SYSTEM_TIME: {
+		__u64 accumulated = *(__u64 *)xyarray__entry(evsel->process_time.accumulated_times,
+							     cpu_map_idx, thread);
+
+		if (evsel->disabled) {
+			delta_start = accumulated;
+		} else {
+			__u64 *start_time = xyarray__entry(evsel->process_time.start_times,
+							   cpu_map_idx, thread);
+			__u64 cur_time;
+
+			err = tool_pmu__read_stat(evsel, cpu_map_idx, thread, &cur_time);
+			if (!err) {
+				if (*start_time != INVALID_START_TIME && cur_time >= *start_time)
+					delta_start = accumulated + (cur_time - *start_time);
+				else
+					delta_start = accumulated;
+			}
+		}
+		adjust = true;
+		break;
+	}
+	case TOOL_PMU__EVENT_NONE:
+	case TOOL_PMU__EVENT_MAX:
+	default:
+		err = -EINVAL;
+	}
+	if (err)
+		return err;
+
+	if (adjust) {
+		__u64 ticks_per_sec = sysconf(_SC_CLK_TCK);
+
+		delta_start *= 1e9 / ticks_per_sec;
+	}
+	perf_counts__update(count, old_count, /*raw=*/true, delta_start);
+	return 0;
+}
+
+struct perf_pmu *tool_pmu__new(void)
+{
+	struct perf_pmu *tool = zalloc(sizeof(struct perf_pmu));
+
+	if (!tool)
+		return NULL;
+
+	if (perf_pmu__init(tool, PERF_PMU_TYPE_TOOL, "tool") != 0) {
+		perf_pmu__delete(tool);
+		return NULL;
+	}
+	tool->events_table = find_core_events_table("common", "common");
+	return tool;
+}

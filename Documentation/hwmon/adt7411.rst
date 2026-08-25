@@ -1,0 +1,75 @@
+Kernel driver adt7411
+=====================
+
+Supported chips:
+
+  * Analog Devices ADT7411
+
+    Prefix: 'adt7411'
+
+    Addresses scanned: 0x48, 0x4a, 0x4b
+
+    Datasheet: Publicly available at the Analog Devices website
+
+Author: Wolfram Sang (based on adt7470 by Darrick J. Wong)
+
+Description
+-----------
+
+This driver implements support for the Analog Devices ADT7411 chip. There may
+be other chips that implement this interface.
+
+The ADT7411 can use an I2C/SMBus compatible 2-wire interface or an
+SPI-compatible 4-wire interface. It provides a 10-bit analog to digital
+converter which measures 1 temperature, vdd and 8 input voltages. It has an
+internal temperature sensor, but an external one can also be connected (one
+loses 2 inputs then). There are high- and low-limit registers for all inputs.
+
+Check the datasheet for details.
+
+sysfs-Interface
+---------------
+
+================    =================================
+in0_input           vdd voltage input
+in0_min             vdd low limit
+in0_max             vdd high limit
+in0_alarm           vdd alarm
+in[1-8]_input       analog 1-8 input
+in[1-8]_min         analog input low limit
+in[1-8]_max         analog input high limit
+in[1-8]_alarm       analog input alarm
+temp1_input         internal temperature input
+temp1_min           internal temperature low limit
+temp1_max           internal temperature high limit
+temp1_min_alarm     internal temperature low alarm
+temp1_max_alarm     internal temperature high alarm
+================    =================================
+
+If the external temperature sensor is enabled, the following attributes are
+also available:
+
+================ ================================================
+temp2_input      external temperature input
+temp2_min        external temperature low limit
+temp2_max        external temperature high limit
+temp2_min_alarm  external temperature low alarm
+temp2_max_alarm  external temperature high alarm
+temp2_fault      external temperature sensor fault
+================ ================================================
+
+If the external temperature sensor is enabled, analog inputs in1 and in2 are
+not available.
+
+Besides standard interfaces, this driver adds (0 = off, 1 = on):
+
+  ============== =======================================================
+  adc_ref_vdd	 Use vdd as reference instead of 2.25 V
+  fast_sampling	 Sample at 22.5 kHz instead of 1.4 kHz, but drop filters
+  no_average	 Turn off averaging over 16 samples
+  ============== =======================================================
+
+Notes
+-----
+
+SPI is not supported yet.

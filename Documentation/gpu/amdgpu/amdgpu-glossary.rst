@@ -1,0 +1,292 @@
+===============
+AMDGPU Glossary
+===============
+
+Here you can find some generic acronyms used in the amdgpu driver. Notice that
+we have a dedicated glossary for Display Core at
+'Documentation/gpu/amdgpu/display/dc-glossary.rst'.
+
+.. glossary::
+
+    active_cu_number
+      The number of CUs that are active on the system.  The number of active
+      CUs may be less than SE * SH * CU depending on the board configuration.
+
+    BACO
+      Bus Alive, Chip Off
+
+    BOCO
+      Bus Off, Chip Off
+
+    CE
+      Constant Engine
+
+    CIK
+      Sea Islands
+
+    CB
+      Color Buffer
+
+    CP
+      Command Processor
+
+    CPC
+      Command Processor Compute
+
+    CPF
+      Command Processor Fetch
+
+    CPG
+      Command Processor Graphics
+
+    CPLIB
+      Content Protection Library
+
+    CS
+      Command Submission
+
+    CSB
+      Clear State Indirect Buffer
+
+    CU
+      Compute Unit
+
+    DB
+      Depth Buffer
+
+    DFS
+      Digital Frequency Synthesizer
+
+    ECP
+      Enhanced Content Protection
+
+    EOP
+      End Of Pipe/Pipeline
+
+    FLR
+      Function Level Reset
+
+    GART
+      Graphics Address Remapping Table.  This is the name we use for the GPUVM
+      page table used by the GPU kernel driver.  It remaps system resources
+      (memory or MMIO space) into the GPU's address space so the GPU can access
+      them.  The name GART harkens back to the days of AGP when the platform
+      provided an MMU that the GPU could use to get a contiguous view of
+      scattered pages for DMA.  The MMU has since moved on to the GPU, but the
+      name stuck.
+
+    GC
+      Graphics and Compute
+
+    GDS
+      Global Data Share
+
+    GE
+      Geometry Engine
+
+    GMC
+      Graphic Memory Controller
+
+    GPR
+      General Purpose Register
+
+    GPUVM
+      GPU Virtual Memory.  This is the GPU's MMU.  The GPU supports multiple
+      virtual address spaces that can be in flight at any given time.  These
+      allow the GPU to remap VRAM and system resources into GPU virtual address
+      spaces for use by the GPU kernel driver and applications using the GPU.
+      These provide memory protection for different applications using the GPU.
+
+    GTT
+      Graphics Translation Tables.  This is a memory pool managed through TTM
+      which provides access to system resources (memory or MMIO space) for
+      use by the GPU. These addresses can be mapped into the "GART" GPUVM page
+      table for use by the kernel driver or into per process GPUVM page tables
+      for application usage.
+
+    GWS
+      Global Wave Sync
+
+    IH
+      Interrupt Handler
+
+    IV
+      Interrupt Vector
+
+    HQD
+      Hardware Queue Descriptor
+
+    IB
+      Indirect Buffer
+
+    IMU
+      Integrated Management Unit (Power Management support)
+
+    IP
+        Intellectual Property blocks
+
+    KCQ
+      Kernel Compute Queue
+
+    KFD
+      Kernel Fusion Driver
+
+    KGQ
+      Kernel Graphics Queue
+
+    KIQ
+      Kernel Interface Queue
+
+    MC
+      Memory Controller
+
+    MCBP
+      Mid Command Buffer Preemption
+
+    ME
+      MicroEngine (Graphics)
+
+    MEC
+      MicroEngine Compute
+
+    MES
+      MicroEngine Scheduler
+
+    MMHUB
+      Multi-Media HUB
+
+    MQD
+      Memory Queue Descriptor
+
+    PA
+      Primitive Assembler / Physical Address
+
+    PDE
+      Page Directory Entry
+
+    PFP
+      Pre-Fetch Parser (Graphics)
+
+    PPLib
+      PowerPlay Library - PowerPlay is the power management component.
+
+    PRT
+      Partially Resident Texture (also known as sparse residency)
+
+    PSP
+        Platform Security Processor
+
+    PTE
+      Page Table Entry
+
+    RB
+      Render Backends. Some people called it ROPs.
+
+    RLC
+      RunList Controller. This name is a remnant of past ages and doesn't have
+      much meaning today. It's a group of general-purpose helper engines for
+      the GFX block. It's involved in GFX power management and SR-IOV, among
+      other things.
+
+    SC
+      Scan Converter
+
+    SDMA
+      System DMA
+
+    SE
+      Shader Engine
+
+    SGPR
+      Scalar General-Purpose Registers
+
+    SH
+      SHader array
+
+    SI
+      Southern Islands
+
+    SMU/SMC
+      System Management Unit / System Management Controller
+
+    SPI (AMDGPU)
+      Shader Processor Input
+
+    SRLC
+      Save/Restore List Control
+
+    SRLG
+      Save/Restore List GPM_MEM
+
+    SRLS
+      Save/Restore List SRM_MEM
+
+    SS
+      Spread Spectrum
+
+    SX
+      Shader Export
+
+    TA
+      Trusted Application
+
+    TC
+      Texture Cache
+
+    TCC
+      Texture Cache per Channel - L2 cache attached to the memory channels.
+      May be used when shader cores are accessing memory.
+      Despite "Texture" in the name, this is used by any kind of memory access.
+      TCCs may be mapped to TCPs, depending on the architecture.
+
+    TCP (AMDGPU)
+      Texture Cache per Pipe - L1 cache attached to each CU.
+      Even though the name "Texture" is part of this
+      acronym, the TCP represents the path to memory shaders; i.e., it is not
+      related to texture. The name is a leftover from older designs where shader
+      stages had different cache designs; it refers to the L1 cache in older
+      architectures.
+
+    TMR
+      Trusted Memory Region
+
+    TMZ
+      Trusted Memory Zone
+
+    TOC
+      Table of Contents
+
+    UMC
+      Unified Memory Controller
+
+    UMSCH
+      User Mode Scheduler
+
+    UTC (AMDGPU)
+      Unified Translation Cache. UTC is equivalent to TLB. You might see a
+      variation of this acronym with L at the end, i.e., UTCL followed by a
+      number; L means the cache level (e.g., UTCL1 and UTCL2).
+
+    UVD
+      Unified Video Decoder
+
+    VCE
+      Video Compression Engine
+
+    VCN
+      Video Codec Next
+
+    VGPR
+      Vector General-Purpose Registers
+
+    VMID
+      Virtual Memory ID
+
+    VPE
+      Video Processing Engine
+
+    XCC
+      Accelerator Core Complex
+
+    XCP
+      Accelerator Core Partition

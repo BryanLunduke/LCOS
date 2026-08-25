@@ -1,0 +1,210 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright 2023 Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: AMD
+ *
+ */
+
+#include "amdgpu_dm_replay.h"
+#include "dc_dmub_srv.h"
+#include "dc.h"
+#include "amdgpu_dm.h"
+#include "modules/power/power_helpers.h"
+#include "dmub/inc/dmub_cmd.h"
+#include "dc/inc/link_service.h"
+#include "dm_helpers.h"
+
+
+/*
+ * amdgpu_dm_link_supports_replay() - check if the link supports replay
+ * @link: link
+ * @aconnector: aconnector
+ *
+ */
+bool amdgpu_dm_link_supports_replay(struct dc_link *link, struct amdgpu_dm_connector *aconnector)
+{
+	struct dm_connector_state *state = to_dm_connector_state(aconnector->base.state);
+	struct dpcd_caps *dpcd_caps = &link->dpcd_caps;
+	struct adaptive_sync_caps *as_caps = &link->dpcd_caps.adaptive_sync_caps;
+
+	if (!state->freesync_capable)
+		return false;
+
+	if (!aconnector->vsdb_info.replay_mode)
+		return false;
+
+	// Check the eDP version
+	if (dpcd_caps->edp_rev < EDP_REVISION_13)
+		return false;
+
+	if (!dpcd_caps->alpm_caps.bits.AUX_WAKE_ALPM_CAP)
+		return false;
+
+	// Check adaptive sync support cap
+	if (!as_caps->dp_adap_sync_caps.bits.ADAPTIVE_SYNC_SDP_SUPPORT)
+		return false;
+
+	// Sink shall populate line deviation information
+	if (dpcd_caps->pr_info.pixel_deviation_per_line == 0 ||
+		dpcd_caps->pr_info.max_deviation_line == 0)
+		return false;
+
+	return true;
+}
+EXPORT_IF_KUNIT(amdgpu_dm_link_supports_replay);
+
+/*
+ * amdgpu_dm_set_replay_caps() - setup Replay capabilities
+ * @link: link
+ * @aconnector: aconnector
+ *
+ */
+bool amdgpu_dm_set_replay_caps(struct dc_link *link, struct amdgpu_dm_connector *aconnector)
+{
+	struct replay_config pr_config = { 0 };
+	union replay_debug_flags *debug_flags = NULL;
+	struct dc *dc = link->ctx->dc;
+
+	// If Replay is already set to support, return true to skip checks
+	if (link->replay_settings.config.replay_supported)
+		return true;
+
+	if (!dc_is_embedded_signal(link->connector_signal))
+		return false;
+
+	if (link->panel_config.psr.disallow_replay)
+		return false;
+
+	if (!amdgpu_dm_link_supports_replay(link, aconnector))
+		return false;
+
+	if (!dc->ctx->dmub_srv || !dc->ctx->dmub_srv->dmub ||
+		!dc->ctx->dmub_srv->dmub->feature_caps.replay_supported)
+		return false;
+
+	/* Mark Replay is supported in link and update related attributes
+	 * This flag presents DPCD caps & amd_vsdb caps satisfy replay requirement.
+	 */
+	pr_config.replay_cap_support = true;
+
+	// Mark Replay is supported in pr_config
+	pr_config.replay_supported = true;
+
+	pr_config.replay_enable_option = pr_enable_option_general_ui |
+					 pr_enable_option_static_screen	|
+					 pr_enable_option_static_screen_coasting;
+	pr_config.replay_power_opt_supported = replay_power_opt_smu_opt_static_screen |
+					       replay_power_opt_z10_static_screen;
+	pr_config.replay_smu_opt_supported = false;
+	pr_config.replay_support_fast_resync_in_ultra_sleep_mode =
+		aconnector->max_vfreq >= 2 * aconnector->min_vfreq;
+	pr_config.force_disable_desync_error_check = false;
+
+	debug_flags = (union replay_debug_flags *)&pr_config.debug_flags;
+	debug_flags->u32All = 0;
+	debug_flags->bitfields.visual_confirm =	dc->debug.visual_confirm == VISUAL_CONFIRM_REPLAY;
+	debug_flags->bitfields.skip_crtc_disabled = dc->debug.replay_skip_crtc_disabled;
+
+	init_replay_config(link, &pr_config);
+
+	return true;
+}
+EXPORT_IF_KUNIT(amdgpu_dm_set_replay_caps);
+
+/*
+ * amdgpu_dm_link_setup_replay() - config replay settings
+ * @stream: pointer to dc_stream_state structure
+ * @vrr_params: pointer to mod_vrr_params structure containing VRR parameters
+ *
+ * config replay link settings including coasting vtotal calculations.
+ *
+ * Return: true if successful, false if any parameter is invalid or replay not supported
+ */
+bool amdgpu_dm_link_setup_replay(struct dc_stream_state *stream,
+		struct mod_vrr_params *vrr_params)
+{
+	struct dc_link *link;
+	unsigned int static_coasting_vtotal;
+
+	if (!stream || !stream->link || !vrr_params)
+		return false;
+
+	link = stream->link;
+	if (!link->replay_settings.config.replay_supported)
+		return false;
+
+	if (link->replay_settings.replay_feature_enabled)
+		return true;
+
+	calculate_replay_link_off_frame_count(link, stream->timing.v_total,
+			stream->timing.h_total);
+
+	static_coasting_vtotal = mod_freesync_calc_v_total_from_refresh(stream,
+			vrr_params->min_refresh_in_uhz);
+
+	set_replay_coasting_vtotal(link, PR_COASTING_TYPE_NOM,
+			stream->timing.v_total);
+	set_replay_coasting_vtotal(link, PR_COASTING_TYPE_STATIC,
+			static_coasting_vtotal);
+	return true;
+}
+EXPORT_IF_KUNIT(amdgpu_dm_link_setup_replay);
+
+/*
+ * amdgpu_dm_replay_set_event() - set or clear replay event for a stream
+ * @dm: pointer to amdgpu_display_manager
+ * @stream: pointer to dc_stream_state
+ * @set_event: true to set event, false to clear event
+ * @event: replay event type to set or clear
+ * @wait_for_disable: whether to wait for replay to be disabled before returning
+ *
+ * This function sets or clears a specific replay event for the given stream.
+ * It temporarily disables idle optimizations during the operation to ensure
+ * hardware access is available.
+ *
+ * Return: true if successful, false if any parameter is invalid or operation fails
+ */
+bool amdgpu_dm_replay_set_event(struct amdgpu_display_manager *dm,
+		struct dc_stream_state *stream,
+		bool set_event,
+		enum replay_event event,
+		bool wait_for_disable)
+{
+	unsigned int replay_events;
+
+	/* Validate all required parameters */
+	if (!stream || !stream->link ||
+		!stream->link->replay_settings.replay_feature_enabled)
+		return false;
+
+	/* Get current replay events */
+	if (!mod_power_get_replay_event(dm->power_module, stream, &replay_events))
+		return false;
+
+	/* If all events already in desired state, return true. */
+	if ((replay_events & event) == (set_event ? event : 0))
+		return true;
+
+	return mod_power_set_replay_event(dm->power_module, stream,
+					 set_event, event, wait_for_disable);
+}
+EXPORT_IF_KUNIT(amdgpu_dm_replay_set_event);

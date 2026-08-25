@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: GPL-2.0
+#include <linux/ftrace.h>
+#include <linux/tracepoint.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/rv.h>
+#include <rv/instrumentation.h>
+
+#define MODULE_NAME "%%MODEL_NAME%%"
+
+/*
+ * XXX: include required tracepoint headers, e.g.,
+ * #include <trace/events/sched.h>
+ */
+#include <rv_trace.h>
+%%INCLUDE_PARENT%%
+/*
+ * This is the self-generated part of the monitor. Generally, there is no need
+ * to touch this section.
+ */
+#define RV_MON_TYPE RV_MON_%%MONITOR_TYPE%%
+#include "%%MODEL_NAME%%.h"
+#include <rv/%%MONITOR_CLASS%%_monitor.h>
+
+/*
+ * This is the instrumentation part of the monitor.
+ *
+ * This is the section where manual work is required. Here the kernel events
+ * are translated into model's event.
+ *
+ */
+%%TRACEPOINT_HANDLERS_SKEL%%
+static int enable_%%MODEL_NAME%%(void)
+{
+	int retval;
+
+	retval = %%MONITOR_CLASS%%_monitor_init();
+	if (retval)
+		return retval;
+
+%%TRACEPOINT_ATTACH%%
+
+	return 0;
+}
+
+static void disable_%%MODEL_NAME%%(void)
+{
+	rv_this.enabled = 0;
+
+%%TRACEPOINT_DETACH%%
+
+	%%MONITOR_CLASS%%_monitor_destroy();
+}
+
+/*
+ * This is the monitor register section.
+ */
+static struct rv_monitor rv_this = {
+	.name = "%%MODEL_NAME%%",
+	.description = "%%DESCRIPTION%%",
+	.enable = enable_%%MODEL_NAME%%,
+	.disable = disable_%%MODEL_NAME%%,
+	.reset = da_monitor_reset_all,
+	.enabled = 0,
+};
+
+static int __init register_%%MODEL_NAME%%(void)
+{
+	return rv_register_monitor(&rv_this, %%PARENT%%);
+}
+
+static void __exit unregister_%%MODEL_NAME%%(void)
+{
+	rv_unregister_monitor(&rv_this);
+}
+
+module_init(register_%%MODEL_NAME%%);
+module_exit(unregister_%%MODEL_NAME%%);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("rvgen: auto-generated");
+MODULE_DESCRIPTION("%%MODEL_NAME%%: %%DESCRIPTION%%");

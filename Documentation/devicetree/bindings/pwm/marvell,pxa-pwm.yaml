@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pwm/marvell,pxa-pwm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Marvell PXA PWM
+
+maintainers:
+  - Duje Mihanović <duje.mihanovic@skole.hr>
+
+allOf:
+  - $ref: pwm.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - spacemit,k1-pwm
+              - spacemit,k3-pwm
+    then:
+      properties:
+        "#pwm-cells":
+          const: 3
+    else:
+      properties:
+        "#pwm-cells":
+          const: 1
+          description: |
+            Used for specifying the period length in nanoseconds.
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - spacemit,k3-pwm
+    then:
+      required:
+        - clock-names
+      properties:
+        clocks:
+          minItems: 2
+        clock-names:
+          minItems: 2
+    else:
+      properties:
+        clocks:
+          maxItems: 1
+        clock-names:
+          maxItems: 1
+
+properties:
+  compatible:
+    oneOf:
+      - enum:
+          - marvell,pxa250-pwm
+          - marvell,pxa270-pwm
+          - marvell,pxa168-pwm
+          - marvell,pxa910-pwm
+      - items:
+          - enum:
+              - spacemit,k1-pwm
+              - spacemit,k3-pwm
+          - const: marvell,pxa910-pwm
+
+  reg:
+    # Length should be 0x10
+    maxItems: 1
+
+  "#pwm-cells":
+    description: Number of cells in a pwm specifier.
+
+  clocks:
+    minItems: 1
+    items:
+      - description: The function clock
+      - description: An optional bus clock
+
+  clock-names:
+    minItems: 1
+    maxItems: 2
+    oneOf:
+      - items:
+          - const: func
+          - const: bus
+
+  resets:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - clocks
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/pxa-clock.h>
+
+    pwm0: pwm@40b00000 {
+      compatible = "marvell,pxa250-pwm";
+      reg = <0x40b00000 0x10>;
+      #pwm-cells = <1>;
+      clocks = <&clks CLK_PWM0>;
+    };

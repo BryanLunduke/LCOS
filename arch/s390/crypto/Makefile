@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Cryptographic API
+#
+
+obj-$(CONFIG_CRYPTO_AES_S390) += aes_s390.o
+obj-$(CONFIG_CRYPTO_PAES_S390) += paes_s390.o
+obj-$(CONFIG_S390_PRNG) += prng.o
+obj-$(CONFIG_CRYPTO_HMAC_S390) += hmac_s390.o
+obj-$(CONFIG_CRYPTO_PHMAC_S390) += phmac_s390.o
+obj-y += arch_random.o

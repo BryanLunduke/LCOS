@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/*
+ * As a loose attempt to separate RP1 customizations from SoC peripherals
+ * definitioni, this file is intended to host the override nodes for the RP1
+ * peripherals, e.g. to declare the phy of the ethernet interface or custom
+ * pin setup.
+ * All other nodes that do not have anything to do with RP1 should be added
+ * to the included bcm2712-rpi-5-b-base.dtsi instead.
+ */
+
+/dts-v1/;
+
+#include "bcm2712-rpi-5-b-base.dtsi"
+
+/ {
+	aliases {
+		ethernet0 = &rp1_eth;
+	};
+};
+
+&pcie2 {
+	pci@0,0 {
+		reg = <0x0 0x0 0x0 0x0 0x0>;
+		ranges;
+		bus-range = <0 1>;
+		device_type = "pci";
+		#address-cells = <3>;
+		#size-cells = <2>;
+
+		dev@0,0 {
+			compatible = "pci1de4,1";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			ranges = <0x1 0x0 0x0 0x82010000 0x0 0x0 0x0 0x400000>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+
+			#include "rp1-common.dtsi"
+		};
+	};
+};
+
+&rp1_eth {
+	assigned-clocks = <&rp1_clocks RP1_CLK_ETH_TSU>,
+			  <&rp1_clocks RP1_CLK_ETH>;
+	assigned-clock-rates = <50000000>,
+			       <125000000>;
+	status = "okay";
+	phy-mode = "rgmii-id";
+	phy-handle = <&phy1>;
+
+	mdio {
+		reg = <0x1>;
+		reset-gpios = <&rp1_gpio 32 GPIO_ACTIVE_LOW>;
+		reset-delay-us = <5000>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		phy1: ethernet-phy@1 {
+			reg = <0x1>;
+		};
+	};
+};
+
+&rp1_gpio {
+	usb_vbus_default_state: usb-vbus-default-state {
+		function = "vbus1";
+		groups = "vbus1";
+	};
+
+	rp1_i2c4_default_state: rp1-i2c4-default-state {
+		function = "i2c4";
+		groups = "i2c4_2";
+		drive-strength = <12>;
+		bias-pull-up;
+	};
+
+	rp1_i2c6_default_state: rp1-i2c6-default-state {
+		function = "i2c6";
+		groups = "i2c6_0";
+		drive-strength = <12>;
+		bias-pull-up;
+	};
+};
+
+&rp1_i2c4 {
+	pinctrl-0 = <&rp1_i2c4_default_state>;
+	pinctrl-names = "default";
+};
+
+&rp1_i2c6 {
+	pinctrl-0 = <&rp1_i2c6_default_state>;
+	pinctrl-names = "default";
+};
+
+&rp1_usb0 {
+	pinctrl-0 = <&usb_vbus_default_state>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&rp1_usb1 {
+	status = "okay";
+};

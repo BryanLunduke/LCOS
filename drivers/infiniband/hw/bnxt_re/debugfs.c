@@ -1,0 +1,519 @@
+// SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+/*
+ * Copyright (c) 2024, Broadcom. All rights reserved.  The term
+ * Broadcom refers to Broadcom Limited and/or its subsidiaries.
+ *
+ * Description: Debugfs component of the bnxt_re driver
+ */
+
+#include <linux/debugfs.h>
+#include <linux/pci.h>
+#include <linux/seq_file.h>
+#include <rdma/ib_addr.h>
+#include <linux/bnxt/ulp.h>
+
+#include "roce_hsi.h"
+#include "qplib_res.h"
+#include "qplib_sp.h"
+#include "qplib_fp.h"
+#include "qplib_rcfw.h"
+#include "bnxt_re.h"
+#include "ib_verbs.h"
+#include "debugfs.h"
+
+static struct dentry *bnxt_re_debugfs_root;
+
+static const char * const bnxt_re_cq_coal_str[] = {
+	"buf_maxtime",
+	"normal_maxbuf",
+	"during_maxbuf",
+	"en_ring_idle_mode",
+	"enable",
+};
+
+static const char * const bnxt_re_cc_gen0_name[] = {
+	"enable_cc",
+	"run_avg_weight_g",
+	"num_phase_per_state",
+	"init_cr",
+	"init_tr",
+	"tos_ecn",
+	"tos_dscp",
+	"alt_vlan_pcp",
+	"alt_vlan_dscp",
+	"rtt",
+	"cc_mode",
+	"tcp_cp",
+	"tx_queue",
+	"inactivity_cp",
+};
+
+static inline const char *bnxt_re_qp_state_str(u8 state)
+{
+	switch (state) {
+	case CMDQ_MODIFY_QP_NEW_STATE_RESET:
+		return "RST";
+	case CMDQ_MODIFY_QP_NEW_STATE_INIT:
+		return "INIT";
+	case CMDQ_MODIFY_QP_NEW_STATE_RTR:
+		return "RTR";
+	case CMDQ_MODIFY_QP_NEW_STATE_RTS:
+		return "RTS";
+	case CMDQ_MODIFY_QP_NEW_STATE_SQE:
+		return "SQER";
+	case CMDQ_MODIFY_QP_NEW_STATE_SQD:
+		return "SQD";
+	case CMDQ_MODIFY_QP_NEW_STATE_ERR:
+		return "ERR";
+	default:
+		return "Invalid QP state";
+	}
+}
+
+static inline const char *bnxt_re_qp_type_str(u8 type)
+{
+	switch (type) {
+	case CMDQ_CREATE_QP1_TYPE_GSI: return "QP1";
+	case CMDQ_CREATE_QP_TYPE_GSI: return "QP1";
+	case CMDQ_CREATE_QP_TYPE_RC: return "RC";
+	case CMDQ_CREATE_QP_TYPE_UD: return "UD";
+	case CMDQ_CREATE_QP_TYPE_RAW_ETHERTYPE: return "RAW_ETHERTYPE";
+	default: return "Invalid transport type";
+	}
+}
+
+static ssize_t qp_info_read(struct file *filep,
+			    char __user *buffer,
+			    size_t count, loff_t *ppos)
+{
+	struct bnxt_re_qp *qp = filep->private_data;
+	struct bnxt_qplib_qp *qplib_qp;
+	u32 rate_limit = 0;
+	char *buf;
+	int len;
+
+	if (*ppos)
+		return 0;
+
+	qplib_qp = &qp->qplib_qp;
+	if (qplib_qp->shaper_allocation_status)
+		rate_limit = qplib_qp->rate_limit;
+
+	buf = kasprintf(GFP_KERNEL,
+			"QPN\t\t: %d\n"
+			"transport\t: %s\n"
+			"state\t\t: %s\n"
+			"mtu\t\t: %d\n"
+			"timeout\t\t: %d\n"
+			"remote QPN\t: %d\n"
+			"shaper allocated : %d\n"
+			"rate limit\t: %d kbps\n",
+			qp->qplib_qp.id,
+			bnxt_re_qp_type_str(qp->qplib_qp.type),
+			bnxt_re_qp_state_str(qp->qplib_qp.state),
+			qp->qplib_qp.mtu,
+			qp->qplib_qp.timeout,
+			qp->qplib_qp.dest_qpn,
+			qplib_qp->shaper_allocation_status,
+			rate_limit);
+	if (!buf)
+		return -ENOMEM;
+	if (count < strlen(buf)) {
+		kfree(buf);
+		return -ENOSPC;
+	}
+	len = simple_read_from_buffer(buffer, count, ppos, buf, strlen(buf));
+	kfree(buf);
+	return len;
+}
+
+static const struct file_operations debugfs_qp_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = qp_info_read,
+};
+
+void bnxt_re_debug_add_qpinfo(struct bnxt_re_dev *rdev, struct bnxt_re_qp *qp)
+{
+	char resn[32];
+
+	sprintf(resn, "0x%x", qp->qplib_qp.id);
+	qp->dentry = debugfs_create_file(resn, 0400, rdev->qp_debugfs, qp, &debugfs_qp_fops);
+}
+
+void bnxt_re_debug_rem_qpinfo(struct bnxt_re_dev *rdev, struct bnxt_re_qp *qp)
+{
+	debugfs_remove(qp->dentry);
+}
+
+static int map_cc_config_offset_gen0_ext0(u32 offset, struct bnxt_qplib_cc_param *ccparam, u32 *val)
+{
+	u64 map_offset;
+
+	map_offset = BIT(offset);
+
+	switch (map_offset) {
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_ENABLE_CC:
+		*val = ccparam->enable;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_G:
+		*val = ccparam->g;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_NUMPHASEPERSTATE:
+		*val = ccparam->nph_per_state;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_INIT_CR:
+		*val = ccparam->init_cr;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_INIT_TR:
+		*val = ccparam->init_tr;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_TOS_ECN:
+		*val = ccparam->tos_ecn;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_TOS_DSCP:
+		*val =  ccparam->tos_dscp;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_ALT_VLAN_PCP:
+		*val = ccparam->alt_vlan_pcp;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_ALT_TOS_DSCP:
+		*val = ccparam->alt_tos_dscp;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_RTT:
+	       *val = ccparam->rtt;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_CC_MODE:
+		*val = ccparam->cc_mode;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_TCP_CP:
+		*val =  ccparam->tcp_cp;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_INACTIVITY_CP:
+		*val = ccparam->inact_th;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static ssize_t bnxt_re_cc_config_get(struct file *filp, char __user *buffer,
+				     size_t usr_buf_len, loff_t *ppos)
+{
+	struct bnxt_re_cc_param *dbg_cc_param = filp->private_data;
+	struct bnxt_re_dev *rdev = dbg_cc_param->rdev;
+	struct bnxt_qplib_cc_param ccparam = {};
+	u32 offset = dbg_cc_param->offset;
+	char buf[16];
+	u32 val;
+	int rc;
+
+	rc = bnxt_qplib_query_cc_param(&rdev->qplib_res, &ccparam);
+	if (rc)
+		return rc;
+
+	rc = map_cc_config_offset_gen0_ext0(offset, &ccparam, &val);
+	if (rc)
+		return rc;
+
+	rc = snprintf(buf, sizeof(buf), "%d\n", val);
+	if (rc < 0)
+		return rc;
+
+	return simple_read_from_buffer(buffer, usr_buf_len, ppos, (u8 *)(buf), rc);
+}
+
+static int bnxt_re_fill_gen0_ext0(struct bnxt_qplib_cc_param *ccparam, u32 offset, u32 val)
+{
+	u32 modify_mask;
+
+	modify_mask = BIT(offset);
+
+	switch (modify_mask) {
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_ENABLE_CC:
+		ccparam->enable = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_G:
+		ccparam->g = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_NUMPHASEPERSTATE:
+		ccparam->nph_per_state = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_INIT_CR:
+		ccparam->init_cr = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_INIT_TR:
+		ccparam->init_tr = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_TOS_ECN:
+		ccparam->tos_ecn = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_TOS_DSCP:
+		ccparam->tos_dscp = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_ALT_VLAN_PCP:
+		ccparam->alt_vlan_pcp = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_ALT_TOS_DSCP:
+		ccparam->alt_tos_dscp = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_RTT:
+		ccparam->rtt = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_CC_MODE:
+		ccparam->cc_mode = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_TCP_CP:
+		ccparam->tcp_cp = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_TX_QUEUE:
+		return -EOPNOTSUPP;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_INACTIVITY_CP:
+		ccparam->inact_th = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_TIME_PER_PHASE:
+		ccparam->time_pph = val;
+		break;
+	case CMDQ_MODIFY_ROCE_CC_MODIFY_MASK_PKTS_PER_PHASE:
+		ccparam->pkts_pph = val;
+		break;
+	}
+
+	ccparam->mask = modify_mask;
+	return 0;
+}
+
+static int bnxt_re_configure_cc(struct bnxt_re_dev *rdev, u32 gen_ext, u32 offset, u32 val)
+{
+	struct bnxt_qplib_cc_param ccparam = { };
+	int rc;
+
+	if (gen_ext != CC_CONFIG_GEN0_EXT0)
+		return -EOPNOTSUPP;
+
+	rc = bnxt_re_fill_gen0_ext0(&ccparam, offset, val);
+	if (rc)
+		return rc;
+
+	bnxt_qplib_modify_cc(&rdev->qplib_res, &ccparam);
+	return 0;
+}
+
+static ssize_t bnxt_re_cc_config_set(struct file *filp, const char __user *buffer,
+				     size_t count, loff_t *ppos)
+{
+	struct bnxt_re_cc_param *dbg_cc_param = filp->private_data;
+	struct bnxt_re_dev *rdev = dbg_cc_param->rdev;
+	u32 offset = dbg_cc_param->offset;
+	u8 cc_gen = dbg_cc_param->cc_gen;
+	u32 val;
+	int rc;
+
+	rc = kstrtou32_from_user(buffer, count, 0, &val);
+	if (!rc)
+		rc = bnxt_re_configure_cc(rdev, cc_gen, offset, val);
+	return rc ? rc : count;
+}
+
+static const struct file_operations bnxt_re_cc_config_ops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = bnxt_re_cc_config_get,
+	.write = bnxt_re_cc_config_set,
+};
+
+static int info_show(struct seq_file *m, void *unused)
+{
+	struct bnxt_re_dev *rdev = m->private;
+	struct bnxt_re_res_cntrs *res_s = &rdev->stats.res;
+
+	seq_puts(m, "Info:\n");
+	seq_printf(m, "Device Name\t\t: %s\n", dev_name(&rdev->ibdev.dev));
+	seq_printf(m, "PD Watermark\t\t: %llu\n", res_s->pd_watermark);
+	seq_printf(m, "AH Watermark\t\t: %llu\n", res_s->ah_watermark);
+	seq_printf(m, "QP Watermark\t\t: %llu\n", res_s->qp_watermark);
+	seq_printf(m, "RC QP Watermark\t\t: %llu\n", res_s->rc_qp_watermark);
+	seq_printf(m, "UD QP Watermark\t\t: %llu\n", res_s->ud_qp_watermark);
+	seq_printf(m, "SRQ Watermark\t\t: %llu\n", res_s->srq_watermark);
+	seq_printf(m, "CQ Watermark\t\t: %llu\n", res_s->cq_watermark);
+	seq_printf(m, "MR Watermark\t\t: %llu\n", res_s->mr_watermark);
+	seq_printf(m, "MW Watermark\t\t: %llu\n", res_s->mw_watermark);
+	seq_printf(m, "CQ Resize Count\t\t: %d\n", atomic_read(&res_s->resize_count));
+	if (rdev->pacing.dbr_pacing) {
+		seq_printf(m, "DB Pacing Reschedule\t: %llu\n", rdev->stats.pacing.resched);
+		seq_printf(m, "DB Pacing Complete\t: %llu\n", rdev->stats.pacing.complete);
+		seq_printf(m, "DB Pacing Alerts\t: %llu\n", rdev->stats.pacing.alerts);
+		seq_printf(m, "DB FIFO Register\t: 0x%x\n",
+			   readl(rdev->en_dev->bar0 + rdev->pacing.dbr_db_fifo_reg_off));
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(info);
+
+static void bnxt_re_debugfs_add_info(struct bnxt_re_dev *rdev)
+{
+	debugfs_create_file("info", 0400, rdev->dbg_root, rdev, &info_fops);
+}
+
+static ssize_t cq_coal_cfg_write(struct file *file,
+				 const char __user *buf,
+				 size_t count, loff_t *pos)
+{
+	struct seq_file *s = file->private_data;
+	struct bnxt_re_cq_coal_param *param = s->private;
+	struct bnxt_re_dev *rdev = param->rdev;
+	int ret, offset = param->offset;
+	u32 val;
+
+	ret = kstrtou32_from_user(buf, count, 0, &val);
+	if (ret)
+		return ret;
+
+	switch (offset) {
+	case BNXT_RE_COAL_CQ_BUF_MAXTIME:
+		if (val < 1 || val > BNXT_QPLIB_CQ_COAL_MAX_BUF_MAXTIME)
+			return -EINVAL;
+		rdev->cq_coalescing.buf_maxtime = val;
+		break;
+	case BNXT_RE_COAL_CQ_NORMAL_MAXBUF:
+		if (val < 1 || val > BNXT_QPLIB_CQ_COAL_MAX_NORMAL_MAXBUF)
+			return -EINVAL;
+		rdev->cq_coalescing.normal_maxbuf = val;
+		break;
+	case BNXT_RE_COAL_CQ_DURING_MAXBUF:
+		if (val < 1 || val > BNXT_QPLIB_CQ_COAL_MAX_DURING_MAXBUF)
+			return -EINVAL;
+		rdev->cq_coalescing.during_maxbuf = val;
+		break;
+	case BNXT_RE_COAL_CQ_EN_RING_IDLE_MODE:
+		if (val > BNXT_QPLIB_CQ_COAL_MAX_EN_RING_IDLE_MODE)
+			return -EINVAL;
+		rdev->cq_coalescing.en_ring_idle_mode = val;
+		break;
+	case BNXT_RE_COAL_CQ_ENABLE:
+		if (val > 1)
+			return -EINVAL;
+		rdev->cq_coalescing.enable = val;
+		break;
+	default:
+		return -EINVAL;
+	}
+	return  count;
+}
+
+static int cq_coal_cfg_show(struct seq_file *s, void *unused)
+{
+	struct bnxt_re_cq_coal_param *param = s->private;
+	struct bnxt_re_dev *rdev = param->rdev;
+	int offset = param->offset;
+	u32 val = 0;
+
+	switch (offset) {
+	case BNXT_RE_COAL_CQ_BUF_MAXTIME:
+		val = rdev->cq_coalescing.buf_maxtime;
+		break;
+	case BNXT_RE_COAL_CQ_NORMAL_MAXBUF:
+		val = rdev->cq_coalescing.normal_maxbuf;
+		break;
+	case BNXT_RE_COAL_CQ_DURING_MAXBUF:
+		val = rdev->cq_coalescing.during_maxbuf;
+		break;
+	case BNXT_RE_COAL_CQ_EN_RING_IDLE_MODE:
+		val = rdev->cq_coalescing.en_ring_idle_mode;
+		break;
+	case BNXT_RE_COAL_CQ_ENABLE:
+		val = rdev->cq_coalescing.enable;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	seq_printf(s, "%u\n", val);
+	return 0;
+}
+DEFINE_SHOW_STORE_ATTRIBUTE(cq_coal_cfg);
+
+static void bnxt_re_cleanup_cq_coal_debugfs(struct bnxt_re_dev *rdev)
+{
+	debugfs_remove_recursive(rdev->cq_coal_cfg);
+	kfree(rdev->cq_coal_cfg_params);
+}
+
+static void bnxt_re_init_cq_coal_debugfs(struct bnxt_re_dev *rdev)
+{
+	struct bnxt_re_dbg_cq_coal_params *dbg_cq_coal_params;
+	int i;
+
+	if (!_is_cq_coalescing_supported(rdev->dev_attr->dev_cap_flags2))
+		return;
+
+	dbg_cq_coal_params = kzalloc_obj(*dbg_cq_coal_params);
+	if (!dbg_cq_coal_params)
+		return;
+
+	rdev->cq_coal_cfg = debugfs_create_dir("cq_coal_cfg", rdev->dbg_root);
+	rdev->cq_coal_cfg_params = dbg_cq_coal_params;
+
+	for (i = 0; i < BNXT_RE_COAL_CQ_MAX; i++) {
+		dbg_cq_coal_params->params[i].offset = i;
+		dbg_cq_coal_params->params[i].rdev = rdev;
+		debugfs_create_file(bnxt_re_cq_coal_str[i],
+				    0600, rdev->cq_coal_cfg,
+				    &dbg_cq_coal_params->params[i],
+				    &cq_coal_cfg_fops);
+	}
+}
+
+void bnxt_re_debugfs_add_pdev(struct bnxt_re_dev *rdev)
+{
+	struct pci_dev *pdev = rdev->en_dev->pdev;
+	struct bnxt_re_dbg_cc_config_params *cc_params;
+	int i;
+
+	rdev->dbg_root = debugfs_create_dir(dev_name(&pdev->dev), bnxt_re_debugfs_root);
+
+	rdev->qp_debugfs = debugfs_create_dir("QPs", rdev->dbg_root);
+	rdev->cc_config = debugfs_create_dir("cc_config", rdev->dbg_root);
+
+	bnxt_re_debugfs_add_info(rdev);
+
+	rdev->cc_config_params = kzalloc_obj(*cc_params);
+	if (!rdev->cc_config_params)
+		return;
+
+	for (i = 0; i < BNXT_RE_CC_PARAM_GEN0; i++) {
+		struct bnxt_re_cc_param *tmp_params = &rdev->cc_config_params->gen0_parms[i];
+
+		tmp_params->rdev = rdev;
+		tmp_params->offset = i;
+		tmp_params->cc_gen = CC_CONFIG_GEN0_EXT0;
+		tmp_params->dentry = debugfs_create_file(bnxt_re_cc_gen0_name[i], 0400,
+							 rdev->cc_config, tmp_params,
+							 &bnxt_re_cc_config_ops);
+	}
+
+	bnxt_re_init_cq_coal_debugfs(rdev);
+}
+
+void bnxt_re_debugfs_rem_pdev(struct bnxt_re_dev *rdev)
+{
+	bnxt_re_cleanup_cq_coal_debugfs(rdev);
+	debugfs_remove_recursive(rdev->qp_debugfs);
+	debugfs_remove_recursive(rdev->cc_config);
+	kfree(rdev->cc_config_params);
+	debugfs_remove_recursive(rdev->dbg_root);
+	rdev->dbg_root = NULL;
+}
+
+void bnxt_re_register_debugfs(void)
+{
+	bnxt_re_debugfs_root = debugfs_create_dir("bnxt_re", NULL);
+}
+
+void bnxt_re_unregister_debugfs(void)
+{
+	debugfs_remove(bnxt_re_debugfs_root);
+}

@@ -1,0 +1,4036 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Data Access Monitor
+ */
+
+#define pr_fmt(fmt) "damon: " fmt
+
+#include <linux/damon.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
+#include <linux/memcontrol.h>
+#include <linux/mm.h>
+#include <linux/psi.h>
+#include <linux/sched.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/string_choices.h>
+
+/* for damon_get_folio() used by node eligible memory metrics */
+#include "ops-common.h"
+
+#define CREATE_TRACE_POINTS
+#include <trace/events/damon.h>
+
+static DEFINE_MUTEX(damon_lock);
+static int nr_running_ctxs;
+static bool running_exclusive_ctxs;
+
+static DEFINE_MUTEX(damon_ops_lock);
+static struct damon_operations damon_registered_ops[NR_DAMON_OPS];
+
+static struct kmem_cache *damon_region_cache __ro_after_init;
+
+/* Should be called under damon_ops_lock with id smaller than NR_DAMON_OPS */
+static bool __damon_is_registered_ops(enum damon_ops_id id)
+{
+	struct damon_operations empty_ops = {};
+
+	if (!memcmp(&empty_ops, &damon_registered_ops[id], sizeof(empty_ops)))
+		return false;
+	return true;
+}
+
+/**
+ * damon_is_registered_ops() - Check if a given damon_operations is registered.
+ * @id:	Id of the damon_operations to check if registered.
+ *
+ * Return: true if the ops is set, false otherwise.
+ */
+bool damon_is_registered_ops(enum damon_ops_id id)
+{
+	bool registered;
+
+	if (id >= NR_DAMON_OPS)
+		return false;
+	mutex_lock(&damon_ops_lock);
+	registered = __damon_is_registered_ops(id);
+	mutex_unlock(&damon_ops_lock);
+	return registered;
+}
+
+/**
+ * damon_register_ops() - Register a monitoring operations set to DAMON.
+ * @ops:	monitoring operations set to register.
+ *
+ * This function registers a monitoring operations set of valid &struct
+ * damon_operations->id so that others can find and use them later.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damon_register_ops(struct damon_operations *ops)
+{
+	int err = 0;
+
+	if (ops->id >= NR_DAMON_OPS)
+		return -EINVAL;
+
+	mutex_lock(&damon_ops_lock);
+	/* Fail for already registered ops */
+	if (__damon_is_registered_ops(ops->id))
+		err = -EINVAL;
+	else
+		damon_registered_ops[ops->id] = *ops;
+	mutex_unlock(&damon_ops_lock);
+	return err;
+}
+
+/**
+ * damon_select_ops() - Select a monitoring operations to use with the context.
+ * @ctx:	monitoring context to use the operations.
+ * @id:		id of the registered monitoring operations to select.
+ *
+ * This function finds registered monitoring operations set of @id and make
+ * @ctx to use it.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damon_select_ops(struct damon_ctx *ctx, enum damon_ops_id id)
+{
+	int err = 0;
+
+	if (id >= NR_DAMON_OPS)
+		return -EINVAL;
+
+	mutex_lock(&damon_ops_lock);
+	if (!__damon_is_registered_ops(id))
+		err = -EINVAL;
+	else
+		ctx->ops = damon_registered_ops[id];
+	mutex_unlock(&damon_ops_lock);
+	return err;
+}
+
+struct damon_filter *damon_new_filter(enum damon_filter_type type,
+		bool matching, bool allow)
+{
+	struct damon_filter *filter;
+
+	filter = kmalloc_obj(*filter);
+	if (!filter)
+		return NULL;
+	filter->type = type;
+	filter->matching = matching;
+	filter->allow = allow;
+	INIT_LIST_HEAD(&filter->list);
+	return filter;
+}
+
+void damon_add_filter(struct damon_probe *p, struct damon_filter *f)
+{
+	list_add_tail(&f->list, &p->filters);
+}
+
+static void damon_del_filter(struct damon_filter *f)
+{
+	list_del(&f->list);
+}
+
+static void damon_free_filter(struct damon_filter *f)
+{
+	kfree(f);
+}
+
+void damon_destroy_filter(struct damon_filter *f)
+{
+	damon_del_filter(f);
+	damon_free_filter(f);
+}
+
+static struct damon_filter *damon_nth_filter(int n, struct damon_probe *p)
+{
+	struct damon_filter *f;
+	int i = 0;
+
+	damon_for_each_filter(f, p) {
+		if (i++ == n)
+			return f;
+	}
+	return NULL;
+}
+
+struct damon_probe *damon_new_probe(void)
+{
+	struct damon_probe *p;
+
+	p = kmalloc_obj(*p);
+	if (!p)
+		return NULL;
+	p->weight = 0;
+	INIT_LIST_HEAD(&p->filters);
+	INIT_LIST_HEAD(&p->list);
+	return p;
+}
+
+void damon_add_probe(struct damon_ctx *ctx, struct damon_probe *probe)
+{
+	list_add_tail(&probe->list, &ctx->probes);
+}
+
+static void damon_del_probe(struct damon_probe *p)
+{
+	list_del(&p->list);
+}
+
+static void damon_free_probe(struct damon_probe *p)
+{
+	struct damon_filter *f, *next;
+
+	damon_for_each_filter_safe(f, next, p)
+		damon_free_filter(f);
+	kfree(p);
+}
+
+static void damon_destroy_probe(struct damon_probe *p)
+{
+	damon_del_probe(p);
+	damon_free_probe(p);
+}
+
+static struct damon_probe *damon_nth_probe(int n, struct damon_ctx *ctx)
+{
+	struct damon_probe *p;
+	int i = 0;
+
+	damon_for_each_probe(p, ctx) {
+		if (i++ == n)
+			return p;
+	}
+	return NULL;
+}
+
+static bool damon_has_probe_weights(struct damon_ctx *c)
+{
+	struct damon_probe *p;
+
+	damon_for_each_probe(p, c) {
+		if (p->weight)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * damon_mvsum() - Returns pseudo moving sum value for a time window.
+ * @current_nr:		The value of the current aggregation window.
+ * @last_nr:		The value of the last aggregation window.
+ * @left_window_bp:	Left time of the current aggregation window.
+ *
+ * This function calculates a pseudo moving sum value of a counter that is
+ * aggregated for each time window.  @current_nr is the value of the counter
+ * that aggregated so far (maybe not yet complete), from the beginning of the
+ * current aggregation time window.  @last_nr is the value of the counter that
+ * has completely aggregated in the last aggregation time window.
+ * @left_window_bp represents how much time is left for the current aggregation
+ * time window in bp (1/10,000).  For example, the aggregation time window is
+ * for every 10 seconds and 7 seconds has passed since the beginning of the
+ * current window, this parameter will be 3000 ((10 - 7) / 10 * 10000).
+ *
+ * The logic assumes the aggregation in the last phase was made in a single
+ * speed.  Based on the assumption, the value from the last window that needs
+ * to be added to the current value is calculated as a portion of the last
+ * value based on the remaining time window.
+ */
+static unsigned long damon_mvsum(unsigned long current_nr,
+		unsigned long last_nr, unsigned long left_window_bp)
+{
+	return current_nr + mult_frac(last_nr, left_window_bp, 10000);
+}
+
+/**
+ * damon_nr_accesses_mvsum() - Returns moving sum access frequency score.
+ * @r:		Region to get the access frequency of.
+ * @ctx:	DAMON context of @r.
+ *
+ * This function returns for how many sampling iterations in the last
+ * aggregation interval (&damon_attrs->aggr_interval) the region was found to
+ * be accessed.  Hence the value can be interpreted as the relative access
+ * frequency score of the region (@r).  The value is calculated as a pseudo
+ * moving sum, and hence it is not an exact value but just a best-effort
+ * reasonable estimation.
+ *
+ * Return: the pseudo moving sum access frequency score.
+ */
+unsigned int damon_nr_accesses_mvsum(struct damon_region *r,
+		struct damon_ctx *ctx)
+{
+	unsigned long sample_interval, aggr_interval;
+	unsigned long window_len, left_window, left_window_bp;
+
+	sample_interval = ctx->attrs.sample_interval ? : 1;
+	aggr_interval = ctx->attrs.aggr_interval ? : 1;
+	window_len = aggr_interval / sample_interval;
+	if (time_after_eq(ctx->passed_sample_intervals,
+				ctx->next_aggregation_sis))
+		left_window = 0;
+	else
+		left_window = ctx->next_aggregation_sis -
+			ctx->passed_sample_intervals;
+	left_window_bp = mult_frac(left_window, 10000, window_len);
+
+	if (left_window_bp == 10000)
+		return r->last_nr_accesses;
+
+	return damon_mvsum(r->nr_accesses, r->last_nr_accesses,
+			left_window_bp);
+}
+
+unsigned char damon_probe_hits_mvsum(int probe_idx, struct damon_region *r,
+		struct damon_ctx *ctx)
+{
+	unsigned long sample_interval, aggr_interval;
+	unsigned long window_len, left_window, left_window_bp;
+
+	sample_interval = ctx->attrs.sample_interval ? : 1;
+	aggr_interval =  ctx->attrs.aggr_interval ? : 1;
+	window_len = aggr_interval / sample_interval;
+	if (time_after_eq(ctx->passed_sample_intervals,
+				ctx->next_aggregation_sis))
+		left_window = 0;
+	else
+		left_window = ctx->next_aggregation_sis -
+			ctx->passed_sample_intervals;
+	left_window_bp = mult_frac(left_window, 10000, window_len);
+
+	if (left_window_bp == 10000)
+		return r->last_probe_hits[probe_idx];
+
+	return damon_mvsum(r->probe_hits[probe_idx],
+			r->last_probe_hits[probe_idx], left_window_bp);
+}
+
+#ifdef CONFIG_DAMON_DEBUG_SANITY
+static void damon_verify_new_region(unsigned long start, unsigned long end)
+{
+	WARN_ONCE(start >= end, "start %lu >= end %lu\n", start, end);
+}
+#else
+static void damon_verify_new_region(unsigned long start, unsigned long end)
+{
+}
+#endif
+
+/*
+ * Construct a damon_region struct
+ *
+ * Returns the pointer to the new struct if success, or NULL otherwise
+ */
+struct damon_region *damon_new_region(unsigned long start, unsigned long end)
+{
+	struct damon_region *region;
+	int i;
+
+	damon_verify_new_region(start, end);
+	region = kmem_cache_alloc(damon_region_cache, GFP_KERNEL);
+	if (!region)
+		return NULL;
+
+	region->ar.start = start;
+	region->ar.end = end;
+	region->nr_accesses = 0;
+	for (i = 0; i < DAMON_MAX_PROBES; i++) {
+		region->probe_hits[i] = 0;
+		region->last_probe_hits[i] = 0;
+	}
+	INIT_LIST_HEAD(&region->list);
+
+	region->age = 0;
+	region->last_nr_accesses = 0;
+
+	return region;
+}
+
+static void damon_add_region(struct damon_region *r, struct damon_target *t)
+{
+	list_add_tail(&r->list, &t->regions_list);
+	t->nr_regions++;
+}
+
+/*
+ * Add a region between two other regions
+ */
+static inline void damon_insert_region(struct damon_region *r,
+		struct damon_region *prev, struct damon_region *next,
+		struct damon_target *t)
+{
+	__list_add(&r->list, &prev->list, &next->list);
+	t->nr_regions++;
+}
+
+#ifdef CONFIG_DAMON_DEBUG_SANITY
+static void damon_verify_del_region(struct damon_target *t)
+{
+	WARN_ONCE(t->nr_regions == 0, "t->nr_regions == 0\n");
+}
+#else
+static void damon_verify_del_region(struct damon_target *t)
+{
+}
+#endif
+
+static void damon_del_region(struct damon_region *r, struct damon_target *t)
+{
+	damon_verify_del_region(t);
+
+	list_del(&r->list);
+	t->nr_regions--;
+}
+
+static void damon_free_region(struct damon_region *r)
+{
+	kmem_cache_free(damon_region_cache, r);
+}
+
+static void damon_destroy_region(struct damon_region *r,
+		struct damon_target *t)
+{
+	damon_del_region(r, t);
+	damon_free_region(r);
+}
+
+static bool damon_is_last_region(struct damon_region *r,
+		struct damon_target *t)
+{
+	return list_is_last(&r->list, &t->regions_list);
+}
+
+/**
+ * damon_probe_hits_wsum() - Returns probe hits weighted sum of a region.
+ * @r:		region to get the weighted sum of.
+ * @last:	if the request is for last-window aggregated probe hits.
+ * @ctx:	context of &r.
+ *
+ * Return: the weighted sum of probe hits of the region.
+ */
+unsigned int damon_probe_hits_wsum(struct damon_region *r, bool last,
+		struct damon_ctx *ctx)
+{
+	struct damon_probe *probe;
+	unsigned int sum = 0;
+	int i = 0;
+
+	damon_for_each_probe(probe, ctx) {
+		if (last)
+			sum += r->last_probe_hits[i++] * probe->weight;
+		else
+			sum += r->probe_hits[i++] * probe->weight;
+	}
+	return sum;
+}
+
+/*
+ * Check whether a region is intersecting an address range
+ *
+ * Returns true if it is.
+ */
+static bool damon_intersect(struct damon_region *r,
+		struct damon_addr_range *re)
+{
+	return !(r->ar.end <= re->start || re->end <= r->ar.start);
+}
+
+/*
+ * Fill holes in regions with new regions.
+ */
+static int damon_fill_regions_holes(struct damon_region *first,
+		struct damon_region *last, struct damon_target *t)
+{
+	struct damon_region *r = first;
+
+	damon_for_each_region_from(r, t) {
+		struct damon_region *next, *newr;
+
+		if (r == last)
+			break;
+		next = damon_next_region(r);
+		if (r->ar.end != next->ar.start) {
+			newr = damon_new_region(r->ar.end, next->ar.start);
+			if (!newr)
+				return -ENOMEM;
+			damon_insert_region(newr, r, next, t);
+		}
+	}
+	return 0;
+}
+
+/*
+ * damon_set_regions() - Set regions of a target for given address ranges.
+ * @t:		the given target.
+ * @ranges:	array of new monitoring target ranges.
+ * @nr_ranges:	length of @ranges.
+ * @min_region_sz:	minimum region size.
+ *
+ * This function adds new regions to, or modify existing regions of a
+ * monitoring target to fit in specific ranges.
+ *
+ * Return: 0 if success, or negative error code otherwise.
+ */
+int damon_set_regions(struct damon_target *t, struct damon_addr_range *ranges,
+		unsigned int nr_ranges, unsigned long min_region_sz)
+{
+	struct damon_region *r, *next;
+	unsigned int i;
+	unsigned long last_end;
+	int err;
+
+	for (i = 0; i < nr_ranges; i++) {
+		unsigned long start, end;
+
+		start = ALIGN_DOWN(ranges[i].start, min_region_sz);
+		end = ALIGN(ranges[i].end, min_region_sz);
+		if (start >= end)
+			return -EINVAL;
+		if (i > 0 && last_end > start)
+			return -EINVAL;
+		last_end = end;
+	}
+
+	/* Remove regions which are not in the new ranges */
+	damon_for_each_region_safe(r, next, t) {
+		for (i = 0; i < nr_ranges; i++) {
+			if (damon_intersect(r, &ranges[i]))
+				break;
+		}
+		if (i == nr_ranges)
+			damon_destroy_region(r, t);
+	}
+
+	if (!damon_nr_regions(t)) {
+		for (i = 0; i < nr_ranges; i++) {
+			r = damon_new_region(
+					ALIGN_DOWN(ranges[i].start,
+						min_region_sz),
+					ALIGN(ranges[i].end, min_region_sz));
+			if (!r)
+				return -ENOMEM;
+			damon_add_region(r, t);
+		}
+		return 0;
+	}
+
+	r = damon_first_region(t);
+	/* Add new regions or resize existing regions to fit in the ranges */
+	for (i = 0; i < nr_ranges; i++) {
+		struct damon_region *first = NULL, *last, *newr;
+		struct damon_addr_range *range;
+		bool insert_before_r = false;
+
+		range = &ranges[i];
+		/* Get the first/last regions intersecting with the range */
+		damon_for_each_region_from(r, t) {
+			if (damon_intersect(r, range)) {
+				if (!first)
+					first = r;
+				last = r;
+			}
+			if (r->ar.start >= range->end) {
+				insert_before_r = true;
+				break;
+			}
+		}
+		if (!first) {
+			/* no region intersects with this range */
+			newr = damon_new_region(
+					ALIGN_DOWN(range->start,
+						min_region_sz),
+					ALIGN(range->end, min_region_sz));
+			if (!newr)
+				return -ENOMEM;
+			if (insert_before_r)
+				damon_insert_region(newr, damon_prev_region(r),
+						r, t);
+			else
+				damon_add_region(newr, t);
+		} else {
+			/* resize intersecting regions to fit in this range */
+			first->ar.start = ALIGN_DOWN(range->start,
+					min_region_sz);
+			last->ar.end = ALIGN(range->end, min_region_sz);
+
+			/* fill possible holes in the range */
+			err = damon_fill_regions_holes(first, last, t);
+			if (err)
+				return err;
+		}
+	}
+	return 0;
+}
+
+struct damos_filter *damos_new_filter(enum damos_filter_type type,
+		bool matching, bool allow)
+{
+	struct damos_filter *filter;
+
+	filter = kmalloc_obj(*filter);
+	if (!filter)
+		return NULL;
+	filter->type = type;
+	filter->matching = matching;
+	filter->allow = allow;
+	INIT_LIST_HEAD(&filter->list);
+	return filter;
+}
+
+/**
+ * damos_filter_for_ops() - Return if the filter is ops-handled one.
+ * @type:	type of the filter.
+ *
+ * Return: true if the filter of @type needs to be handled by ops layer, false
+ * otherwise.
+ */
+bool damos_filter_for_ops(enum damos_filter_type type)
+{
+	switch (type) {
+	case DAMOS_FILTER_TYPE_ADDR:
+	case DAMOS_FILTER_TYPE_TARGET:
+		return false;
+	default:
+		break;
+	}
+	return true;
+}
+
+void damos_add_filter(struct damos *s, struct damos_filter *f)
+{
+	if (damos_filter_for_ops(f->type))
+		list_add_tail(&f->list, &s->ops_filters);
+	else
+		list_add_tail(&f->list, &s->core_filters);
+}
+
+static void damos_del_filter(struct damos_filter *f)
+{
+	list_del(&f->list);
+}
+
+static void damos_free_filter(struct damos_filter *f)
+{
+	kfree(f);
+}
+
+void damos_destroy_filter(struct damos_filter *f)
+{
+	damos_del_filter(f);
+	damos_free_filter(f);
+}
+
+struct damos_quota_goal *damos_new_quota_goal(
+		enum damos_quota_goal_metric metric,
+		unsigned long target_value)
+{
+	struct damos_quota_goal *goal;
+
+	goal = kmalloc_obj(*goal);
+	if (!goal)
+		return NULL;
+	goal->metric = metric;
+	goal->target_value = target_value;
+	INIT_LIST_HEAD(&goal->list);
+	return goal;
+}
+
+void damos_add_quota_goal(struct damos_quota *q, struct damos_quota_goal *g)
+{
+	list_add_tail(&g->list, &q->goals);
+}
+
+static void damos_del_quota_goal(struct damos_quota_goal *g)
+{
+	list_del(&g->list);
+}
+
+static void damos_free_quota_goal(struct damos_quota_goal *g)
+{
+	kfree(g);
+}
+
+void damos_destroy_quota_goal(struct damos_quota_goal *g)
+{
+	damos_del_quota_goal(g);
+	damos_free_quota_goal(g);
+}
+
+static bool damos_quota_goals_empty(struct damos_quota *q)
+{
+	return list_empty(&q->goals);
+}
+
+/* initialize fields of @quota that normally API users wouldn't set */
+static struct damos_quota *damos_quota_init(struct damos_quota *quota)
+{
+	quota->esz = 0;
+	quota->total_charged_sz = 0;
+	quota->total_charged_ns = 0;
+	quota->charged_sz = 0;
+	quota->charged_from = 0;
+	quota->charge_target_from = NULL;
+	quota->charge_addr_from = 0;
+	quota->esz_bp = 0;
+	return quota;
+}
+
+struct damos *damon_new_scheme(struct damos_access_pattern *pattern,
+			enum damos_action action,
+			unsigned long apply_interval_us,
+			struct damos_quota *quota,
+			struct damos_watermarks *wmarks,
+			int target_nid)
+{
+	struct damos *scheme;
+
+	scheme = kmalloc_obj(*scheme);
+	if (!scheme)
+		return NULL;
+	scheme->pattern = *pattern;
+	scheme->action = action;
+	scheme->apply_interval_us = apply_interval_us;
+	/*
+	 * next_apply_sis will be set when kdamond starts.  While kdamond is
+	 * running, it will also updated when it is added to the DAMON context,
+	 * or damon_attrs are updated.
+	 */
+	scheme->next_apply_sis = 0;
+	scheme->walk_completed = false;
+	INIT_LIST_HEAD(&scheme->core_filters);
+	INIT_LIST_HEAD(&scheme->ops_filters);
+	scheme->stat = (struct damos_stat){};
+	scheme->max_nr_snapshots = 0;
+	scheme->last_applied = NULL;
+	INIT_LIST_HEAD(&scheme->list);
+
+	scheme->quota = *(damos_quota_init(quota));
+	/* quota.goals should be separately set by caller */
+	INIT_LIST_HEAD(&scheme->quota.goals);
+
+	scheme->wmarks = *wmarks;
+	scheme->wmarks.activated = true;
+
+	scheme->migrate_dests = (struct damos_migrate_dests){};
+	scheme->target_nid = target_nid;
+
+	return scheme;
+}
+
+static void damos_set_next_apply_sis(struct damos *s, struct damon_ctx *ctx)
+{
+	unsigned long sample_interval = ctx->attrs.sample_interval ?
+		ctx->attrs.sample_interval : 1;
+	unsigned long apply_interval = s->apply_interval_us ?
+		s->apply_interval_us : ctx->attrs.aggr_interval;
+
+	s->next_apply_sis = ctx->passed_sample_intervals +
+		apply_interval / sample_interval;
+}
+
+void damon_add_scheme(struct damon_ctx *ctx, struct damos *s)
+{
+	list_add_tail(&s->list, &ctx->schemes);
+	damos_set_next_apply_sis(s, ctx);
+}
+
+static void damon_del_scheme(struct damos *s)
+{
+	list_del(&s->list);
+}
+
+static void damon_free_scheme(struct damos *s)
+{
+	kfree(s);
+}
+
+void damon_destroy_scheme(struct damos *s)
+{
+	struct damos_quota_goal *g, *g_next;
+	struct damos_filter *f, *next;
+
+	damos_for_each_quota_goal_safe(g, g_next, &s->quota)
+		damos_destroy_quota_goal(g);
+
+	damos_for_each_core_filter_safe(f, next, s)
+		damos_destroy_filter(f);
+
+	damos_for_each_ops_filter_safe(f, next, s)
+		damos_destroy_filter(f);
+
+	kfree(s->migrate_dests.node_id_arr);
+	kfree(s->migrate_dests.weight_arr);
+	damon_del_scheme(s);
+	damon_free_scheme(s);
+}
+
+/*
+ * Construct a damon_target struct
+ *
+ * Returns the pointer to the new struct if success, or NULL otherwise
+ */
+struct damon_target *damon_new_target(void)
+{
+	struct damon_target *t;
+
+	t = kmalloc_obj(*t);
+	if (!t)
+		return NULL;
+
+	t->pid = NULL;
+	t->nr_regions = 0;
+	INIT_LIST_HEAD(&t->regions_list);
+	INIT_LIST_HEAD(&t->list);
+	t->obsolete = false;
+
+	return t;
+}
+
+void damon_add_target(struct damon_ctx *ctx, struct damon_target *t)
+{
+	list_add_tail(&t->list, &ctx->adaptive_targets);
+}
+
+bool damon_targets_empty(struct damon_ctx *ctx)
+{
+	return list_empty(&ctx->adaptive_targets);
+}
+
+static void damon_del_target(struct damon_target *t)
+{
+	list_del(&t->list);
+}
+
+void damon_free_target(struct damon_target *t)
+{
+	struct damon_region *r, *next;
+
+	damon_for_each_region_safe(r, next, t)
+		damon_free_region(r);
+	kfree(t);
+}
+
+void damon_destroy_target(struct damon_target *t, struct damon_ctx *ctx)
+{
+
+	if (ctx && ctx->ops.cleanup_target)
+		ctx->ops.cleanup_target(t);
+
+	damon_del_target(t);
+	damon_free_target(t);
+}
+
+unsigned int damon_nr_regions(struct damon_target *t)
+{
+	return t->nr_regions;
+}
+
+struct damon_ctx *damon_new_ctx(void)
+{
+	struct damon_ctx *ctx;
+
+	ctx = kzalloc_obj(*ctx);
+	if (!ctx)
+		return NULL;
+
+	init_completion(&ctx->kdamond_started);
+
+	ctx->attrs.sample_interval = 5 * 1000;
+	ctx->attrs.aggr_interval = 100 * 1000;
+	ctx->attrs.ops_update_interval = 60 * 1000 * 1000;
+
+	ctx->passed_sample_intervals = 0;
+	/* These will be set from kdamond_init_ctx() */
+	ctx->next_aggregation_sis = 0;
+	ctx->next_ops_update_sis = 0;
+
+	mutex_init(&ctx->kdamond_lock);
+	INIT_LIST_HEAD(&ctx->call_controls);
+	mutex_init(&ctx->call_controls_lock);
+	mutex_init(&ctx->walk_control_lock);
+
+	ctx->attrs.min_nr_regions = 10;
+	ctx->attrs.max_nr_regions = 1000;
+
+	INIT_LIST_HEAD(&ctx->probes);
+
+	ctx->addr_unit = 1;
+	ctx->min_region_sz = DAMON_MIN_REGION_SZ;
+
+	INIT_LIST_HEAD(&ctx->adaptive_targets);
+	INIT_LIST_HEAD(&ctx->schemes);
+
+	prandom_seed_state(&ctx->rnd_state, get_random_u64());
+
+	return ctx;
+}
+
+static void damon_destroy_targets(struct damon_ctx *ctx)
+{
+	struct damon_target *t, *next_t;
+
+	damon_for_each_target_safe(t, next_t, ctx)
+		damon_destroy_target(t, ctx);
+}
+
+void damon_destroy_ctx(struct damon_ctx *ctx)
+{
+	struct damos *s, *next_s;
+	struct damon_probe *p, *next_p;
+
+	damon_destroy_targets(ctx);
+
+	damon_for_each_scheme_safe(s, next_s, ctx)
+		damon_destroy_scheme(s);
+
+	damon_for_each_probe_safe(p, next_p, ctx)
+		damon_destroy_probe(p);
+
+	kfree(ctx);
+}
+
+static bool damon_attrs_equals(const struct damon_attrs *attrs1,
+		const struct damon_attrs *attrs2)
+{
+	const struct damon_intervals_goal *ig1 = &attrs1->intervals_goal;
+	const struct damon_intervals_goal *ig2 = &attrs2->intervals_goal;
+
+	return attrs1->sample_interval == attrs2->sample_interval &&
+		attrs1->aggr_interval == attrs2->aggr_interval &&
+		attrs1->ops_update_interval == attrs2->ops_update_interval &&
+		attrs1->min_nr_regions == attrs2->min_nr_regions &&
+		attrs1->max_nr_regions == attrs2->max_nr_regions &&
+		ig1->access_bp == ig2->access_bp &&
+		ig1->aggrs == ig2->aggrs &&
+		ig1->min_sample_us == ig2->min_sample_us &&
+		ig1->max_sample_us == ig2->max_sample_us;
+}
+
+static unsigned int damon_age_for_new_attrs(unsigned int age,
+		struct damon_attrs *old_attrs, struct damon_attrs *new_attrs)
+{
+	return age * old_attrs->aggr_interval / new_attrs->aggr_interval;
+}
+
+/* convert sample ratio in bp (per 10,000) to count */
+static unsigned int damon_sample_bp_to_count(
+		unsigned int bp, struct damon_attrs *attrs)
+{
+	return bp * damon_nr_samples_per_aggr(attrs) / 10000;
+}
+
+/* convert sample count to ratio in bp (per 10,000) */
+static unsigned int damon_sample_count_to_bp(
+		unsigned int count, struct damon_attrs *attrs)
+{
+	return mult_frac(count, 10000, damon_nr_samples_per_aggr(attrs));
+}
+
+static unsigned int damon_nr_samples_for_new_attrs(unsigned int nr,
+		struct damon_attrs *old_attrs, struct damon_attrs *new_attrs)
+{
+	return damon_sample_bp_to_count(
+			damon_sample_count_to_bp(nr, old_attrs), new_attrs);
+}
+
+static void damon_update_probe_hits(struct damon_region *r,
+		struct damon_attrs *old_attrs, struct damon_attrs *new_attrs,
+		bool aggregating, struct damon_ctx *ctx)
+{
+	struct damon_probe *p;
+	int i = 0;
+
+	damon_for_each_probe(p, ctx) {
+		r->last_probe_hits[i] = damon_nr_samples_for_new_attrs(
+				r->last_probe_hits[i], old_attrs, new_attrs);
+		if (!aggregating)
+			r->probe_hits[i] = damon_nr_samples_for_new_attrs(
+					r->probe_hits[i], old_attrs,
+					new_attrs);
+		else
+			r->probe_hits[i] = 0;
+		i++;
+	}
+}
+
+static void damon_update_monitoring_result(struct damon_region *r,
+		struct damon_attrs *old_attrs, struct damon_attrs *new_attrs,
+		bool aggregating, struct damon_ctx *ctx)
+{
+	damon_update_probe_hits(r, old_attrs, new_attrs, aggregating, ctx);
+
+	r->last_nr_accesses = damon_nr_samples_for_new_attrs(
+			r->last_nr_accesses, old_attrs, new_attrs);
+	if (!aggregating)
+		r->nr_accesses = damon_nr_samples_for_new_attrs(
+				r->nr_accesses, old_attrs, new_attrs);
+	else
+		/*
+		 * if this is called in the middle of the aggregation, reset
+		 * the aggregations we made so far for this aggregation
+		 * interval.  In other words, make the status like
+		 * kdamond_reset_aggregated() is called.
+		 */
+		r->nr_accesses = 0;
+	r->age = damon_age_for_new_attrs(r->age, old_attrs, new_attrs);
+}
+
+/*
+ * region->nr_accesses is the number of sampling intervals in the last
+ * aggregation interval that access to the region has found, and region->age is
+ * the number of aggregation intervals that its access pattern has maintained.
+ * For the reason, the real meaning of the two fields depend on current
+ * sampling interval and aggregation interval.  This function updates
+ * ->nr_accesses and ->age of given damon_ctx's regions for new damon_attrs.
+ */
+static void damon_update_monitoring_results(struct damon_ctx *ctx,
+		struct damon_attrs *new_attrs, bool aggregating)
+{
+	struct damon_attrs *old_attrs = &ctx->attrs;
+	struct damon_target *t;
+	struct damon_region *r;
+
+	/* if any interval is zero, simply forgive conversion */
+	if (!old_attrs->sample_interval || !old_attrs->aggr_interval ||
+			!new_attrs->sample_interval ||
+			!new_attrs->aggr_interval)
+		return;
+
+	damon_for_each_target(t, ctx)
+		damon_for_each_region(r, t)
+			damon_update_monitoring_result(r, old_attrs, new_attrs,
+					aggregating, ctx);
+}
+
+/*
+ * damon_valid_intervals_goal() - return if the intervals goal of @attrs is
+ * valid.
+ */
+static bool damon_valid_intervals_goal(struct damon_attrs *attrs)
+{
+	struct damon_intervals_goal *goal = &attrs->intervals_goal;
+
+	/* tuning is disabled */
+	if (!goal->aggrs)
+		return true;
+	if (goal->min_sample_us > goal->max_sample_us)
+		return false;
+	if (attrs->sample_interval < goal->min_sample_us ||
+			goal->max_sample_us < attrs->sample_interval)
+		return false;
+	return true;
+}
+
+/**
+ * damon_set_attrs() - Set attributes for the monitoring.
+ * @ctx:		monitoring context
+ * @attrs:		monitoring attributes
+ *
+ * This function updates monitoring results and next monitoring/damos operation
+ * schedules.  Because those are periodically updated by kdamond, this should
+ * be called from a safe contexts.  Such contexts include damon_ctx setup time
+ * while the kdamond is not yet started, and inside of kdamond_fn().
+ *
+ * In detail, all DAMON API callers directly call this function for initial
+ * setup of damon_ctx before calling damon_start().  Some of the API callers
+ * also indirectly call this function via damon_call() -> damon_commit() for
+ * online parameters updates.  Finally, kdamond_fn() itself use this for
+ * applying auto-tuned monitoring intervals.
+ *
+ * Every time interval is in micro-seconds.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damon_set_attrs(struct damon_ctx *ctx, struct damon_attrs *attrs)
+{
+	unsigned long sample_interval = attrs->sample_interval ?
+		attrs->sample_interval : 1;
+	struct damos *s;
+	bool aggregating = ctx->passed_sample_intervals <
+		ctx->next_aggregation_sis;
+
+	if (!damon_valid_intervals_goal(attrs))
+		return -EINVAL;
+
+	if (attrs->min_nr_regions < 3)
+		return -EINVAL;
+	if (attrs->min_nr_regions > attrs->max_nr_regions)
+		return -EINVAL;
+	if (attrs->sample_interval > attrs->aggr_interval)
+		return -EINVAL;
+
+	/* calls from core-external doesn't set this. */
+	if (!attrs->aggr_samples)
+		attrs->aggr_samples = attrs->aggr_interval / sample_interval;
+
+	ctx->next_aggregation_sis = ctx->passed_sample_intervals +
+		attrs->aggr_interval / sample_interval;
+	ctx->next_ops_update_sis = ctx->passed_sample_intervals +
+		attrs->ops_update_interval / sample_interval;
+	/*
+	 * next_intervals_tune_sis will be updated inside kdamond_fn().
+	 */
+
+	damon_update_monitoring_results(ctx, attrs, aggregating);
+	ctx->attrs = *attrs;
+
+	damon_for_each_scheme(s, ctx)
+		damos_set_next_apply_sis(s, ctx);
+
+	return 0;
+}
+
+/**
+ * damon_set_schemes() - Set data access monitoring based operation schemes.
+ * @ctx:	monitoring context
+ * @schemes:	array of the schemes
+ * @nr_schemes:	number of entries in @schemes
+ *
+ * This function should not be called while the kdamond of the context is
+ * running.
+ */
+void damon_set_schemes(struct damon_ctx *ctx, struct damos **schemes,
+			ssize_t nr_schemes)
+{
+	struct damos *s, *next;
+	ssize_t i;
+
+	damon_for_each_scheme_safe(s, next, ctx)
+		damon_destroy_scheme(s);
+	for (i = 0; i < nr_schemes; i++)
+		damon_add_scheme(ctx, schemes[i]);
+}
+
+static struct damos_quota_goal *damos_nth_quota_goal(
+		int n, struct damos_quota *q)
+{
+	struct damos_quota_goal *goal;
+	int i = 0;
+
+	damos_for_each_quota_goal(goal, q) {
+		if (i++ == n)
+			return goal;
+	}
+	return NULL;
+}
+
+static void damos_commit_quota_goal_union(
+		struct damos_quota_goal *dst, struct damos_quota_goal *src)
+{
+	switch (dst->metric) {
+	case DAMOS_QUOTA_NODE_MEM_USED_BP:
+	case DAMOS_QUOTA_NODE_MEM_FREE_BP:
+		dst->nid = src->nid;
+		break;
+	case DAMOS_QUOTA_NODE_MEMCG_USED_BP:
+	case DAMOS_QUOTA_NODE_MEMCG_FREE_BP:
+		dst->nid = src->nid;
+		dst->memcg_id = src->memcg_id;
+		break;
+	default:
+		break;
+	}
+}
+
+static void damos_commit_quota_goal(
+		struct damos_quota_goal *dst, struct damos_quota_goal *src)
+{
+	dst->metric = src->metric;
+	dst->target_value = src->target_value;
+	if (dst->metric == DAMOS_QUOTA_USER_INPUT)
+		dst->current_value = src->current_value;
+	/* keep last_psi_total as is, since it will be updated in next cycle */
+	damos_commit_quota_goal_union(dst, src);
+}
+
+/**
+ * damos_commit_quota_goals() - Commit DAMOS quota goals to another quota.
+ * @dst:	The commit destination DAMOS quota.
+ * @src:	The commit source DAMOS quota.
+ *
+ * Copies user-specified parameters for quota goals from @src to @dst.  Users
+ * should use this function for quota goals-level parameters update of running
+ * DAMON contexts, instead of manual in-place updates.
+ *
+ * This function should be called from parameters-update safe context, like
+ * damon_call().
+ */
+int damos_commit_quota_goals(struct damos_quota *dst, struct damos_quota *src)
+{
+	struct damos_quota_goal *dst_goal, *next, *src_goal, *new_goal;
+	int i = 0, j = 0;
+
+	damos_for_each_quota_goal_safe(dst_goal, next, dst) {
+		src_goal = damos_nth_quota_goal(i++, src);
+		if (src_goal)
+			damos_commit_quota_goal(dst_goal, src_goal);
+		else
+			damos_destroy_quota_goal(dst_goal);
+	}
+	damos_for_each_quota_goal_safe(src_goal, next, src) {
+		if (j++ < i)
+			continue;
+		new_goal = damos_new_quota_goal(
+				src_goal->metric, src_goal->target_value);
+		if (!new_goal)
+			return -ENOMEM;
+		damos_commit_quota_goal(new_goal, src_goal);
+		damos_add_quota_goal(dst, new_goal);
+	}
+	return 0;
+}
+
+static int damos_commit_quota(struct damos_quota *dst, struct damos_quota *src)
+{
+	int err;
+
+	dst->reset_interval = src->reset_interval;
+	dst->ms = src->ms;
+	dst->sz = src->sz;
+	err = damos_commit_quota_goals(dst, src);
+	if (err)
+		return err;
+	dst->goal_tuner = src->goal_tuner;
+	dst->fail_charge_num = src->fail_charge_num;
+	dst->fail_charge_denom = src->fail_charge_denom;
+	dst->weight_sz = src->weight_sz;
+	dst->weight_nr_accesses = src->weight_nr_accesses;
+	dst->weight_age = src->weight_age;
+	return 0;
+}
+
+static struct damos_filter *damos_nth_core_filter(int n, struct damos *s)
+{
+	struct damos_filter *filter;
+	int i = 0;
+
+	damos_for_each_core_filter(filter, s) {
+		if (i++ == n)
+			return filter;
+	}
+	return NULL;
+}
+
+static struct damos_filter *damos_nth_ops_filter(int n, struct damos *s)
+{
+	struct damos_filter *filter;
+	int i = 0;
+
+	damos_for_each_ops_filter(filter, s) {
+		if (i++ == n)
+			return filter;
+	}
+	return NULL;
+}
+
+static void damos_commit_filter_arg(
+		struct damos_filter *dst, struct damos_filter *src)
+{
+	switch (dst->type) {
+	case DAMOS_FILTER_TYPE_MEMCG:
+		dst->memcg_id = src->memcg_id;
+		break;
+	case DAMOS_FILTER_TYPE_ADDR:
+		dst->addr_range = src->addr_range;
+		break;
+	case DAMOS_FILTER_TYPE_TARGET:
+		dst->target_idx = src->target_idx;
+		break;
+	case DAMOS_FILTER_TYPE_HUGEPAGE_SIZE:
+		dst->sz_range = src->sz_range;
+		break;
+	default:
+		break;
+	}
+}
+
+static void damos_commit_filter(
+		struct damos_filter *dst, struct damos_filter *src)
+{
+	dst->type = src->type;
+	dst->matching = src->matching;
+	dst->allow = src->allow;
+	damos_commit_filter_arg(dst, src);
+}
+
+static int damos_commit_core_filters(struct damos *dst, struct damos *src)
+{
+	struct damos_filter *dst_filter, *next, *src_filter, *new_filter;
+	int i = 0, j = 0;
+
+	damos_for_each_core_filter_safe(dst_filter, next, dst) {
+		src_filter = damos_nth_core_filter(i++, src);
+		if (src_filter)
+			damos_commit_filter(dst_filter, src_filter);
+		else
+			damos_destroy_filter(dst_filter);
+	}
+
+	damos_for_each_core_filter_safe(src_filter, next, src) {
+		if (j++ < i)
+			continue;
+
+		new_filter = damos_new_filter(
+				src_filter->type, src_filter->matching,
+				src_filter->allow);
+		if (!new_filter)
+			return -ENOMEM;
+		damos_commit_filter_arg(new_filter, src_filter);
+		damos_add_filter(dst, new_filter);
+	}
+	return 0;
+}
+
+static int damos_commit_ops_filters(struct damos *dst, struct damos *src)
+{
+	struct damos_filter *dst_filter, *next, *src_filter, *new_filter;
+	int i = 0, j = 0;
+
+	damos_for_each_ops_filter_safe(dst_filter, next, dst) {
+		src_filter = damos_nth_ops_filter(i++, src);
+		if (src_filter)
+			damos_commit_filter(dst_filter, src_filter);
+		else
+			damos_destroy_filter(dst_filter);
+	}
+
+	damos_for_each_ops_filter_safe(src_filter, next, src) {
+		if (j++ < i)
+			continue;
+
+		new_filter = damos_new_filter(
+				src_filter->type, src_filter->matching,
+				src_filter->allow);
+		if (!new_filter)
+			return -ENOMEM;
+		damos_commit_filter_arg(new_filter, src_filter);
+		damos_add_filter(dst, new_filter);
+	}
+	return 0;
+}
+
+/**
+ * damos_filters_default_reject() - decide whether to reject memory that didn't
+ *				    match with any given filter.
+ * @filters:	Given DAMOS filters of a group.
+ */
+static bool damos_filters_default_reject(struct list_head *filters)
+{
+	struct damos_filter *last_filter;
+
+	if (list_empty(filters))
+		return false;
+	last_filter = list_last_entry(filters, struct damos_filter, list);
+	return last_filter->allow;
+}
+
+static void damos_set_filters_default_reject(struct damos *s)
+{
+	if (!list_empty(&s->ops_filters))
+		s->core_filters_default_reject = false;
+	else
+		s->core_filters_default_reject =
+			damos_filters_default_reject(&s->core_filters);
+	s->ops_filters_default_reject =
+		damos_filters_default_reject(&s->ops_filters);
+}
+
+static bool damon_valid_probe_params(struct damon_ctx *ctx)
+{
+	unsigned long sample_interval;
+	unsigned char max_probe_hits;
+	struct damon_probe *probe;
+	unsigned int wsum, wsum_to_add;
+
+	if (!damon_has_probe_weights(ctx))
+		return true;
+
+	sample_interval = ctx->attrs.sample_interval ? : 1;
+	if (ctx->attrs.aggr_interval / sample_interval > U8_MAX)
+		return false;
+
+	/* invalid if probe hits weighted sum can overflow */
+	max_probe_hits = damon_nr_samples_per_aggr(&ctx->attrs);
+	wsum = 0;
+	damon_for_each_probe(probe, ctx) {
+		if (probe->weight > UINT_MAX / max_probe_hits)
+			return false;
+		wsum_to_add = probe->weight * max_probe_hits;
+		if (UINT_MAX - wsum < wsum_to_add)
+			return false;
+		wsum += wsum_to_add;
+	}
+	return true;
+}
+
+/*
+ * damos_commit_dests() - Copy migration destinations from @src to @dst.
+ * @dst:	Destination structure to update.
+ * @src:	Source structure to copy from.
+ *
+ * If the number of destinations has changed, the old arrays in @dst are freed
+ * and new ones are allocated.  On success, @dst contains a full copy of
+ * @src's arrays and count.
+ *
+ * On allocation failure, @dst is left in a partially torn-down state: its
+ * arrays may be NULL and @nr_dests may not reflect the actual allocation
+ * sizes.  The structure remains safe to deallocate via damon_destroy_scheme(),
+ * but callers must not reuse @dst for further commits — it should be
+ * discarded.
+ *
+ * Return: 0 on success, -ENOMEM on allocation failure.
+ */
+static int damos_commit_dests(struct damos_migrate_dests *dst,
+		struct damos_migrate_dests *src)
+{
+	if (dst->nr_dests != src->nr_dests) {
+		kfree(dst->node_id_arr);
+		kfree(dst->weight_arr);
+
+		dst->node_id_arr = kmalloc_array(src->nr_dests,
+			sizeof(*dst->node_id_arr), GFP_KERNEL);
+		if (!dst->node_id_arr) {
+			dst->weight_arr = NULL;
+			return -ENOMEM;
+		}
+
+		dst->weight_arr = kmalloc_array(src->nr_dests,
+			sizeof(*dst->weight_arr), GFP_KERNEL);
+		if (!dst->weight_arr) {
+			/* ->node_id_arr will be freed by scheme destruction */
+			return -ENOMEM;
+		}
+	}
+
+	dst->nr_dests = src->nr_dests;
+	for (int i = 0; i < src->nr_dests; i++) {
+		dst->node_id_arr[i] = src->node_id_arr[i];
+		dst->weight_arr[i] = src->weight_arr[i];
+	}
+
+	return 0;
+}
+
+static int damos_commit_filters(struct damos *dst, struct damos *src)
+{
+	int err;
+
+	err = damos_commit_core_filters(dst, src);
+	if (err)
+		return err;
+	err = damos_commit_ops_filters(dst, src);
+	if (err)
+		return err;
+	damos_set_filters_default_reject(dst);
+	return 0;
+}
+
+static struct damos *damon_nth_scheme(int n, struct damon_ctx *ctx)
+{
+	struct damos *s;
+	int i = 0;
+
+	damon_for_each_scheme(s, ctx) {
+		if (i++ == n)
+			return s;
+	}
+	return NULL;
+}
+
+static int damos_commit(struct damos *dst, struct damos *src)
+{
+	int err;
+
+	dst->pattern = src->pattern;
+	dst->action = src->action;
+	dst->apply_interval_us = src->apply_interval_us;
+
+	err = damos_commit_quota(&dst->quota, &src->quota);
+	if (err)
+		return err;
+
+	dst->wmarks = src->wmarks;
+	dst->target_nid = src->target_nid;
+
+	err = damos_commit_dests(&dst->migrate_dests, &src->migrate_dests);
+	if (err)
+		return err;
+
+	err = damos_commit_filters(dst, src);
+	if (err)
+		return err;
+
+	dst->max_nr_snapshots = src->max_nr_snapshots;
+	return 0;
+}
+
+static int damon_commit_schemes(struct damon_ctx *dst, struct damon_ctx *src)
+{
+	struct damos *dst_scheme, *next, *src_scheme, *new_scheme;
+	int i = 0, j = 0, err;
+
+	damon_for_each_scheme_safe(dst_scheme, next, dst) {
+		src_scheme = damon_nth_scheme(i++, src);
+		if (src_scheme) {
+			err = damos_commit(dst_scheme, src_scheme);
+			if (err)
+				return err;
+		} else {
+			damon_destroy_scheme(dst_scheme);
+		}
+	}
+
+	damon_for_each_scheme_safe(src_scheme, next, src) {
+		if (j++ < i)
+			continue;
+		new_scheme = damon_new_scheme(&src_scheme->pattern,
+				src_scheme->action,
+				src_scheme->apply_interval_us,
+				&src_scheme->quota, &src_scheme->wmarks,
+				NUMA_NO_NODE);
+		if (!new_scheme)
+			return -ENOMEM;
+		err = damos_commit(new_scheme, src_scheme);
+		if (err) {
+			damon_destroy_scheme(new_scheme);
+			return err;
+		}
+		damon_add_scheme(dst, new_scheme);
+	}
+	return 0;
+}
+
+static struct damon_target *damon_nth_target(int n, struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	int i = 0;
+
+	damon_for_each_target(t, ctx) {
+		if (i++ == n)
+			return t;
+	}
+	return NULL;
+}
+
+/*
+ * The caller should ensure the regions of @src are
+ * 1. valid (end >= src) and
+ * 2. sorted by starting address.
+ *
+ * If @src has no region, @dst keeps current regions.
+ */
+static int damon_commit_target_regions(struct damon_target *dst,
+		struct damon_target *src, unsigned long src_min_region_sz)
+{
+	struct damon_region *src_region, *prev = NULL;
+	struct damon_addr_range *ranges;
+	int i = 0, err;
+
+	damon_for_each_region(src_region, src) {
+		if (!prev || prev->ar.end != src_region->ar.start)
+			i++;
+		prev = src_region;
+	}
+	if (!i)
+		return 0;
+
+	ranges = kvmalloc_objs(*ranges, i, GFP_KERNEL | __GFP_NOWARN);
+	if (!ranges)
+		return -ENOMEM;
+	prev = NULL;
+	i = 0;
+	damon_for_each_region(src_region, src) {
+		if (!prev) {
+			ranges[i].start = src_region->ar.start;
+		} else if (prev->ar.end != src_region->ar.start) {
+			ranges[i++].end = prev->ar.end;
+			ranges[i].start = src_region->ar.start;
+		}
+		prev = src_region;
+	}
+	ranges[i++].end = damon_last_region(src)->ar.end;
+	err = damon_set_regions(dst, ranges, i, src_min_region_sz);
+	kvfree(ranges);
+	return err;
+}
+
+static int damon_commit_target(
+		struct damon_target *dst, bool dst_has_pid,
+		struct damon_target *src, bool src_has_pid,
+		unsigned long src_min_region_sz)
+{
+	int err;
+
+	err = damon_commit_target_regions(dst, src, src_min_region_sz);
+	if (err)
+		return err;
+	if (dst_has_pid)
+		put_pid(dst->pid);
+	if (src_has_pid)
+		get_pid(src->pid);
+	dst->pid = src->pid;
+	return 0;
+}
+
+/*
+ * damon_revert_target_commits() - revert unsuccessful target commits.
+ * @dst:	Commit destination context
+ * @failed:	Commit failed destination target
+ * @src:	Commit source context
+ *
+ * Revert target states that changed by damon_commit_target(), and cannot be
+ * cleaned up by the destination context's ops.cleanup_target().
+ */
+static void damon_revert_target_commits(struct damon_ctx *dst,
+		struct damon_target *failed, struct damon_ctx *src)
+{
+	struct damon_target *target;
+
+	if (!damon_target_has_pid(src))
+		return;
+	if (dst->ops.cleanup_target)
+		return;
+	damon_for_each_target(target, dst) {
+		if (target == failed)
+			return;
+		put_pid(target->pid);
+	}
+}
+
+static int damon_commit_targets(
+		struct damon_ctx *dst, struct damon_ctx *src)
+{
+	struct damon_target *dst_target, *next, *src_target, *new_target;
+	struct damon_target *failed;
+	int i = 0, j = 0, err;
+
+	damon_for_each_target_safe(dst_target, next, dst) {
+		src_target = damon_nth_target(i++, src);
+		/*
+		 * If src target is obsolete, do not commit the parameters to
+		 * the dst target, and further remove the dst target.
+		 */
+		if (src_target && !src_target->obsolete) {
+			err = damon_commit_target(
+					dst_target, damon_target_has_pid(dst),
+					src_target, damon_target_has_pid(src),
+					src->min_region_sz);
+			if (err) {
+				failed = dst_target;
+				goto out;
+			}
+		} else {
+			struct damos *s;
+
+			damon_destroy_target(dst_target, dst);
+			damon_for_each_scheme(s, dst) {
+				if (s->quota.charge_target_from == dst_target) {
+					s->quota.charge_target_from = NULL;
+					s->quota.charge_addr_from = 0;
+				}
+			}
+		}
+	}
+
+	failed = NULL;
+	damon_for_each_target_safe(src_target, next, src) {
+		if (j++ < i)
+			continue;
+		/* target to remove has no matching dst */
+		if (src_target->obsolete) {
+			err = -EINVAL;
+			goto out;
+		}
+		new_target = damon_new_target();
+		if (!new_target) {
+			err = -ENOMEM;
+			goto out;
+		}
+		err = damon_commit_target(new_target, false,
+				src_target, damon_target_has_pid(src),
+				src->min_region_sz);
+		if (err) {
+			damon_destroy_target(new_target, NULL);
+			goto out;
+		}
+		damon_add_target(dst, new_target);
+	}
+	return 0;
+
+out:
+	damon_revert_target_commits(dst, failed, src);
+	return err;
+}
+
+static void damon_commit_filter(struct damon_filter *dst,
+		struct damon_filter *src)
+{
+	dst->type = src->type;
+	dst->matching = src->matching;
+	dst->allow = src->allow;
+	switch (dst->type) {
+	case DAMON_FILTER_TYPE_MEMCG:
+		dst->memcg_id = src->memcg_id;
+		break;
+	default:
+		break;
+	}
+}
+
+static int damon_commit_filters(struct damon_probe *dst,
+		struct damon_probe *src)
+{
+	struct damon_filter *dst_filter, *next, *src_filter, *new_filter;
+	int i = 0, j = 0;
+
+	damon_for_each_filter_safe(dst_filter, next, dst) {
+		src_filter = damon_nth_filter(i++, src);
+		if (src_filter)
+			damon_commit_filter(dst_filter, src_filter);
+		else
+			damon_destroy_filter(dst_filter);
+	}
+
+	damon_for_each_filter_safe(src_filter, next, src) {
+		if (j++ < i)
+			continue;
+
+		new_filter = damon_new_filter(src_filter->type,
+				src_filter->matching, src_filter->allow);
+		if (!new_filter)
+			return -ENOMEM;
+		switch (src_filter->type) {
+		case DAMON_FILTER_TYPE_MEMCG:
+			new_filter->memcg_id = src_filter->memcg_id;
+			break;
+		default:
+			break;
+		}
+		damon_add_filter(dst, new_filter);
+	}
+	return 0;
+}
+
+static int damon_commit_probes(struct damon_ctx *dst, struct damon_ctx *src)
+{
+	struct damon_probe *dst_probe, *next, *src_probe, *new_probe;
+	int i = 0, j = 0, err;
+
+	damon_for_each_probe_safe(dst_probe, next, dst) {
+		src_probe = damon_nth_probe(i++, src);
+		if (src_probe) {
+			dst_probe->weight = src_probe->weight;
+			err = damon_commit_filters(dst_probe, src_probe);
+			if (err)
+				return err;
+		} else {
+			damon_destroy_probe(dst_probe);
+		}
+	}
+
+	damon_for_each_probe_safe(src_probe, next, src) {
+		if (j++ < i)
+			continue;
+
+		new_probe = damon_new_probe();
+		if (!new_probe)
+			return -ENOMEM;
+		damon_add_probe(dst, new_probe);
+		new_probe->weight = src_probe->weight;
+		err = damon_commit_filters(new_probe, src_probe);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int __damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
+{
+	int err;
+	struct damos *scheme;
+	struct damos_quota_goal *goal;
+
+	dst->maybe_corrupted = true;
+	if (!is_power_of_2(src->min_region_sz))
+		return -EINVAL;
+
+	/* node_eligible_mem_bp metric requires PADDR ops */
+	if (src->ops.id != DAMON_OPS_PADDR) {
+		damon_for_each_scheme(scheme, src) {
+			struct damos_quota *quota = &scheme->quota;
+
+			damos_for_each_quota_goal(goal, quota) {
+				if (goal->metric ==
+						DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP)
+					return -EINVAL;
+			}
+		}
+	}
+
+	if (!damon_valid_probe_params(src))
+		return -EINVAL;
+
+	err = damon_commit_schemes(dst, src);
+	if (err)
+		return err;
+	err = damon_commit_targets(dst, src);
+	if (err)
+		return err;
+	/*
+	 * schemes and targets should be updated first, since
+	 * 1. damon_set_attrs() updates monitoring results of targets and
+	 * next_apply_sis of schemes, and
+	 * 2. ops update should be done after pid handling is done (target
+	 *    committing require putting pids).
+	 */
+	if (!damon_attrs_equals(&dst->attrs, &src->attrs)) {
+		err = damon_set_attrs(dst, &src->attrs);
+		if (err) {
+			damon_revert_target_commits(dst, NULL, src);
+			return err;
+		}
+	}
+	dst->pause = src->pause;
+	dst->ops = src->ops;
+	err = damon_commit_probes(dst, src);
+	if (err)
+		return err;
+	dst->addr_unit = src->addr_unit;
+	dst->min_region_sz = src->min_region_sz;
+
+	dst->maybe_corrupted = false;
+	return 0;
+}
+
+static struct damon_ctx *damon_new_test_ctx(struct damon_ctx *dst)
+{
+	struct damon_ctx *test_ctx;
+	int err;
+
+	test_ctx = damon_new_ctx();
+	if (!test_ctx)
+		return NULL;
+	err = __damon_commit_ctx(test_ctx, dst);
+	if (err) {
+		damon_destroy_ctx(test_ctx);
+		return NULL;
+	}
+	return test_ctx;
+}
+
+/**
+ * damon_commit_ctx() - Commit parameters of a DAMON context to another.
+ * @dst:	The commit destination DAMON context.
+ * @src:	The commit source DAMON context.
+ *
+ * This function copies user-specified parameters from @src to @dst and update
+ * the internal status and results accordingly.  Users should use this function
+ * for context-level parameters update of running context, instead of manual
+ * in-place updates.
+ *
+ * This function should be called from parameters-update safe context, like
+ * damon_call().
+ */
+int damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src)
+{
+	struct damon_ctx *test_ctx;
+	int err;
+
+	test_ctx = damon_new_test_ctx(dst);
+	if (!test_ctx)
+		return -ENOMEM;
+	err = __damon_commit_ctx(test_ctx, src);
+	if (err)
+		goto out;
+	err = __damon_commit_ctx(dst, src);
+out:
+	damon_destroy_ctx(test_ctx);
+	return err;
+}
+
+/**
+ * damon_nr_running_ctxs() - Return number of currently running contexts.
+ */
+int damon_nr_running_ctxs(void)
+{
+	int nr_ctxs;
+
+	mutex_lock(&damon_lock);
+	nr_ctxs = nr_running_ctxs;
+	mutex_unlock(&damon_lock);
+
+	return nr_ctxs;
+}
+
+/* Returns the size upper limit for each monitoring region */
+static unsigned long damon_region_sz_limit(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	unsigned long sz = 0;
+
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region(r, t)
+			sz += damon_sz_region(r);
+	}
+
+	if (ctx->attrs.min_nr_regions)
+		sz /= ctx->attrs.min_nr_regions;
+	if (sz < ctx->min_region_sz)
+		sz = ctx->min_region_sz;
+
+	return sz;
+}
+
+static int damon_split_region_at(struct damon_target *t,
+				  struct damon_region *r, unsigned long sz_r);
+
+/*
+ * damon_apply_min_nr_regions() - Make effect of min_nr_regions parameter.
+ * @ctx:	monitoring context.
+ *
+ * This function implement min_nr_regions (minimum number of damon_region
+ * objects in the given monitoring context) behavior.  It first calculates
+ * maximum size of each region for enforcing the min_nr_regions as total size
+ * of the regions divided by the min_nr_regions.  After that, this function
+ * splits regions to ensure all regions are equal to or smaller than the size
+ * limit.  Finally, this function returns the maximum size limit.
+ *
+ * Returns: maximum size of each region for convincing min_nr_regions.
+ */
+static unsigned long damon_apply_min_nr_regions(struct damon_ctx *ctx)
+{
+	unsigned long max_region_sz = damon_region_sz_limit(ctx);
+	struct damon_target *t;
+	struct damon_region *r, *next;
+
+	max_region_sz = ALIGN(max_region_sz, ctx->min_region_sz);
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region_safe(r, next, t) {
+			while (damon_sz_region(r) > max_region_sz) {
+				if (damon_split_region_at(t, r, max_region_sz))
+					goto out;
+				r = damon_next_region(r);
+			}
+		}
+	}
+out:
+	return max_region_sz;
+}
+
+static int kdamond_fn(void *data);
+
+/*
+ * __damon_start() - Starts monitoring with given context.
+ * @ctx:	monitoring context
+ *
+ * This function should be called while damon_lock is hold.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+static int __damon_start(struct damon_ctx *ctx)
+{
+	int err = -EBUSY;
+
+	mutex_lock(&ctx->kdamond_lock);
+	if (!ctx->kdamond) {
+		err = 0;
+		reinit_completion(&ctx->kdamond_started);
+		ctx->kdamond = kthread_run(kdamond_fn, ctx, "kdamond.%d",
+				nr_running_ctxs);
+		if (IS_ERR(ctx->kdamond)) {
+			err = PTR_ERR(ctx->kdamond);
+			ctx->kdamond = NULL;
+		} else {
+			wait_for_completion(&ctx->kdamond_started);
+		}
+	}
+	mutex_unlock(&ctx->kdamond_lock);
+
+	return err;
+}
+
+static int __damon_commit_ctx(struct damon_ctx *dst, struct damon_ctx *src);
+
+/**
+ * damon_start() - Starts the monitorings for a given group of contexts.
+ * @ctxs:	an array of the pointers for contexts to start monitoring
+ * @nr_ctxs:	size of @ctxs
+ * @exclusive:	exclusiveness of this contexts group
+ *
+ * This function starts a group of monitoring threads for a group of monitoring
+ * contexts.  One thread per each context is created and run in parallel.  The
+ * caller should handle synchronization between the threads by itself.  If
+ * @exclusive is true and a group of threads that created by other
+ * 'damon_start()' call is currently running, this function does nothing but
+ * returns -EBUSY.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damon_start(struct damon_ctx **ctxs, int nr_ctxs, bool exclusive)
+{
+	int i;
+	int err = 0;
+
+	for (i = 0; i < nr_ctxs; i++) {
+		struct damon_ctx *test_ctx;
+
+		test_ctx = damon_new_ctx();
+		if (!test_ctx)
+			return -ENOMEM;
+
+		err = __damon_commit_ctx(test_ctx, ctxs[i]);
+		damon_destroy_ctx(test_ctx);
+		if (err)
+			return err;
+	}
+
+	mutex_lock(&damon_lock);
+	if ((exclusive && nr_running_ctxs) ||
+			(!exclusive && running_exclusive_ctxs)) {
+		mutex_unlock(&damon_lock);
+		return -EBUSY;
+	}
+
+	for (i = 0; i < nr_ctxs; i++) {
+		err = __damon_start(ctxs[i]);
+		if (err)
+			break;
+		nr_running_ctxs++;
+	}
+	if (exclusive && nr_running_ctxs)
+		running_exclusive_ctxs = true;
+	mutex_unlock(&damon_lock);
+
+	if (i != nr_ctxs)
+		damon_stop(ctxs, i);
+
+	return err;
+}
+
+/*
+ * __damon_stop() - Stops monitoring of a given context.
+ * @ctx:	monitoring context
+ */
+static void __damon_stop(struct damon_ctx *ctx)
+{
+	struct task_struct *tsk;
+
+	mutex_lock(&ctx->kdamond_lock);
+	tsk = ctx->kdamond;
+	if (tsk) {
+		get_task_struct(tsk);
+		mutex_unlock(&ctx->kdamond_lock);
+		kthread_stop_put(tsk);
+		return;
+	}
+	mutex_unlock(&ctx->kdamond_lock);
+}
+
+/**
+ * damon_stop() - Stops the monitorings for a given group of contexts.
+ * @ctxs:	an array of the pointers for contexts to stop monitoring
+ * @nr_ctxs:	size of @ctxs
+ */
+void damon_stop(struct damon_ctx **ctxs, int nr_ctxs)
+{
+	int i;
+
+	for (i = 0; i < nr_ctxs; i++)
+		/* nr_running_ctxs is decremented in kdamond_fn */
+		__damon_stop(ctxs[i]);
+}
+
+/**
+ * damon_is_running() - Returns if a given DAMON context is running.
+ * @ctx:	The DAMON context to see if running.
+ *
+ * Return: true if @ctx is running, false otherwise.
+ */
+bool damon_is_running(struct damon_ctx *ctx)
+{
+	bool running;
+
+	mutex_lock(&ctx->kdamond_lock);
+	running = ctx->kdamond != NULL;
+	mutex_unlock(&ctx->kdamond_lock);
+	return running;
+}
+
+/**
+ * damon_kdamond_pid() - Return pid of a given DAMON context's worker thread.
+ * @ctx:	The DAMON context of the question.
+ *
+ * Return: pid if @ctx is running, negative error code otherwise.
+ */
+int damon_kdamond_pid(struct damon_ctx *ctx)
+{
+	int pid = -EINVAL;
+
+	mutex_lock(&ctx->kdamond_lock);
+	if (ctx->kdamond)
+		pid = ctx->kdamond->pid;
+	mutex_unlock(&ctx->kdamond_lock);
+	return pid;
+}
+
+/**
+ * damon_call() - Invoke a given function on DAMON worker thread (kdamond).
+ * @ctx:	DAMON context to call the function for.
+ * @control:	Control variable of the call request.
+ *
+ * Ask DAMON worker thread (kdamond) of @ctx to call a function with an
+ * argument data that respectively passed via &damon_call_control->fn and
+ * &damon_call_control->data of @control.  If &damon_call_control->repeat of
+ * @control is unset, further wait until the kdamond finishes handling of the
+ * request.  Otherwise, return as soon as the request is made.
+ *
+ * The kdamond executes the function with the argument in the main loop, just
+ * after a sampling of the iteration is finished.  The function can hence
+ * safely access the internal data of the &struct damon_ctx without additional
+ * synchronization.  The return value of the function will be saved in
+ * &damon_call_control->return_code.
+ *
+ * Note that this function should be called only after damon_start() with the
+ * @ctx has succeeded.  Otherwise, this function could fall into an indefinite
+ * wait.
+ *
+ * When this function is failed, the @ctx is guaranteed to be stopped.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damon_call(struct damon_ctx *ctx, struct damon_call_control *control)
+{
+	if (!control->repeat)
+		init_completion(&control->completion);
+	control->canceled = false;
+	INIT_LIST_HEAD(&control->list);
+
+	mutex_lock(&ctx->call_controls_lock);
+	if (ctx->call_controls_obsolete) {
+		mutex_unlock(&ctx->call_controls_lock);
+		goto canceled;
+	}
+	list_add_tail(&control->list, &ctx->call_controls);
+	mutex_unlock(&ctx->call_controls_lock);
+	if (control->repeat)
+		return 0;
+	wait_for_completion(&control->completion);
+	if (control->canceled)
+		goto canceled;
+	return 0;
+
+canceled:
+	while (damon_is_running(ctx))
+		schedule_timeout_idle(msecs_to_jiffies(100));
+	return -ECANCELED;
+
+}
+
+/**
+ * damos_walk() - Invoke a given functions while DAMOS walk regions.
+ * @ctx:	DAMON context to call the functions for.
+ * @control:	Control variable of the walk request.
+ *
+ * Ask DAMON worker thread (kdamond) of @ctx to call a function for each region
+ * that the kdamond will apply DAMOS action to, and wait until the kdamond
+ * finishes handling of the request.
+ *
+ * The kdamond executes the given function in the main loop, for each region
+ * just after it applied any DAMOS actions of @ctx to it.  The invocation is
+ * made only within one &damos->apply_interval_us since damos_walk()
+ * invocation, for each scheme.  The given callback function can hence safely
+ * access the internal data of &struct damon_ctx and &struct damon_region that
+ * each of the scheme will apply the action for next interval, without
+ * additional synchronizations against the kdamond.  If every scheme of @ctx
+ * passed at least one &damos->apply_interval_us, kdamond marks the request as
+ * completed so that damos_walk() can wakeup and return.
+ *
+ * Note that this function should be called only after damon_start() with the
+ * @ctx has succeeded.  Otherwise, this function could fall into an indefinite
+ * wait.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damos_walk(struct damon_ctx *ctx, struct damos_walk_control *control)
+{
+	init_completion(&control->completion);
+	control->canceled = false;
+	mutex_lock(&ctx->walk_control_lock);
+	if (ctx->walk_control_obsolete) {
+		mutex_unlock(&ctx->walk_control_lock);
+		return -ECANCELED;
+	}
+	if (ctx->walk_control) {
+		mutex_unlock(&ctx->walk_control_lock);
+		return -EBUSY;
+	}
+	ctx->walk_control = control;
+	mutex_unlock(&ctx->walk_control_lock);
+	wait_for_completion(&control->completion);
+	if (control->canceled)
+		return -ECANCELED;
+	return 0;
+}
+
+/*
+ * Reset the aggregated monitoring results ('nr_accesses' of each region).
+ */
+static void kdamond_reset_aggregated(struct damon_ctx *c)
+{
+	struct damon_target *t;
+	unsigned int ti = 0;	/* target's index */
+	unsigned int nr_probes = 0;
+	struct damon_probe *probe;
+
+	if (trace_damon_region_aggregated_enabled()) {
+		damon_for_each_probe(probe, c)
+			nr_probes++;
+	}
+
+	damon_for_each_target(t, c) {
+		struct damon_region *r;
+
+		damon_for_each_region(r, t) {
+			int i;
+
+			trace_damon_aggregated(ti, r, damon_nr_regions(t));
+			trace_damon_region_aggregated(ti, r,
+					damon_nr_regions(t), nr_probes);
+			r->last_nr_accesses = r->nr_accesses;
+			r->nr_accesses = 0;
+			for (i = 0; i < DAMON_MAX_PROBES; i++) {
+				r->last_probe_hits[i] = r->probe_hits[i];
+				r->probe_hits[i] = 0;
+			}
+		}
+		ti++;
+	}
+}
+
+static unsigned long damon_get_intervals_score(struct damon_ctx *c)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	unsigned long sz_region, max_access_events = 0, access_events = 0;
+	unsigned long target_access_events;
+	unsigned long goal_bp = c->attrs.intervals_goal.access_bp;
+
+	damon_for_each_target(t, c) {
+		damon_for_each_region(r, t) {
+			sz_region = damon_sz_region(r);
+			max_access_events += sz_region * c->attrs.aggr_samples;
+			access_events += sz_region * r->nr_accesses;
+		}
+	}
+	target_access_events = max_access_events * goal_bp / 10000;
+	target_access_events = target_access_events ? : 1;
+	return mult_frac(access_events, 10000, target_access_events);
+}
+
+static unsigned long damon_feed_loop_next_input(unsigned long last_input,
+		unsigned long score);
+
+static unsigned long damon_get_intervals_adaptation_bp(struct damon_ctx *c)
+{
+	unsigned long score_bp, adaptation_bp;
+
+	score_bp = damon_get_intervals_score(c);
+	adaptation_bp = damon_feed_loop_next_input(100000000, score_bp) /
+		10000;
+	/*
+	 * adaptation_bp ranges from 1 to 20,000.  Avoid too rapid reduction of
+	 * the intervals by rescaling [1,10,000] to [5000, 10,000].
+	 */
+	if (adaptation_bp <= 10000)
+		adaptation_bp = 5000 + adaptation_bp / 2;
+	return adaptation_bp;
+}
+
+static noinline_for_stack void kdamond_tune_intervals(struct damon_ctx *c)
+{
+	unsigned long adaptation_bp;
+	struct damon_attrs new_attrs;
+	struct damon_intervals_goal *goal;
+
+	adaptation_bp = damon_get_intervals_adaptation_bp(c);
+	if (adaptation_bp == 10000)
+		return;
+
+	new_attrs = c->attrs;
+	goal = &c->attrs.intervals_goal;
+	new_attrs.sample_interval = min(goal->max_sample_us,
+			c->attrs.sample_interval * adaptation_bp / 10000);
+	new_attrs.sample_interval = max(goal->min_sample_us,
+			new_attrs.sample_interval);
+	new_attrs.aggr_interval = new_attrs.sample_interval *
+		c->attrs.aggr_samples;
+	trace_damon_monitor_intervals_tune(new_attrs.sample_interval);
+	damon_set_attrs(c, &new_attrs);
+}
+
+static bool __damos_valid_target(struct damon_region *r, struct damos *s,
+		struct damon_ctx *c)
+{
+	unsigned long sz;
+	unsigned int nr_accesses = damon_nr_accesses_mvsum(r, c);
+
+	sz = damon_sz_region(r);
+	return s->pattern.min_sz_region <= sz &&
+		sz <= s->pattern.max_sz_region &&
+		s->pattern.min_nr_accesses <= nr_accesses &&
+		nr_accesses <= s->pattern.max_nr_accesses &&
+		s->pattern.min_age_region <= r->age &&
+		r->age <= s->pattern.max_age_region;
+}
+
+/*
+ * damos_quota_is_set() - Return if the given quota is actually set.
+ * @quota:	The quota to check.
+ *
+ * Returns true if the quota is set, false otherwise.
+ */
+static bool damos_quota_is_set(struct damos_quota *quota)
+{
+	return quota->esz || quota->sz || quota->ms ||
+		!damos_quota_goals_empty(quota);
+}
+
+static bool damos_valid_target(struct damon_ctx *c, struct damon_region *r,
+		struct damos *s)
+{
+	bool ret = __damos_valid_target(r, s, c);
+
+	if (!ret || !damos_quota_is_set(&s->quota) || !c->ops.get_scheme_score)
+		return ret;
+
+	return c->ops.get_scheme_score(c, r, s) >= s->quota.min_score;
+}
+
+/*
+ * damos_skip_charged_region() - Check if the given region or starting part of
+ * it is already charged for the DAMOS quota.
+ * @t:	The target of the region.
+ * @rp:	The pointer to the region.
+ * @s:	The scheme to be applied.
+ * @min_region_sz:	minimum region size.
+ *
+ * If a quota of a scheme has exceeded in a quota charge window, the scheme's
+ * action would applied to only a part of the target access pattern fulfilling
+ * regions.  To avoid applying the scheme action to only already applied
+ * regions, DAMON skips applying the scheme action to the regions that charged
+ * in the previous charge window.
+ *
+ * This function checks if a given region should be skipped or not for the
+ * reason.  If only the starting part of the region has previously charged,
+ * this function splits the region into two so that the second one covers the
+ * area that not charged in the previous charge widnow, and return true.  The
+ * caller can see the second one on the next iteration of the region walk.
+ * Note that this means the caller should use damon_for_each_region() instead
+ * of damon_for_each_region_safe().  If damon_for_each_region_safe() is used,
+ * the second region will just be ignored.
+ *
+ * Return: true if the region should be skipped, false otherwise.
+ */
+static bool damos_skip_charged_region(struct damon_target *t,
+		struct damon_region *r, struct damos *s,
+		unsigned long min_region_sz)
+{
+	struct damos_quota *quota = &s->quota;
+	unsigned long sz_to_skip;
+
+	/* Skip previously charged regions */
+	if (quota->charge_target_from) {
+		if (t != quota->charge_target_from)
+			return true;
+		if (r == damon_last_region(t)) {
+			quota->charge_target_from = NULL;
+			quota->charge_addr_from = 0;
+			return true;
+		}
+		if (quota->charge_addr_from &&
+				r->ar.end <= quota->charge_addr_from)
+			return true;
+
+		if (quota->charge_addr_from && r->ar.start <
+				quota->charge_addr_from) {
+			sz_to_skip = ALIGN_DOWN(quota->charge_addr_from -
+					r->ar.start, min_region_sz);
+			if (!sz_to_skip) {
+				if (damon_sz_region(r) <= min_region_sz)
+					return true;
+				sz_to_skip = min_region_sz;
+			}
+			damon_split_region_at(t, r, sz_to_skip);
+			return true;
+		}
+		quota->charge_target_from = NULL;
+		quota->charge_addr_from = 0;
+	}
+	return false;
+}
+
+static void damos_update_stat(struct damos *s,
+		unsigned long sz_tried, unsigned long sz_applied,
+		unsigned long sz_ops_filter_passed)
+{
+	s->stat.nr_tried++;
+	s->stat.sz_tried += sz_tried;
+	if (sz_applied)
+		s->stat.nr_applied++;
+	s->stat.sz_applied += sz_applied;
+	s->stat.sz_ops_filter_passed += sz_ops_filter_passed;
+}
+
+static bool damos_filter_match(struct damon_ctx *ctx, struct damon_target *t,
+		struct damon_region *r, struct damos_filter *filter,
+		unsigned long min_region_sz)
+{
+	bool matched = false;
+	struct damon_target *ti;
+	int target_idx = 0;
+	unsigned long start, end;
+
+	switch (filter->type) {
+	case DAMOS_FILTER_TYPE_TARGET:
+		damon_for_each_target(ti, ctx) {
+			if (ti == t)
+				break;
+			target_idx++;
+		}
+		matched = target_idx == filter->target_idx;
+		break;
+	case DAMOS_FILTER_TYPE_ADDR:
+		start = ALIGN_DOWN(filter->addr_range.start, min_region_sz);
+		end = ALIGN_DOWN(filter->addr_range.end, min_region_sz);
+
+		/* inside the range */
+		if (start <= r->ar.start && r->ar.end <= end) {
+			matched = true;
+			break;
+		}
+		/* outside of the range */
+		if (r->ar.end <= start || end <= r->ar.start) {
+			matched = false;
+			break;
+		}
+		/* start before the range and overlap */
+		if (r->ar.start < start) {
+			damon_split_region_at(t, r, start - r->ar.start);
+			matched = false;
+			break;
+		}
+		/* start inside the range */
+		damon_split_region_at(t, r, end - r->ar.start);
+		matched = true;
+		break;
+	default:
+		return false;
+	}
+
+	return matched == filter->matching;
+}
+
+static bool damos_core_filter_out(struct damon_ctx *ctx, struct damon_target *t,
+		struct damon_region *r, struct damos *s)
+{
+	struct damos_filter *filter;
+
+	s->core_filters_allowed = false;
+	damos_for_each_core_filter(filter, s) {
+		if (damos_filter_match(ctx, t, r, filter, ctx->min_region_sz)) {
+			if (filter->allow)
+				s->core_filters_allowed = true;
+			return !filter->allow;
+		}
+	}
+	return s->core_filters_default_reject;
+}
+
+/*
+ * damos_walk_call_walk() - Call &damos_walk_control->walk_fn.
+ * @ctx:	The context of &damon_ctx->walk_control.
+ * @t:		The monitoring target of @r that @s will be applied.
+ * @r:		The region of @t that @s will be applied.
+ * @s:		The scheme of @ctx that will be applied to @r.
+ *
+ * This function is called from kdamond whenever it asked the operation set to
+ * apply a DAMOS scheme action to a region.  If a DAMOS walk request is
+ * installed by damos_walk() and not yet uninstalled, invoke it.
+ */
+static void damos_walk_call_walk(struct damon_ctx *ctx, struct damon_target *t,
+		struct damon_region *r, struct damos *s,
+		unsigned long sz_filter_passed)
+{
+	struct damos_walk_control *control;
+
+	if (s->walk_completed)
+		return;
+
+	control = ctx->walk_control;
+	if (!control)
+		return;
+
+	control->walk_fn(control->data, ctx, t, r, s, sz_filter_passed);
+}
+
+/*
+ * damos_walk_complete() - Complete DAMOS walk request if all walks are done.
+ * @ctx:	The context of &damon_ctx->walk_control.
+ * @s:		A scheme of @ctx that all walks are now done.
+ *
+ * This function is called when kdamond finished applying the action of a DAMOS
+ * scheme to all regions that eligible for the given &damos->apply_interval_us.
+ * If every scheme of @ctx including @s now finished walking for at least one
+ * &damos->apply_interval_us, this function makrs the handling of the given
+ * DAMOS walk request is done, so that damos_walk() can wake up and return.
+ */
+static void damos_walk_complete(struct damon_ctx *ctx, struct damos *s)
+{
+	struct damos *siter;
+	struct damos_walk_control *control;
+
+	control = ctx->walk_control;
+	if (!control)
+		return;
+
+	s->walk_completed = true;
+	/* if all schemes completed, signal completion to walker */
+	damon_for_each_scheme(siter, ctx) {
+		if (!siter->walk_completed)
+			return;
+	}
+	damon_for_each_scheme(siter, ctx)
+		siter->walk_completed = false;
+
+	complete(&control->completion);
+	ctx->walk_control = NULL;
+}
+
+/*
+ * damos_walk_cancel() - Cancel the current DAMOS walk request.
+ * @ctx:	The context of &damon_ctx->walk_control.
+ *
+ * This function is called when @ctx is deactivated by DAMOS watermarks, DAMOS
+ * walk is requested but there is no DAMOS scheme to walk for, or the kdamond
+ * is already out of the main loop and therefore gonna be terminated, and hence
+ * cannot continue the walks.  This function therefore marks the walk request
+ * as canceled, so that damos_walk() can wake up and return.
+ */
+static void damos_walk_cancel(struct damon_ctx *ctx)
+{
+	struct damos_walk_control *control;
+
+	mutex_lock(&ctx->walk_control_lock);
+	control = ctx->walk_control;
+	mutex_unlock(&ctx->walk_control_lock);
+
+	if (!control)
+		return;
+	control->canceled = true;
+	complete(&control->completion);
+	mutex_lock(&ctx->walk_control_lock);
+	ctx->walk_control = NULL;
+	mutex_unlock(&ctx->walk_control_lock);
+}
+
+static void damos_charge_quota(struct damos_quota *quota,
+		unsigned long sz_region, unsigned long sz_applied)
+{
+	/*
+	 * sz_applied could be bigger than sz_region, depending on ops
+	 * implementation of the action, e.g., damos_pa_pageout().  Charge only
+	 * the region size in the case.
+	 */
+	if (!quota->fail_charge_denom || sz_applied > sz_region)
+		quota->charged_sz += sz_region;
+	else
+		quota->charged_sz += sz_applied + mult_frac(
+				(sz_region - sz_applied),
+				quota->fail_charge_num,
+				quota->fail_charge_denom);
+}
+
+static bool damos_quota_is_full(struct damos_quota *quota,
+		unsigned long min_region_sz)
+{
+	if (!damos_quota_is_set(quota))
+		return false;
+	if (quota->charged_sz >= quota->esz)
+		return true;
+	/*
+	 * DAMOS action is applied per region, so <min_region_sz remaining
+	 * quota means the quota is effectively full.
+	 */
+	return quota->esz - quota->charged_sz < min_region_sz;
+}
+
+static void damos_apply_scheme(struct damon_ctx *c, struct damon_target *t,
+		struct damon_region *r, struct damos *s)
+{
+	struct damos_quota *quota = &s->quota;
+	unsigned long sz = damon_sz_region(r);
+	struct timespec64 begin, end;
+	unsigned long sz_applied = 0;
+	unsigned long sz_ops_filter_passed = 0;
+	/*
+	 * We plan to support multiple context per kdamond, as DAMON sysfs
+	 * implies with 'nr_contexts' file.  Nevertheless, only single context
+	 * per kdamond is supported for now.  So, we can simply use '0' context
+	 * index here.
+	 */
+	unsigned int cidx = 0;
+	struct damos *siter;		/* schemes iterator */
+	unsigned int sidx = 0;
+	struct damon_target *titer;	/* targets iterator */
+	unsigned int tidx = 0, nr_accesses = 0;
+	bool do_trace = false;
+
+	/* get indices for trace_damos_before_apply() */
+	if (trace_damos_before_apply_enabled()) {
+		damon_for_each_scheme(siter, c) {
+			if (siter == s)
+				break;
+			sidx++;
+		}
+		damon_for_each_target(titer, c) {
+			if (titer == t)
+				break;
+			tidx++;
+		}
+		nr_accesses = damon_nr_accesses_mvsum(r, c);
+		do_trace = true;
+	}
+
+	if (c->ops.apply_scheme) {
+		if (damos_quota_is_set(quota) &&
+				quota->charged_sz + sz > quota->esz) {
+			sz = ALIGN_DOWN(quota->esz - quota->charged_sz,
+					c->min_region_sz);
+			if (!sz)
+				goto update_stat;
+			damon_split_region_at(t, r, sz);
+		}
+		if (damos_core_filter_out(c, t, r, s))
+			return;
+		ktime_get_coarse_ts64(&begin);
+		trace_damos_before_apply(cidx, sidx, tidx, r, nr_accesses,
+				damon_nr_regions(t), do_trace);
+		sz_applied = c->ops.apply_scheme(c, t, r, s,
+				&sz_ops_filter_passed);
+		damos_walk_call_walk(c, t, r, s, sz_ops_filter_passed);
+		ktime_get_coarse_ts64(&end);
+		quota->total_charged_ns += timespec64_to_ns(&end) -
+			timespec64_to_ns(&begin);
+		damos_charge_quota(quota, sz, sz_applied);
+		if (damos_quota_is_full(quota, c->min_region_sz)) {
+			quota->charge_target_from = t;
+			quota->charge_addr_from = r->ar.end;
+		}
+	}
+	if (s->action != DAMOS_STAT)
+		r->age = 0;
+
+update_stat:
+	damos_update_stat(s, sz, sz_applied, sz_ops_filter_passed);
+}
+
+static void damon_do_apply_schemes(struct damon_ctx *c,
+				   struct damon_target *t,
+				   struct damon_region *r)
+{
+	struct damos *s;
+
+	damon_for_each_scheme(s, c) {
+		struct damos_quota *quota = &s->quota;
+
+		if (time_before(c->passed_sample_intervals, s->next_apply_sis))
+			continue;
+
+		if (!s->wmarks.activated)
+			continue;
+
+		/* Check the quota */
+		if (damos_quota_is_full(quota, c->min_region_sz))
+			continue;
+
+		if (damos_skip_charged_region(t, r, s, c->min_region_sz))
+			continue;
+
+		if (s->max_nr_snapshots &&
+				s->max_nr_snapshots <= s->stat.nr_snapshots)
+			continue;
+
+		if (damos_valid_target(c, r, s))
+			damos_apply_scheme(c, t, r, s);
+
+		if (damon_is_last_region(r, t))
+			s->stat.nr_snapshots++;
+	}
+}
+
+/*
+ * damos_apply_target() - Apply DAMOS schemes to a given target.
+ * @c:			monitoring context to apply its DAMOS schemes to..
+ * @t:			monitoring target to apply the schemes to.
+ * @max_region_sz:	maximum region size for @c.
+ *
+ * This function could split regions for keeping the quota.  To minimize
+ * overhead from the split operations increased number of regions, this
+ * function will also merge regions after the schemes applying attempt is done,
+ * for each region.  The merge operation is made only when it doesn't lose the
+ * monitoring information and not violating @max_region_sz.
+ *
+ * Hence, after this function is called, the total number of regions could
+ * be increased or reduced.  The increase could make max_nr_regions temporarily
+ * be violated, until the next per-aggregation interval regions merge operation
+ * is executed.  The decrease will not violate min_nr_regions though, since it
+ * keeps @max_region_sz.
+ */
+static void damos_apply_target(struct damon_ctx *c, struct damon_target *t,
+		unsigned long max_region_sz)
+{
+	struct damon_region *r;
+
+	damon_for_each_region(r, t) {
+		struct damon_region *prev_r;
+
+		damon_do_apply_schemes(c, t, r);
+		/*
+		 * damon_do_apply_scheems() could split the region for the
+		 * quota.  Keeping the new slices is an overhead.  Merge back
+		 * the slices into the previous region if it doesn't lose any
+		 * information and not violating the max_region_sz.
+		 */
+		if (damon_first_region(t) == r)
+			continue;
+		prev_r = damon_prev_region(r);
+		if (prev_r->ar.end != r->ar.start)
+			continue;
+		if (prev_r->age != r->age)
+			continue;
+		if (prev_r->last_nr_accesses != r->last_nr_accesses)
+			continue;
+		if (prev_r->nr_accesses != r->nr_accesses)
+			continue;
+		if (r->ar.end - prev_r->ar.start > max_region_sz)
+			continue;
+		prev_r->ar.end = r->ar.end;
+		damon_destroy_region(r, t);
+		r = prev_r;
+	}
+}
+
+/*
+ * damon_feed_loop_next_input() - get next input to achieve a target score.
+ * @last_input	The last input.
+ * @score	Current score that made with @last_input.
+ *
+ * Calculate next input to achieve the target score, based on the last input
+ * and current score.  Assuming the input and the score are positively
+ * proportional, calculate how much compensation should be added to or
+ * subtracted from the last input as a proportion of the last input.  Avoid
+ * next input always being zero by setting it non-zero always.  In short form
+ * (assuming support of float and signed calculations), the algorithm is as
+ * below.
+ *
+ * next_input = max(last_input * ((goal - current) / goal + 1), 1)
+ *
+ * For simple implementation, we assume the target score is always 10,000.  The
+ * caller should adjust @score for this.
+ *
+ * Returns next input that assumed to achieve the target score.
+ */
+static unsigned long damon_feed_loop_next_input(unsigned long last_input,
+		unsigned long score)
+{
+	const unsigned long goal = 10000;
+	/* Set minimum input as 10000 to avoid compensation be zero */
+	const unsigned long min_input = 10000;
+	unsigned long score_goal_diff, compensation;
+	bool over_achieving = score > goal;
+
+	if (score == goal)
+		return last_input;
+	if (score >= goal * 2)
+		return min_input;
+
+	if (over_achieving)
+		score_goal_diff = score - goal;
+	else
+		score_goal_diff = goal - score;
+
+	if (last_input < ULONG_MAX / score_goal_diff)
+		compensation = last_input * score_goal_diff / goal;
+	else
+		compensation = last_input / goal * score_goal_diff;
+
+	if (over_achieving)
+		return max(last_input - compensation, min_input);
+	if (last_input < ULONG_MAX - compensation)
+		return last_input + compensation;
+	return ULONG_MAX;
+}
+
+#ifdef CONFIG_PSI
+
+static u64 damos_get_some_mem_psi_total(void)
+{
+	if (static_branch_likely(&psi_disabled))
+		return 0;
+	return div_u64(psi_system.total[PSI_AVGS][PSI_MEM * 2],
+			NSEC_PER_USEC);
+}
+
+#else	/* CONFIG_PSI */
+
+static inline u64 damos_get_some_mem_psi_total(void)
+{
+	return 0;
+}
+
+#endif	/* CONFIG_PSI */
+
+#ifdef CONFIG_NUMA
+static bool invalid_mem_node(int nid)
+{
+	return nid < 0 || nid >= MAX_NUMNODES || !node_state(nid, N_MEMORY);
+}
+
+static __kernel_ulong_t damos_get_node_mem_bp(
+		struct damos_quota_goal *goal)
+{
+	struct sysinfo i;
+	__kernel_ulong_t numerator;
+
+	if (invalid_mem_node(goal->nid)) {
+		if (goal->metric == DAMOS_QUOTA_NODE_MEM_USED_BP)
+			return 0;
+		else	/* DAMOS_QUOTA_NODE_MEM_FREE_BP */
+			return 10000;
+	}
+
+	si_meminfo_node(&i, goal->nid);
+	if (goal->metric == DAMOS_QUOTA_NODE_MEM_USED_BP)
+		numerator = i.totalram - i.freeram;
+	else	/* DAMOS_QUOTA_NODE_MEM_FREE_BP */
+		numerator = i.freeram;
+	return mult_frac(numerator, 10000, i.totalram);
+}
+
+static unsigned long damos_get_node_memcg_used_bp(
+		struct damos_quota_goal *goal)
+{
+	struct mem_cgroup *memcg;
+	struct lruvec *lruvec;
+	unsigned long used_pages, numerator;
+	struct sysinfo i;
+
+	if (invalid_mem_node(goal->nid)) {
+		if (goal->metric == DAMOS_QUOTA_NODE_MEMCG_USED_BP)
+			return 0;
+		else	/* DAMOS_QUOTA_NODE_MEMCG_FREE_BP */
+			return 10000;
+	}
+
+	memcg = mem_cgroup_get_from_id(goal->memcg_id);
+	if (!memcg) {
+		if (goal->metric == DAMOS_QUOTA_NODE_MEMCG_USED_BP)
+			return 0;
+		else	/* DAMOS_QUOTA_NODE_MEMCG_FREE_BP */
+			return 10000;
+	}
+
+	mem_cgroup_flush_stats(memcg);
+	lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(goal->nid));
+	used_pages = lruvec_page_state(lruvec, NR_ACTIVE_ANON);
+	used_pages += lruvec_page_state(lruvec, NR_INACTIVE_ANON);
+	used_pages += lruvec_page_state(lruvec, NR_ACTIVE_FILE);
+	used_pages += lruvec_page_state(lruvec, NR_INACTIVE_FILE);
+
+	mem_cgroup_put(memcg);
+
+	si_meminfo_node(&i, goal->nid);
+	if (goal->metric == DAMOS_QUOTA_NODE_MEMCG_USED_BP)
+		numerator = used_pages;
+	else	/* DAMOS_QUOTA_NODE_MEMCG_FREE_BP */
+		numerator = i.totalram - used_pages;
+	return mult_frac(numerator, 10000, i.totalram);
+}
+
+#ifdef CONFIG_DAMON_PADDR
+/*
+ * damos_calc_eligible_bytes() - Calculate raw eligible bytes per node.
+ * @c:		The DAMON context.
+ * @s:		The scheme.
+ * @nid:	The target NUMA node id.
+ * @total:	Output for total eligible bytes across all nodes.
+ *
+ * Iterates through each folio in eligible regions to accurately determine
+ * which node the memory resides on. Returns eligible bytes on the specified
+ * node and sets *total to the sum across all nodes.
+ *
+ * Note: This function requires damon_get_folio() from ops-common.c, which is
+ * only available when CONFIG_DAMON_PADDR is enabled. It also requires the
+ * context to be using PADDR operations for meaningful results.
+ */
+static phys_addr_t damos_calc_eligible_bytes(struct damon_ctx *c,
+		struct damos *s, int nid, phys_addr_t *total)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+	phys_addr_t total_eligible = 0;
+	phys_addr_t node_eligible = 0;
+
+	damon_for_each_target(t, c) {
+		damon_for_each_region(r, t) {
+			phys_addr_t addr, end_addr;
+
+			if (!__damos_valid_target(r, s, c))
+				continue;
+
+			/* Convert from core address units to physical bytes */
+			addr = (phys_addr_t)r->ar.start * c->addr_unit;
+			end_addr = (phys_addr_t)r->ar.end * c->addr_unit;
+			while (addr < end_addr) {
+				struct folio *folio;
+				phys_addr_t folio_start, folio_end;
+				phys_addr_t overlap_start, overlap_end;
+				phys_addr_t counted;
+
+				folio = damon_get_folio(PHYS_PFN(addr));
+				if (!folio) {
+					addr = PAGE_ALIGN_DOWN(addr +
+							PAGE_SIZE);
+					if (!addr)
+						break;
+					continue;
+				}
+
+				/*
+				 * Calculate exact overlap between the region
+				 * [addr, end_addr) and the folio range.
+				 * The folio may start before addr if addr is
+				 * in the middle of a large folio.
+				 */
+				folio_start = PFN_PHYS(folio_pfn(folio));
+				folio_end = folio_start + folio_size(folio);
+
+				overlap_start = max(addr, folio_start);
+				overlap_end = min(end_addr, folio_end);
+
+				if (overlap_end > overlap_start) {
+					counted = overlap_end - overlap_start;
+					total_eligible += counted;
+					if (folio_nid(folio) == nid)
+						node_eligible += counted;
+				}
+
+				/* Advance past the entire folio */
+				addr = folio_end;
+				folio_put(folio);
+			}
+			cond_resched();
+		}
+	}
+
+	*total = total_eligible;
+	return node_eligible;
+}
+
+static unsigned long damos_get_node_eligible_mem_bp(struct damon_ctx *c,
+		struct damos *s, int nid)
+{
+	phys_addr_t total_eligible = 0;
+	phys_addr_t node_eligible;
+
+	if (c->ops.id != DAMON_OPS_PADDR)
+		return 0;
+
+	if (nid < 0 || nid >= MAX_NUMNODES || !node_online(nid))
+		return 0;
+
+	node_eligible = damos_calc_eligible_bytes(c, s, nid, &total_eligible);
+
+	if (!(unsigned long)total_eligible)
+		return 0;
+
+	return mult_frac((unsigned long)node_eligible, 10000,
+			(unsigned long)total_eligible);
+}
+#else /* CONFIG_DAMON_PADDR */
+static unsigned long damos_get_node_eligible_mem_bp(struct damon_ctx *c,
+		struct damos *s, int nid)
+{
+	return 0;
+}
+#endif /* CONFIG_DAMON_PADDR */
+#else /* CONFIG_NUMA */
+static __kernel_ulong_t damos_get_node_mem_bp(
+		struct damos_quota_goal *goal)
+{
+	return 0;
+}
+
+static unsigned long damos_get_node_memcg_used_bp(
+		struct damos_quota_goal *goal)
+{
+	return 0;
+}
+
+static unsigned long damos_get_node_eligible_mem_bp(struct damon_ctx *c,
+		struct damos *s, int nid)
+{
+	return 0;
+}
+#endif /* CONFIG_NUMA */
+
+/*
+ * Returns LRU-active or inactive memory to total LRU memory size ratio.
+ */
+static unsigned int damos_get_in_active_mem_bp(bool active_ratio)
+{
+	unsigned long active, inactive, total;
+
+	/* This should align with /proc/meminfo output */
+	active = global_node_page_state(NR_LRU_BASE + LRU_ACTIVE_ANON) +
+		global_node_page_state(NR_LRU_BASE + LRU_ACTIVE_FILE);
+	inactive = global_node_page_state(NR_LRU_BASE + LRU_INACTIVE_ANON) +
+		global_node_page_state(NR_LRU_BASE + LRU_INACTIVE_FILE);
+	total = active + inactive;
+	if (active_ratio)
+		return mult_frac(active, 10000, total);
+	return mult_frac(inactive, 10000, total);
+}
+
+static void damos_set_quota_goal_current_value(struct damon_ctx *c,
+		struct damos *s, struct damos_quota_goal *goal)
+{
+	u64 now_psi_total;
+
+	switch (goal->metric) {
+	case DAMOS_QUOTA_USER_INPUT:
+		/* User should already set goal->current_value */
+		break;
+	case DAMOS_QUOTA_SOME_MEM_PSI_US:
+		now_psi_total = damos_get_some_mem_psi_total();
+		goal->current_value = now_psi_total - goal->last_psi_total;
+		goal->last_psi_total = now_psi_total;
+		break;
+	case DAMOS_QUOTA_NODE_MEM_USED_BP:
+	case DAMOS_QUOTA_NODE_MEM_FREE_BP:
+		goal->current_value = damos_get_node_mem_bp(goal);
+		break;
+	case DAMOS_QUOTA_NODE_MEMCG_USED_BP:
+	case DAMOS_QUOTA_NODE_MEMCG_FREE_BP:
+		goal->current_value = damos_get_node_memcg_used_bp(goal);
+		break;
+	case DAMOS_QUOTA_ACTIVE_MEM_BP:
+	case DAMOS_QUOTA_INACTIVE_MEM_BP:
+		goal->current_value = damos_get_in_active_mem_bp(
+				goal->metric == DAMOS_QUOTA_ACTIVE_MEM_BP);
+		break;
+	case DAMOS_QUOTA_NODE_ELIGIBLE_MEM_BP:
+		goal->current_value = damos_get_node_eligible_mem_bp(c, s,
+				goal->nid);
+		break;
+	default:
+		break;
+	}
+}
+
+/* Return the highest score since it makes schemes least aggressive */
+static unsigned long damos_quota_score(struct damon_ctx *c, struct damos *s)
+{
+	struct damos_quota_goal *goal;
+	struct damos_quota *quota = &s->quota;
+	unsigned long highest_score = 0;
+
+	damos_for_each_quota_goal(goal, quota) {
+		damos_set_quota_goal_current_value(c, s, goal);
+		highest_score = max(highest_score,
+				mult_frac(goal->current_value, 10000,
+					goal->target_value));
+	}
+
+	return highest_score;
+}
+
+static void damos_goal_tune_esz_bp_consist(struct damon_ctx *c, struct damos *s)
+{
+	struct damos_quota *quota = &s->quota;
+	unsigned long score = damos_quota_score(c, s);
+
+	quota->esz_bp = damon_feed_loop_next_input(
+			max(quota->esz_bp, 10000UL), score);
+}
+
+static void damos_goal_tune_esz_bp_temporal(struct damon_ctx *c,
+		struct damos *s)
+{
+	struct damos_quota *quota = &s->quota;
+	unsigned long score = damos_quota_score(c, s);
+
+	if (score >= 10000)
+		quota->esz_bp = 0;
+	else if (quota->sz)
+		quota->esz_bp = quota->sz * 10000;
+	else
+		quota->esz_bp = ULONG_MAX;
+}
+
+/*
+ * Called only if quota->ms, or quota->sz are set, or quota->goals is not empty
+ */
+static void damos_set_effective_quota(struct damon_ctx *ctx, struct damos *s)
+{
+	struct damos_quota *quota = &s->quota;
+	unsigned long throughput;
+	unsigned long esz = ULONG_MAX;
+
+	if (!quota->ms && list_empty(&quota->goals)) {
+		quota->esz = quota->sz;
+		return;
+	}
+
+	if (!list_empty(&quota->goals)) {
+		if (quota->goal_tuner == DAMOS_QUOTA_GOAL_TUNER_CONSIST)
+			damos_goal_tune_esz_bp_consist(ctx, s);
+		else if (quota->goal_tuner == DAMOS_QUOTA_GOAL_TUNER_TEMPORAL)
+			damos_goal_tune_esz_bp_temporal(ctx, s);
+		esz = quota->esz_bp / 10000;
+	}
+
+	if (quota->ms) {
+		if (quota->total_charged_ns)
+			throughput = mult_frac(quota->total_charged_sz,
+					1000000, quota->total_charged_ns);
+		else
+			throughput = PAGE_SIZE * 1024;
+		esz = min(throughput * quota->ms, esz);
+		esz = max(ctx->min_region_sz, esz);
+	}
+
+	if (quota->sz && quota->sz < esz)
+		esz = quota->sz;
+
+	quota->esz = esz;
+}
+
+static void damos_trace_esz(struct damon_ctx *c, struct damos *s,
+		struct damos_quota *quota)
+{
+	unsigned int cidx = 0, sidx = 0;
+	struct damos *siter;
+
+	damon_for_each_scheme(siter, c) {
+		if (siter == s)
+			break;
+		sidx++;
+	}
+	trace_damos_esz(cidx, sidx, quota->esz);
+}
+
+static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
+{
+	struct damos_quota *quota = &s->quota;
+	struct damon_target *t;
+	struct damon_region *r;
+	unsigned long cumulated_sz, cached_esz;
+	unsigned int score, max_score = 0;
+
+	if (!quota->ms && !quota->sz && list_empty(&quota->goals))
+		return;
+
+	/* First charge window */
+	if (!quota->total_charged_sz && !quota->charged_from) {
+		quota->charged_from = jiffies;
+		damos_set_effective_quota(c, s);
+		if (trace_damos_esz_enabled())
+			damos_trace_esz(c, s, quota);
+	}
+
+	/* New charge window starts */
+	if (!time_in_range_open(jiffies, quota->charged_from,
+				quota->charged_from +
+				msecs_to_jiffies(quota->reset_interval))) {
+		if (damos_quota_is_full(quota, c->min_region_sz))
+			s->stat.qt_exceeds++;
+		quota->total_charged_sz += quota->charged_sz;
+		quota->charged_from = jiffies;
+		quota->charged_sz = 0;
+		if (trace_damos_esz_enabled())
+			cached_esz = quota->esz;
+		damos_set_effective_quota(c, s);
+		if (trace_damos_esz_enabled() && quota->esz != cached_esz)
+			damos_trace_esz(c, s, quota);
+	}
+
+	if (!c->ops.get_scheme_score)
+		return;
+
+	/* Fill up the score histogram */
+	memset(c->regions_score_histogram, 0,
+			sizeof(*c->regions_score_histogram) *
+			(DAMOS_MAX_SCORE + 1));
+	damon_for_each_target(t, c) {
+		damon_for_each_region(r, t) {
+			if (!__damos_valid_target(r, s, c))
+				continue;
+			if (damos_core_filter_out(c, t, r, s))
+				continue;
+			score = c->ops.get_scheme_score(c, r, s);
+			c->regions_score_histogram[score] +=
+				damon_sz_region(r);
+			if (score > max_score)
+				max_score = score;
+		}
+	}
+
+	/* Set the min score limit */
+	for (cumulated_sz = 0, score = max_score; ; score--) {
+		cumulated_sz += c->regions_score_histogram[score];
+		if (cumulated_sz >= quota->esz || !score)
+			break;
+	}
+	quota->min_score = score;
+}
+
+static void damos_trace_stat(struct damon_ctx *c, struct damos *s)
+{
+	unsigned int cidx = 0, sidx = 0;
+	struct damos *siter;
+
+	if (!trace_damos_stat_after_apply_interval_enabled())
+		return;
+
+	damon_for_each_scheme(siter, c) {
+		if (siter == s)
+			break;
+		sidx++;
+	}
+	trace_call__damos_stat_after_apply_interval(cidx, sidx, &s->stat);
+}
+
+static void kdamond_apply_schemes(struct damon_ctx *c)
+{
+	struct damon_target *t;
+	struct damos *s;
+	bool has_schemes_to_apply = false;
+	unsigned long max_region_sz;
+
+	damon_for_each_scheme(s, c) {
+		if (time_before(c->passed_sample_intervals, s->next_apply_sis))
+			continue;
+
+		if (!s->wmarks.activated)
+			continue;
+
+		has_schemes_to_apply = true;
+
+		damos_adjust_quota(c, s);
+	}
+
+	if (!has_schemes_to_apply)
+		return;
+
+	max_region_sz = damon_region_sz_limit(c);
+	mutex_lock(&c->walk_control_lock);
+	damon_for_each_target(t, c) {
+		if (c->ops.target_valid && c->ops.target_valid(t) == false)
+			continue;
+		damos_apply_target(c, t, max_region_sz);
+	}
+
+	damon_for_each_scheme(s, c) {
+		if (time_before(c->passed_sample_intervals, s->next_apply_sis))
+			continue;
+		damos_walk_complete(c, s);
+		damos_set_next_apply_sis(s, c);
+		s->last_applied = NULL;
+		damos_trace_stat(c, s);
+	}
+	mutex_unlock(&c->walk_control_lock);
+}
+
+#ifdef CONFIG_DAMON_DEBUG_SANITY
+static void damon_verify_merge_two_regions(
+		struct damon_region *l, struct damon_region *r)
+{
+	/* damon_merge_two_regions() may created incorrect left region */
+	WARN_ONCE(l->ar.start >= l->ar.end, "l: %lu-%lu, r: %lu-%lu\n",
+			l->ar.start, l->ar.end, r->ar.start, r->ar.end);
+}
+#else
+static void damon_verify_merge_two_regions(
+		struct damon_region *l, struct damon_region *r)
+{
+}
+#endif
+
+/*
+ * Merge two adjacent regions into one region
+ */
+static void damon_merge_two_regions(struct damon_target *t,
+		struct damon_region *l, struct damon_region *r)
+{
+	unsigned long sz_l = damon_sz_region(l), sz_r = damon_sz_region(r);
+	int i;
+
+	l->nr_accesses = (l->nr_accesses * sz_l + r->nr_accesses * sz_r) /
+			(sz_l + sz_r);
+	l->age = (l->age * sz_l + r->age * sz_r) / (sz_l + sz_r);
+	l->ar.end = r->ar.end;
+	/* todo: do this for only installed probes */
+	for (i = 0; i < DAMON_MAX_PROBES; i++)
+		l->probe_hits[i] = (l->probe_hits[i] * sz_l + r->probe_hits[i]
+				* sz_r) / (sz_l + sz_r);
+	damon_verify_merge_two_regions(l, r);
+	damon_destroy_region(r, t);
+}
+
+static unsigned int damon_merge_score(struct damon_region *r, bool last,
+		struct damon_ctx *ctx, bool use_probe_hits)
+{
+	if (use_probe_hits)
+		return damon_probe_hits_wsum(r, last, ctx);
+	if (last)
+		return r->last_nr_accesses;
+	return r->nr_accesses;
+}
+
+/*
+ * Merge adjacent regions having similar access frequencies
+ *
+ * t		target affected by this merge operation
+ * thres	'->nr_accesses' diff threshold for the merge
+ * sz_limit	size upper limit of each region
+ */
+static void damon_merge_regions_of(struct damon_target *t, unsigned int thres,
+		unsigned long sz_limit, struct damon_ctx *ctx, bool count_age)
+{
+	struct damon_region *r, *prev = NULL, *next;
+	bool use_probe_hits = damon_has_probe_weights(ctx);
+
+	damon_for_each_region_safe(r, next, t) {
+		unsigned int score, last_score, diff;
+
+		score = damon_merge_score(r, false, ctx, use_probe_hits);
+		last_score = damon_merge_score(r, true, ctx, use_probe_hits);
+
+		if (count_age) {
+			if (abs_diff(score, last_score) > thres)
+				r->age = 0;
+			else if ((score == 0) != (last_score == 0))
+				r->age = 0;
+			else
+				r->age++;
+		}
+
+		if (!prev)
+			goto set_prev_continue;
+		if (prev->ar.end != r->ar.start)
+			goto set_prev_continue;
+		diff = abs_diff(score, damon_merge_score(prev, false, ctx,
+					use_probe_hits));
+		if (diff > thres)
+			goto set_prev_continue;
+		if (damon_sz_region(prev) + damon_sz_region(r) > sz_limit)
+			goto set_prev_continue;
+		damon_merge_two_regions(t, prev, r);
+		continue;
+set_prev_continue:
+		prev = r;
+	}
+}
+
+/*
+ * Merge adjacent regions having similar access frequencies
+ *
+ * threshold	'->nr_accesses' diff threshold for the merge
+ * sz_limit	size upper limit of each region
+ *
+ * This function merges monitoring target regions which are adjacent and their
+ * access frequencies are similar.  This is for minimizing the monitoring
+ * overhead under the dynamically changeable access pattern.  If a merge was
+ * unnecessarily made, later 'kdamond_split_regions()' will revert it.
+ *
+ * The total number of regions could be higher than the user-defined limit,
+ * max_nr_regions for some cases.  For example, the user can update
+ * max_nr_regions to a number that lower than the current number of regions
+ * while DAMON is running.  For such a case, repeat merging until the limit is
+ * met while increasing @threshold up to possible maximum level.
+ */
+static void kdamond_merge_regions(struct damon_ctx *c, unsigned int threshold,
+				  unsigned long sz_limit)
+{
+	struct damon_target *t;
+	unsigned int nr_regions;
+	unsigned int max_thres;
+	bool count_age = true;
+
+	max_thres = c->attrs.aggr_interval /
+		(c->attrs.sample_interval ?  c->attrs.sample_interval : 1);
+	while (true) {
+		nr_regions = 0;
+		damon_for_each_target(t, c) {
+			damon_merge_regions_of(t, threshold, sz_limit, c,
+					count_age);
+			nr_regions += damon_nr_regions(t);
+		}
+		count_age = false;
+		if (nr_regions <= c->attrs.max_nr_regions ||
+				max_thres <= threshold)
+			break;
+		if (threshold < max_thres / 2)
+			threshold = max(1, threshold * 2);
+		else
+			threshold = max_thres;
+	}
+}
+
+#ifdef CONFIG_DAMON_DEBUG_SANITY
+static void damon_verify_split_region_at(struct damon_region *r,
+		unsigned long sz_r)
+{
+	WARN_ONCE(sz_r == 0 || sz_r >= damon_sz_region(r),
+			"sz_r: %lu r: %lu-%lu (%lu)\n",
+			sz_r, r->ar.start, r->ar.end, damon_sz_region(r));
+}
+#else
+static void damon_verify_split_region_at(struct damon_region *r,
+		unsigned long sz_r)
+{
+}
+#endif
+
+/*
+ * Split a region in two
+ *
+ * r		the region to be split
+ * sz_r		size of the first sub-region that will be made
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+static int damon_split_region_at(struct damon_target *t,
+				  struct damon_region *r, unsigned long sz_r)
+{
+	struct damon_region *new;
+
+	damon_verify_split_region_at(r, sz_r);
+	new = damon_new_region(r->ar.start + sz_r, r->ar.end);
+	if (!new)
+		return -ENOMEM;
+
+	r->ar.end = new->ar.start;
+
+	new->age = r->age;
+	new->last_nr_accesses = r->last_nr_accesses;
+	new->nr_accesses = r->nr_accesses;
+	/* todo: do this for only installed probes */
+	memcpy(new->probe_hits, r->probe_hits, sizeof(r->probe_hits));
+	memcpy(new->last_probe_hits, r->last_probe_hits,
+			sizeof(r->last_probe_hits));
+
+	damon_insert_region(new, r, damon_next_region(r), t);
+	return 0;
+}
+
+/* Split every region in the given target into 'nr_subs' regions */
+static void damon_split_regions_of(struct damon_ctx *ctx,
+				   struct damon_target *t, int nr_subs,
+				   unsigned long min_region_sz)
+{
+	struct damon_region *r, *next;
+	unsigned long sz_region, sz_sub = 0;
+	int i;
+
+	damon_for_each_region_safe(r, next, t) {
+		sz_region = damon_sz_region(r);
+
+		for (i = 0; i < nr_subs - 1 &&
+				sz_region > 2 * min_region_sz; i++) {
+			/*
+			 * Randomly select size of left sub-region to be at
+			 * least 10 percent and at most 90% of original region
+			 */
+			sz_sub = ALIGN_DOWN(damon_rand(ctx, 1, 10) *
+					sz_region / 10, min_region_sz);
+			/* Do not allow blank region */
+			if (sz_sub == 0 || sz_sub >= sz_region)
+				continue;
+
+			damon_split_region_at(t, r, sz_sub);
+			sz_region = sz_sub;
+		}
+	}
+}
+
+/* Split one in every @split_step regions into two, from a rotating offset */
+static void damon_split_some_regions(struct damon_ctx *ctx,
+				     unsigned long split_step)
+{
+	static unsigned long rotation;
+	struct damon_target *t;
+	struct damon_region *r, *next;
+	unsigned long offset = rotation++ % split_step;
+	unsigned long idx = 0;
+
+	damon_for_each_target(t, ctx) {
+		damon_for_each_region_safe(r, next, t) {
+			unsigned long sz_region, sz_sub;
+
+			if (idx++ % split_step != offset)
+				continue;
+			sz_region = damon_sz_region(r);
+			if (sz_region < 2 * ctx->min_region_sz)
+				continue;
+
+			sz_sub = ALIGN_DOWN(damon_rand(ctx, 1, 10) *
+					sz_region / 10, ctx->min_region_sz);
+			/* Do not allow blank region */
+			if (sz_sub == 0 || sz_sub >= sz_region)
+				continue;
+
+			damon_split_region_at(t, r, sz_sub);
+		}
+	}
+}
+
+/*
+ * Split every target region into randomly-sized small regions
+ *
+ * This function splits every target region into random-sized small regions if
+ * current total number of the regions is equal or smaller than half of the
+ * user-specified maximum number of regions.  This is for maximizing the
+ * monitoring accuracy under the dynamically changeable access patterns.  If a
+ * split was unnecessarily made, later 'kdamond_merge_regions()' will revert
+ * it.
+ */
+static void kdamond_split_regions(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+	unsigned long nr_regions = 0;
+	unsigned long max_nr_regions = ctx->attrs.max_nr_regions;
+	static unsigned long last_nr_regions;
+	int nr_subregions = 2;
+
+	damon_for_each_target(t, ctx)
+		nr_regions += damon_nr_regions(t);
+
+	if (nr_regions >= max_nr_regions)
+		goto done;
+
+	if (nr_regions > max_nr_regions / 2) {
+		damon_split_some_regions(ctx,
+			max_nr_regions / (max_nr_regions - nr_regions));
+		goto done;
+	}
+
+	/* Maybe the middle of the region has different access frequency */
+	if (last_nr_regions == nr_regions &&
+			nr_regions < max_nr_regions / 3)
+		nr_subregions = 3;
+
+	damon_for_each_target(t, ctx)
+		damon_split_regions_of(ctx, t, nr_subregions,
+				       ctx->min_region_sz);
+
+done:
+	last_nr_regions = nr_regions;
+}
+
+/*
+ * Check whether current monitoring should be stopped
+ *
+ * The monitoring is stopped when either the user requested to stop, or all
+ * monitoring targets are invalid.
+ *
+ * Returns true if need to stop current monitoring.
+ */
+static bool kdamond_need_stop(struct damon_ctx *ctx)
+{
+	struct damon_target *t;
+
+	if (kthread_should_stop())
+		return true;
+
+	if (!ctx->ops.target_valid)
+		return false;
+
+	damon_for_each_target(t, ctx) {
+		if (ctx->ops.target_valid(t))
+			return false;
+	}
+
+	return true;
+}
+
+static int damos_get_wmark_metric_value(enum damos_wmark_metric metric,
+					unsigned long *metric_value)
+{
+	switch (metric) {
+	case DAMOS_WMARK_FREE_MEM_RATE:
+		*metric_value = global_zone_page_state(NR_FREE_PAGES) * 1000 /
+		       totalram_pages();
+		return 0;
+	default:
+		break;
+	}
+	return -EINVAL;
+}
+
+/*
+ * Returns zero if the scheme is active.  Else, returns time to wait for next
+ * watermark check in micro-seconds.
+ */
+static unsigned long damos_wmark_wait_us(struct damos *scheme)
+{
+	unsigned long metric;
+
+	if (damos_get_wmark_metric_value(scheme->wmarks.metric, &metric))
+		return 0;
+
+	/* higher than high watermark or lower than low watermark */
+	if (metric > scheme->wmarks.high || scheme->wmarks.low > metric) {
+		if (scheme->wmarks.activated)
+			pr_debug("deactivate a scheme (%d) for %s wmark\n",
+				 scheme->action,
+				 str_high_low(metric > scheme->wmarks.high));
+		scheme->wmarks.activated = false;
+		return scheme->wmarks.interval;
+	}
+
+	/* inactive and higher than middle watermark */
+	if ((scheme->wmarks.high >= metric && metric >= scheme->wmarks.mid) &&
+			!scheme->wmarks.activated)
+		return scheme->wmarks.interval;
+
+	if (!scheme->wmarks.activated)
+		pr_debug("activate a scheme (%d)\n", scheme->action);
+	scheme->wmarks.activated = true;
+	return 0;
+}
+
+static void kdamond_usleep(unsigned long usecs)
+{
+	if (usecs >= USLEEP_RANGE_UPPER_BOUND)
+		schedule_timeout_idle(usecs_to_jiffies(usecs));
+	else
+		usleep_range_idle(usecs, usecs + 1);
+}
+
+#ifdef CONFIG_DAMON_DEBUG_SANITY
+static void damon_verify_ctx(struct damon_ctx *c)
+{
+	struct damon_target *t;
+	struct damon_region *r;
+
+	damon_for_each_target(t, c) {
+		struct damon_region *prev_r = NULL;
+		unsigned int nr_regions = 0;
+
+		damon_for_each_region(r, t) {
+			WARN_ONCE(r->ar.start >= r->ar.end,
+					"region start (%lu) >= end (%lu)\n",
+					r->ar.start, r->ar.end);
+			WARN_ONCE(prev_r && prev_r->ar.end > r->ar.start,
+					"region overlap (%lu > %lu)\n",
+					prev_r->ar.end, r->ar.start);
+			prev_r = r;
+			nr_regions++;
+		}
+		WARN_ONCE(damon_nr_regions(t) != nr_regions,
+				"nr_regions mismatch: %u != %u\n",
+				damon_nr_regions(t), nr_regions);
+	}
+}
+#else
+static void damon_verify_ctx(struct damon_ctx *c)
+{
+}
+#endif
+
+/*
+ * kdamond_call() - handle damon_call_control objects.
+ * @ctx:	The &struct damon_ctx of the kdamond.
+ * @cancel:	Whether to cancel the invocation of the function.
+ *
+ * If there are &struct damon_call_control requests that registered via
+ * &damon_call() on @ctx, do or cancel the invocation of the function depending
+ * on @cancel.  @cancel is set when the kdamond is already out of the main loop
+ * and therefore will be terminated.
+ */
+static void kdamond_call(struct damon_ctx *ctx, bool cancel)
+{
+	struct damon_call_control *control, *next;
+	LIST_HEAD(controls);
+
+	damon_verify_ctx(ctx);
+
+	mutex_lock(&ctx->call_controls_lock);
+	list_splice_tail_init(&ctx->call_controls, &controls);
+	mutex_unlock(&ctx->call_controls_lock);
+
+	list_for_each_entry_safe(control, next, &controls, list) {
+		if (!control->repeat || cancel)
+			list_del(&control->list);
+
+		if (cancel)
+			control->canceled = true;
+		else
+			control->return_code = control->fn(control->data);
+
+		if (!control->repeat)
+			complete(&control->completion);
+		else if (control->canceled && control->dealloc_on_cancel)
+			kfree(control);
+		if (!cancel && ctx->maybe_corrupted)
+			break;
+	}
+
+	mutex_lock(&ctx->call_controls_lock);
+	list_splice_tail(&controls, &ctx->call_controls);
+	mutex_unlock(&ctx->call_controls_lock);
+}
+
+/* Returns negative error code if it's not activated but should return */
+static int kdamond_wait_activation(struct damon_ctx *ctx)
+{
+	struct damos *s;
+	unsigned long wait_time;
+	unsigned long min_wait_time = 0;
+	bool init_wait_time = false;
+
+	while (!kdamond_need_stop(ctx)) {
+		damon_for_each_scheme(s, ctx) {
+			wait_time = damos_wmark_wait_us(s);
+			if (!init_wait_time || wait_time < min_wait_time) {
+				init_wait_time = true;
+				min_wait_time = wait_time;
+			}
+		}
+		if (!min_wait_time)
+			return 0;
+
+		kdamond_usleep(min_wait_time);
+
+		kdamond_call(ctx, false);
+		if (ctx->maybe_corrupted)
+			return -EINVAL;
+		damos_walk_cancel(ctx);
+	}
+	return -EBUSY;
+}
+
+static void kdamond_init_ctx(struct damon_ctx *ctx)
+{
+	unsigned long sample_interval = ctx->attrs.sample_interval ?
+		ctx->attrs.sample_interval : 1;
+	struct damos *scheme;
+
+	ctx->passed_sample_intervals = 0;
+	ctx->next_aggregation_sis = ctx->attrs.aggr_interval / sample_interval;
+	ctx->next_ops_update_sis = ctx->attrs.ops_update_interval /
+		sample_interval;
+	ctx->next_intervals_tune_sis = ctx->next_aggregation_sis *
+		ctx->attrs.intervals_goal.aggrs;
+
+	damon_for_each_scheme(scheme, ctx) {
+		damos_set_next_apply_sis(scheme, ctx);
+		damos_set_filters_default_reject(scheme);
+	}
+}
+
+/*
+ * The monitoring daemon that runs as a kernel thread
+ */
+static int kdamond_fn(void *data)
+{
+	struct damon_ctx *ctx = data;
+	unsigned long sz_limit = 0;
+
+	pr_debug("kdamond (%d) starts\n", current->pid);
+
+	mutex_lock(&ctx->call_controls_lock);
+	ctx->call_controls_obsolete = false;
+	mutex_unlock(&ctx->call_controls_lock);
+	mutex_lock(&ctx->walk_control_lock);
+	ctx->walk_control_obsolete = false;
+	mutex_unlock(&ctx->walk_control_lock);
+	complete(&ctx->kdamond_started);
+	kdamond_init_ctx(ctx);
+
+	if (ctx->ops.init)
+		ctx->ops.init(ctx);
+	ctx->regions_score_histogram = kmalloc_array(DAMOS_MAX_SCORE + 1,
+			sizeof(*ctx->regions_score_histogram), GFP_KERNEL);
+	if (!ctx->regions_score_histogram)
+		goto done;
+
+	sz_limit = damon_apply_min_nr_regions(ctx);
+
+	while (!kdamond_need_stop(ctx)) {
+		/*
+		 * ctx->attrs and ctx->next_{aggregation,ops_update}_sis could
+		 * be changed from kdamond_call().  Read the values here, and
+		 * use those for this iteration.  That is, damon_set_attrs()
+		 * updated new values are respected from next iteration.
+		 */
+		unsigned long next_aggregation_sis = ctx->next_aggregation_sis;
+		unsigned long next_ops_update_sis = ctx->next_ops_update_sis;
+		unsigned long sample_interval = ctx->attrs.sample_interval;
+		bool access_check_disabled = damon_has_probe_weights(ctx);
+		unsigned int max_merge_score = 0, max_wsum;
+		bool get_max_wsum;
+
+		if (kdamond_wait_activation(ctx))
+			break;
+
+		if (!access_check_disabled && ctx->ops.prepare_access_checks)
+			ctx->ops.prepare_access_checks(ctx);
+
+		kdamond_usleep(sample_interval);
+		ctx->passed_sample_intervals++;
+
+		if (!access_check_disabled && ctx->ops.check_accesses)
+			max_merge_score = ctx->ops.check_accesses(ctx);
+		if (ctx->ops.apply_probes) {
+			if (time_after_eq(ctx->passed_sample_intervals,
+						next_aggregation_sis) &&
+					access_check_disabled)
+				get_max_wsum = true;
+			else
+				get_max_wsum = false;
+			max_wsum = ctx->ops.apply_probes(ctx,
+					access_check_disabled, get_max_wsum);
+			if (get_max_wsum)
+				max_merge_score = max_wsum;
+		}
+
+		if (time_after_eq(ctx->passed_sample_intervals,
+					next_aggregation_sis)) {
+			kdamond_merge_regions(ctx,
+					max_merge_score / 10,
+					sz_limit);
+			/* online updates might be made */
+			sz_limit = damon_apply_min_nr_regions(ctx);
+		}
+
+		/*
+		 * do kdamond_call() and kdamond_apply_schemes() after
+		 * kdamond_merge_regions() if possible, to reduce overhead
+		 */
+		kdamond_call(ctx, false);
+		if (ctx->maybe_corrupted)
+			break;
+		while (ctx->pause) {
+			damos_walk_cancel(ctx);
+			kdamond_usleep(ctx->attrs.sample_interval);
+			/* allow caller unset pause via damon_call() */
+			kdamond_call(ctx, false);
+			if (kdamond_need_stop(ctx) || ctx->maybe_corrupted)
+				goto done;
+		}
+		if (!list_empty(&ctx->schemes))
+			kdamond_apply_schemes(ctx);
+		else
+			damos_walk_cancel(ctx);
+
+		sample_interval = ctx->attrs.sample_interval ?
+			ctx->attrs.sample_interval : 1;
+		if (time_after_eq(ctx->passed_sample_intervals,
+					next_aggregation_sis)) {
+			if (ctx->attrs.intervals_goal.aggrs &&
+					time_after_eq(
+						ctx->passed_sample_intervals,
+						ctx->next_intervals_tune_sis)) {
+				/*
+				 * ctx->next_aggregation_sis might be updated
+				 * from kdamond_call().  In the case,
+				 * damon_set_attrs() which will be called from
+				 * kdamond_tune_interval() may wrongly think
+				 * this is in the middle of the current
+				 * aggregation, and make aggregation
+				 * information reset for all regions.  Then,
+				 * following kdamond_reset_aggregated() call
+				 * will make the region information invalid.
+				 *
+				 * Reset ->next_aggregation_sis to avoid that.
+				 * It will anyway correctly updated after this
+				 * if clause.
+				 */
+				ctx->next_aggregation_sis =
+					next_aggregation_sis;
+				ctx->next_intervals_tune_sis +=
+					ctx->attrs.aggr_samples *
+					ctx->attrs.intervals_goal.aggrs;
+				kdamond_tune_intervals(ctx);
+				sample_interval = ctx->attrs.sample_interval ?
+					ctx->attrs.sample_interval : 1;
+
+			}
+			ctx->next_aggregation_sis = next_aggregation_sis +
+				ctx->attrs.aggr_interval / sample_interval;
+
+			kdamond_reset_aggregated(ctx);
+			kdamond_split_regions(ctx);
+		}
+
+		if (time_after_eq(ctx->passed_sample_intervals,
+					next_ops_update_sis)) {
+			ctx->next_ops_update_sis = next_ops_update_sis +
+				ctx->attrs.ops_update_interval /
+				sample_interval;
+			if (ctx->ops.update)
+				ctx->ops.update(ctx);
+		}
+	}
+done:
+	damon_destroy_targets(ctx);
+
+	kfree(ctx->regions_score_histogram);
+	mutex_lock(&ctx->call_controls_lock);
+	ctx->call_controls_obsolete = true;
+	mutex_unlock(&ctx->call_controls_lock);
+	kdamond_call(ctx, true);
+	mutex_lock(&ctx->walk_control_lock);
+	ctx->walk_control_obsolete = true;
+	mutex_unlock(&ctx->walk_control_lock);
+	damos_walk_cancel(ctx);
+
+	pr_debug("kdamond (%d) finishes\n", current->pid);
+	mutex_lock(&ctx->kdamond_lock);
+	ctx->kdamond = NULL;
+	mutex_unlock(&ctx->kdamond_lock);
+
+	mutex_lock(&damon_lock);
+	nr_running_ctxs--;
+	if (!nr_running_ctxs && running_exclusive_ctxs)
+		running_exclusive_ctxs = false;
+	mutex_unlock(&damon_lock);
+
+	return 0;
+}
+
+struct damon_system_ram_range_walk_arg {
+	bool walked;
+	struct resource res;
+};
+
+static int damon_system_ram_walk_fn(struct resource *res, void *arg)
+{
+	struct damon_system_ram_range_walk_arg *a = arg;
+
+	if (!a->walked) {
+		a->walked = true;
+		a->res.start = res->start;
+	}
+	a->res.end = res->end;
+	return 0;
+}
+
+static unsigned long damon_res_to_core_addr(resource_size_t ra,
+		unsigned long addr_unit)
+{
+	/*
+	 * Use div_u64() for avoiding linking errors related with __udivdi3,
+	 * __aeabi_uldivmod, or similar problems.  This should also improve the
+	 * performance optimization (read div_u64() comment for the detail).
+	 */
+	if (sizeof(ra) == 8 && sizeof(addr_unit) == 4)
+		return div_u64(ra, addr_unit);
+	return ra / addr_unit;
+}
+
+static bool damon_find_system_rams_range(unsigned long *start,
+		unsigned long *end, unsigned long addr_unit)
+{
+	struct damon_system_ram_range_walk_arg arg = {};
+
+	walk_system_ram_res(0, -1, &arg, damon_system_ram_walk_fn);
+	if (!arg.walked)
+		return false;
+	*start = damon_res_to_core_addr(arg.res.start, addr_unit);
+	*end = damon_res_to_core_addr(arg.res.end + 1, addr_unit);
+	if (*end <= *start)
+		return false;
+	return true;
+}
+
+/**
+ * damon_set_region_system_rams_default() - Set the region of the given
+ * monitoring target as requested, or to cover all 'System RAM' resources.
+ * @t:		The monitoring target to set the region.
+ * @start:	The pointer to the start address of the region.
+ * @end:	The pointer to the end address of the region.
+ * @addr_unit:	The address unit for the damon_ctx of @t.
+ * @min_region_sz:	Minimum region size.
+ *
+ * This function sets the region of @t as requested by @start and @end.  If the
+ * values of @start and @end are zero, however, this function finds 'System
+ * RAM' resources and sets the region to cover all the resource.  In the latter
+ * case, this function saves the start and the end addresseses of the first and
+ * the last resources in @start and @end, respectively.
+ *
+ * Return: 0 on success, negative error code otherwise.
+ */
+int damon_set_region_system_rams_default(struct damon_target *t,
+			unsigned long *start, unsigned long *end,
+			unsigned long addr_unit, unsigned long min_region_sz)
+{
+	struct damon_addr_range addr_range;
+
+	if (!*start && !*end &&
+		!damon_find_system_rams_range(start, end, addr_unit))
+		return -EINVAL;
+
+	addr_range.start = *start;
+	addr_range.end = *end;
+	return damon_set_regions(t, &addr_range, 1, min_region_sz);
+}
+
+/**
+ * damon_update_region_access_rate() - Update the access rate of a region.
+ * @r:		The DAMON region to update for its access check result.
+ * @accessed:	Whether the region has accessed during last sampling interval.
+ *
+ * Update the access rate of a region with the region's last sampling interval
+ * access check result.
+ *
+ * Usually this will be called by &damon_operations->check_accesses callback.
+ */
+void damon_update_region_access_rate(struct damon_region *r, bool accessed)
+{
+	if (accessed)
+		r->nr_accesses++;
+}
+
+/**
+ * damon_initialized() - Return if DAMON is ready to be used.
+ *
+ * Return: true if DAMON is ready to be used, false otherwise.
+ */
+bool damon_initialized(void)
+{
+	return damon_region_cache != NULL;
+}
+
+static int __init damon_init(void)
+{
+	damon_region_cache = KMEM_CACHE(damon_region, 0);
+	if (unlikely(!damon_region_cache)) {
+		pr_err("creating damon_region_cache fails\n");
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+subsys_initcall(damon_init);
+
+#include "tests/core-kunit.h"

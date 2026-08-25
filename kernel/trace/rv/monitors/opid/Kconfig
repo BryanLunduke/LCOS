@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+config RV_MON_OPID
+	depends on RV
+	depends on RV_MON_SCHED
+	default y
+	select HA_MON_EVENTS_IMPLICIT
+	bool "opid monitor"
+	help
+	  Monitor to ensure operations like wakeup and need resched occur with
+	  interrupts and preemption disabled.
+
+	  For further information, see:
+	    Documentation/trace/rv/monitor_sched.rst

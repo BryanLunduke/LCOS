@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: GPL-2.0-only
+menu "DMABUF options"
+
+config SYNC_FILE
+	bool "Explicit Synchronization Framework"
+	default n
+	select DMA_SHARED_BUFFER
+	help
+	  The Sync File Framework adds explicit synchronization via
+	  userspace. It enables send/receive 'struct dma_fence' objects to/from
+	  userspace via Sync File fds for synchronization between drivers via
+	  userspace components. It has been ported from Android.
+
+	  The first and main user for this is graphics in which a fence is
+	  associated with a buffer. When a job is submitted to the GPU a fence
+	  is attached to the buffer and is transferred via userspace, using Sync
+	  Files fds, to the DRM driver for example. More details at
+	  Documentation/driver-api/sync_file.rst.
+
+config SW_SYNC
+	bool "Sync File Validation Framework"
+	default n
+	depends on SYNC_FILE
+	depends on DEBUG_FS
+	help
+	  A sync object driver that uses a 32bit counter to coordinate
+	  synchronization.  Useful when there is no hardware primitive backing
+	  the synchronization.
+
+	  WARNING: improper use of this can result in deadlocking kernel
+	  drivers from userspace. Intended for test and debug only.
+
+config UDMABUF
+	bool "userspace dmabuf misc driver"
+	default n
+	depends on DMA_SHARED_BUFFER
+	depends on MEMFD_CREATE || COMPILE_TEST
+	depends on MMU
+	help
+	  A driver to let userspace turn memfd regions into dma-bufs.
+	  Qemu can use this to create host dmabufs for guest framebuffers.
+
+config DMABUF_DEBUG
+	bool "DMA-BUF debug checks"
+	depends on DMA_SHARED_BUFFER
+	default y if DEBUG
+	help
+	  This option enables additional checks for DMA-BUF importers and
+	  exporters. Specifically it validates that importers do not peek at the
+	  underlying struct page when they import a buffer.
+
+config DMABUF_KUNIT_TEST
+	tristate "KUnit tests for DMA-BUF" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select DMA_SHARED_BUFFER
+	default KUNIT_ALL_TESTS
+	help
+	   Enable kunit tests for DMA-BUF
+
+menuconfig DMABUF_HEAPS
+	bool "DMA-BUF Userland Memory Heaps"
+	select DMA_SHARED_BUFFER
+	help
+	  Choose this option to enable the DMA-BUF userland memory heaps.
+	  This options creates per heap chardevs in /dev/dma_heap/ which
+	  allows userspace to allocate dma-bufs that can be shared
+	  between drivers.
+
+source "drivers/dma-buf/heaps/Kconfig"
+
+endmenu

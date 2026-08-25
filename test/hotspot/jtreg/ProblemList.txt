@@ -1,0 +1,216 @@
+#
+# Copyright (c) 2016, 2026, Oracle and/or its affiliates. All rights reserved.
+# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+#
+# This code is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License version 2 only, as
+# published by the Free Software Foundation.
+#
+# This code is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# version 2 for more details (a copy is included in the LICENSE file that
+# accompanied this code).
+#
+# You should have received a copy of the GNU General Public License version
+# 2 along with this work; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+# or visit www.oracle.com if you need additional information or have any
+# questions.
+#
+
+#############################################################################
+#
+# List of quarantined tests -- tests that should not be run by default, because
+# they may fail due to known reason. The reason (CR#) must be mandatory specified.
+#
+# List items are testnames followed by labels, all MUST BE commented
+#   as to why they are here and use a label:
+#     generic-all   Problems on all platforms
+#     generic-ARCH  Where ARCH is one of: x64, i586, ppc64, ppc64le, s390x etc.
+#     OSNAME-all    Where OSNAME is one of: linux, windows, macosx, aix
+#     OSNAME-ARCH   Specific on to one OSNAME and ARCH, e.g. macosx-x64
+#     OSNAME-REV    Specific on to one OSNAME and REV, e.g. macosx-10.7.4
+#
+# More than one label is allowed but must be on the same line.
+#
+#############################################################################
+
+
+#############################################################################
+
+# :hotspot_compiler
+
+compiler/compilercontrol/jcmd/ClearDirectivesFileStackTest.java 8225370 generic-all
+
+compiler/cpuflags/TestAESIntrinsicsOnSupportedConfig.java 8190680 generic-all
+
+compiler/runtime/Test8168712.java#with-dtrace 8211771 linux-s390x
+compiler/runtime/Test8168712.java#without-dtrace 8211771 linux-s390x
+compiler/runtime/Test7196199.java 8365196 windows-x64
+
+compiler/c2/Test8004741.java 8235801 generic-all
+compiler/c2/irTests/TestDuplicateBackedge.java 8318904 generic-all
+
+compiler/codecache/jmx/PoolsIndependenceTest.java 8264632 macosx-all
+
+compiler/vectorapi/VectorRebracket128Test.java 8330538 generic-all
+
+compiler/floatingpoint/TestSubnormalFloat.java 8317810 generic-i586
+compiler/floatingpoint/TestSubnormalDouble.java 8317810 generic-i586
+
+compiler/codecache/CodeCacheFullCountTest.java 8332954 generic-all
+
+compiler/interpreter/Test6833129.java 8335266 generic-i586
+
+compiler/c2/aarch64/TestStaticCallStub.java 8359963 generic-aarch64
+
+compiler/escapeAnalysis/TestBCEscapeAnalyzerOverflow.java 8387392 windows-aarch64
+
+compiler/vectorapi/VectorStoreMaskIdentityTest.java 8388281 generic-all
+
+#############################################################################
+
+# :hotspot_gc
+
+gc/epsilon/TestMemoryMXBeans.java 8206434 generic-all
+gc/g1/logging/TestG1LoggingFailure.java 8169634 generic-all
+gc/g1/humongousObjects/TestHeapCounters.java 8178918 generic-all
+gc/TestAllocHumongousFragment.java#adaptive 8298781 generic-all
+gc/TestAllocHumongousFragment.java#aggressive 8298781 generic-all
+gc/TestAllocHumongousFragment.java#g1 8298781 generic-all
+gc/TestAllocHumongousFragment.java#static 8298781 generic-all
+gc/shenandoah/oom/TestAllocOutOfMemory.java#large 8344312 linux-ppc64le
+gc/stress/jfr/TestStressAllocationGCEventsWithShenandoah.java#generational 8386964 generic-all
+gc/stress/jfr/TestStressAllocationGCEventsWithShenandoah.java#default 8386964 generic-all
+gc/stress/jfr/TestStressBigAllocationGCEventsWithShenandoah.java#generational 8386964 generic-all
+gc/stress/jfr/TestStressBigAllocationGCEventsWithShenandoah.java#default 8386964 generic-all
+gc/TestGCALotAtAllSafepoints.java#Parallel 8390661 generic-all
+gc/TestGCALotAtAllSafepoints.java#Serial 8390661 generic-all
+gc/TestGCALotAtAllSafepoints.java#G1 8390661 generic-all
+gc/TestGCALotAtAllSafepoints.java#Z 8390661 generic-all
+gc/TestGCALotAtAllSafepoints.java#Shenandoah 8390661 generic-all
+
+#############################################################################
+
+# :hotspot_runtime
+
+runtime/jni/terminatedThread/TestTerminatedThread.java 8317789 aix-ppc64
+runtime/Monitor/SyncOnValueBasedClassTest.java 8340995 linux-s390x
+runtime/os/TestTracePageSizes.java#no-options 8267460 linux-aarch64
+runtime/os/TestTracePageSizes.java#explicit-large-page-size 8267460 linux-aarch64
+runtime/os/TestTracePageSizes.java#compiler-options 8267460 linux-aarch64
+runtime/os/TestTracePageSizes.java#G1 8267460 linux-aarch64
+runtime/os/TestTracePageSizes.java#Parallel 8267460 linux-aarch64
+runtime/os/TestTracePageSizes.java#Serial 8267460 linux-aarch64
+runtime/ErrorHandling/MachCodeFramesInErrorFile.java 8313315 linux-ppc64le
+runtime/NMT/VirtualAllocCommitMerge.java 8309698 linux-s390x
+runtime/Thread/TestAlwaysPreTouchStacks.java 8383372 macosx-aarch64
+
+applications/jcstress/copy.java 8229852 linux-all
+
+containers/docker/TestJFREvents.java 8327723 linux-x64
+containers/docker/TestLimitsUpdating.java 8390823 linux-all
+containers/docker/ShareTmpDir.java 8390823 linux-all
+
+#############################################################################
+
+# :hotspot_serviceability
+
+# 8239062 and 8270326 only affects macosx-x64,macosx-aarch64
+serviceability/sa/sadebugd/DebugdConnectTest.java 8239062,8270326 generic-all
+serviceability/sa/TestRevPtrsForInvokeDynamic.java 8241235 generic-all
+
+serviceability/jvmti/vthread/GetThreadStateMountedTest/GetThreadStateMountedTest.java 8318090,8318729 generic-all
+serviceability/jvmti/vthread/GetSetLocalTest/GetSetLocalTest.java 8286836 generic-all
+serviceability/jvmti/vthread/CarrierThreadEventNotification/CarrierThreadEventNotification.java 8333681 generic-all
+serviceability/dcmd/gc/RunFinalizationTest.java 8227120 generic-all
+
+serviceability/sa/ClhsdbCDSCore.java              8318754 macosx-aarch64
+serviceability/sa/ClhsdbFindPC.java#xcomp-core    8318754 macosx-aarch64
+serviceability/sa/ClhsdbFindPC.java#no-xcomp-core 8318754 macosx-aarch64
+serviceability/sa/ClhsdbPmap.java#core            8318754 macosx-aarch64
+serviceability/sa/ClhsdbPstack.java#core          8318754 macosx-aarch64
+serviceability/sa/TestJmapCore.java               8318754 macosx-aarch64
+serviceability/sa/TestJmapCoreMetaspace.java      8318754 macosx-aarch64
+
+serviceability/sa/ClhsdbThreadContext.java        8356704 windows-x64
+
+serviceability/jvmti/stress/StackTrace/NotSuspended/GetStackTraceNotSuspendedStressTest.java 8315980 linux-all,windows-x64
+
+serviceability/jvmti/GetModulesInfo/JvmtiGetAllModulesTest.java 8385679 generic-all
+
+#############################################################################
+
+# :hotspot_misc
+
+#############################################################################
+
+
+#############################################################################
+
+# :vmTestbase_*
+
+#############################################################################
+
+vmTestbase/gc/gctests/FinalizeTest04/FinalizeTest04.java 8284234 generic-all
+vmTestbase/gc/gctests/PhantomReference/phantom001/phantom001.java 8284234 generic-all
+
+vmTestbase/metaspace/gc/firstGC_10m/TestDescription.java 8208250 generic-all
+vmTestbase/metaspace/gc/firstGC_50m/TestDescription.java 8208250 generic-all
+vmTestbase/metaspace/gc/firstGC_99m/TestDescription.java 8208250 generic-all
+vmTestbase/metaspace/gc/firstGC_default/TestDescription.java 8208250 generic-all
+
+vmTestbase/nsk/jvmti/scenarios/capability/CM03/cm03t001/TestDescription.java 8073470 linux-all
+vmTestbase/nsk/jvmti/scenarios/events/EM02/em02t006/TestDescription.java 8372206 generic-all
+vmTestbase/nsk/jvmti/InterruptThread/intrpthrd003/TestDescription.java 8288911 macosx-all
+vmTestbase/nsk/jvmti/unit/timers/JvmtiTest/TestDescription.java 8235348 windows-x64
+
+vmTestbase/jit/escape/LockCoarsening/LockCoarsening001.java 8148743 generic-all
+vmTestbase/jit/escape/LockCoarsening/LockCoarsening002.java 8208259 generic-all
+
+vmTestbase/vm/mlvm/indy/func/jvmti/redefineClassInBootstrap/TestDescription.java 8013267 generic-all
+vmTestbase/vm/mlvm/meth/stress/jdi/breakpointInCompiledCode/Test.java 8257761 generic-all
+vmTestbase/vm/mlvm/indy/func/jvmti/mergeCP_indy2none_a/TestDescription.java 8013267 generic-all
+vmTestbase/vm/mlvm/indy/func/jvmti/mergeCP_indy2manyDiff_b/TestDescription.java 8013267 generic-all
+vmTestbase/vm/mlvm/indy/func/jvmti/mergeCP_indy2manySame_b/TestDescription.java 8013267 generic-all
+vmTestbase/vm/mlvm/meth/stress/compiler/deoptimize/Test.java#id1 8324756 generic-all
+
+vmTestbase/nsk/jdwp/ThreadReference/ForceEarlyReturn/forceEarlyReturn001/forceEarlyReturn001.java 7199837 generic-all
+
+vmTestbase/nsk/monitoring/ThreadMXBean/ThreadInfo/Multi/Multi005/TestDescription.java 8076494 windows-x64
+
+vmTestbase/nsk/monitoring/ThreadMXBean/findMonitorDeadlockedThreads/find006/TestDescription.java 8310144 macosx-aarch64
+
+#############################################################################
+
+# Preview project specific failures go here at the end of the file.
+#
+# These are NOT failures that occur with the '--enable-preview' option
+# specified in the task definition; those go in the appropriate
+# ProblemList-enable-preview.txt file.
+#
+# These are failures that occur WITHOUT the '--enable-preview' option
+# specified in the task definition OR the '--enable-preview' option
+# MAY BE specified in the test itself. In either case, the failure
+# occurs because of some issue with preview project code, in either
+# implementation or test code.
+
+#############################################################################
+
+# Value Objects failures start here:
+applications/ctw/modules/java_base.java 8375645 generic-all
+applications/ctw/modules/java_base_2.java 8375645 generic-all
+
+compiler/codegen/TestRedundantLea.java#Spill                            8361089 generic-all
+
+compiler/vectorapi/TestVectorReassociations.java 8388927 generic-all
+
+serviceability/sa/TestJhsdbJstackMixedWithXComp.java#xcomp-disable-tiered-compilation 8386674 linux-aarch64
+
+# The following test failure(s) DID NOT reproduce during Tier[1-8] testing
+# done for 8377828. Further analysis was done with 8376235 and just one
+# sub-test needed to remain on the ProblemList via 8361089.
+compiler/codegen/TestRedundantLea.java#RegexFind          8361089 generic-all

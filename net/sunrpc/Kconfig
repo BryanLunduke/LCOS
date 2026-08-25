@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config SUNRPC
+	tristate
+	depends on MULTIUSER
+
+config SUNRPC_GSS
+	tristate
+	select OID_REGISTRY
+	depends on MULTIUSER
+
+config SUNRPC_BACKCHANNEL
+	bool
+	depends on SUNRPC
+
+config SUNRPC_SWAP
+	bool
+	depends on SUNRPC
+
+config RPCSEC_GSS_KRB5
+	tristate "Secure RPC: Kerberos V mechanism"
+	depends on SUNRPC && CRYPTO
+	default y
+	select SUNRPC_GSS
+	select CRYPTO_KRB5
+	help
+	  Choose Y here to enable Secure RPC using the Kerberos version 5
+	  GSS-API mechanism (RFC 1964).
+
+	  Secure RPC calls with Kerberos require an auxiliary user-space
+	  daemon which may be found in the Linux nfs-utils package
+	  available from http://linux-nfs.org/.  In addition, user-space
+	  Kerberos support should be installed.
+
+	  If unsure, say Y.
+
+config SUNRPC_DEBUG
+	bool "RPC: Enable dprintk debugging"
+	depends on SUNRPC && SYSCTL
+	select DEBUG_FS
+	help
+	  This option enables a sysctl-based debugging interface
+	  that is be used by the 'rpcdebug' utility to turn on or off
+	  logging of different aspects of the kernel RPC activity.
+
+	  Disabling this option will make your kernel slightly smaller,
+	  but makes troubleshooting NFS issues significantly harder.
+
+	  If unsure, say Y.
+
+config SUNRPC_DEBUG_TRACE
+	bool "RPC: Send dfprintk() output to the trace buffer"
+	depends on SUNRPC_DEBUG && TRACING
+	default n
+	help
+          dprintk() output can be voluminous, which can overwhelm the
+          kernel's logging facility as it must be sent to the console.
+          This option causes dprintk() output to go to the trace buffer
+          instead of the kernel log.
+
+          This will cause warnings about trace_printk() being used to be
+          logged at boot time, so say N unless you are debugging a problem
+          with sunrpc-based clients or services.
+
+config SUNRPC_XPRT_RDMA
+	tristate "RPC-over-RDMA transport"
+	depends on SUNRPC && INFINIBAND && INFINIBAND_ADDR_TRANS
+	default SUNRPC && INFINIBAND
+	select SG_POOL
+	help
+	  This option allows the NFS client and server to use RDMA
+	  transports (InfiniBand, iWARP, or RoCE).
+
+	  To compile this support as a module, choose M. The module
+	  will be called rpcrdma.ko.
+
+	  If unsure, or you know there is no RDMA capability on your
+	  hardware platform, say N.

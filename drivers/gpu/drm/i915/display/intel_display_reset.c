@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright © 2023 Intel Corporation
+ */
+
+#include <linux/debugfs.h>
+
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_print.h>
+
+#include "intel_clock_gating.h"
+#include "intel_cx0_phy.h"
+#include "intel_display_core.h"
+#include "intel_display_driver.h"
+#include "intel_display_reset.h"
+#include "intel_display_types.h"
+#include "intel_display_utils.h"
+#include "intel_hotplug.h"
+#include "intel_pps.h"
+
+bool intel_display_reset_supported(struct intel_display *display)
+{
+	return display && HAS_DISPLAY(display);
+}
+
+bool intel_display_reset_test(struct intel_display *display)
+{
+	return display && HAS_DISPLAY(display) &&
+		display->params.force_reset_modeset_test;
+}
+
+void intel_display_reset_prepare(struct intel_display *display)
+{
+	struct drm_modeset_acquire_ctx *ctx = &display->restore.reset_ctx;
+	struct drm_atomic_commit *state;
+	int ret;
+
+	/*
+	 * Need mode_config.mutex so that we don't
+	 * trample ongoing ->detect() and whatnot.
+	 */
+	mutex_lock(&display->drm->mode_config.mutex);
+	drm_modeset_acquire_init(ctx, 0);
+	while (1) {
+		ret = drm_modeset_lock_all_ctx(display->drm, ctx);
+		if (ret != -EDEADLK)
+			break;
+
+		drm_modeset_backoff(ctx);
+	}
+	/*
+	 * Disabling the crtcs gracefully seems nicer. Also the
+	 * g33 docs say we should at least disable all the planes.
+	 */
+	state = drm_atomic_helper_duplicate_state(display->drm, ctx);
+	if (IS_ERR(state)) {
+		ret = PTR_ERR(state);
+		drm_err(display->drm, "Duplicating state failed with %i\n",
+			ret);
+		return;
+	}
+
+	ret = drm_atomic_helper_disable_all(display->drm, ctx);
+	if (ret) {
+		drm_err(display->drm, "Suspending crtc's failed with %i\n",
+			ret);
+		drm_atomic_commit_put(state);
+		return;
+	}
+
+	display->reset.count++;
+	display->restore.modeset_state = state;
+	state->acquire_ctx = ctx;
+}
+
+void intel_display_reset_finish(struct intel_display *display, bool test_only)
+{
+	struct drm_modeset_acquire_ctx *ctx = &display->restore.reset_ctx;
+	struct drm_atomic_commit *state;
+	int ret;
+
+	state = fetch_and_zero(&display->restore.modeset_state);
+	if (!state)
+		goto unlock;
+
+	/* reset doesn't touch the display */
+	if (test_only) {
+		/* for testing only restore the display */
+		ret = drm_atomic_helper_commit_duplicated_state(state, ctx);
+		if (ret) {
+			drm_WARN_ON(display->drm, ret == -EDEADLK);
+			drm_err(display->drm,
+				"Restoring old state failed with %i\n", ret);
+		}
+	} else {
+		/*
+		 * The display has been reset as well,
+		 * so need a full re-initialization.
+		 */
+		intel_pps_unlock_regs_wa(display);
+		intel_display_driver_init_hw(display);
+		intel_clock_gating_init(display->drm);
+		intel_cx0_pll_power_save_wa(display);
+		intel_hpd_init(display);
+
+		ret = __intel_display_driver_resume(display, state, ctx);
+		if (ret)
+			drm_err(display->drm,
+				"Restoring old state failed with %i\n", ret);
+
+		intel_hpd_poll_disable(display);
+	}
+
+	drm_atomic_commit_put(state);
+unlock:
+	drm_modeset_drop_locks(ctx);
+	drm_modeset_acquire_fini(ctx);
+	mutex_unlock(&display->drm->mode_config.mutex);
+}
+
+void intel_display_reset_debugfs_register(struct intel_display *display)
+{
+	debugfs_create_u32("intel_display_reset_count", 0400,
+			   display->drm->debugfs_root,
+			   &display->reset.count);
+}

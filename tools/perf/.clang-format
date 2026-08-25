@@ -1,0 +1,23 @@
+BasedOnStyle: InheritParentConfig
+SortIncludes: true
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Python.h must be first
+  - Regex:           '^<Python\.h>'
+    Priority:        -1
+  # Implicitly the corresponding header for the C file has Priority 0
+  # C Standard Library Headers
+  - Regex:           '^<(assert|complex|ctype|errno|fenv|float|inttypes|iso646|limits|locale|math|setjmp|signal|stdalign|stdarg|stdatomic|stdbit|stdbool|stdckdint|stddef|stdint|stdio|stdlib|stdnoreturn|string|tgmath|threads|time|uchar|wchar|wctype)\.h>'
+    Priority:        1
+  # OS/System-Specific Headers (directories)
+  - Regex:           '^<(arpa|asm|asm-generic|linux|machine|net|netinet|sys|uapi|x86_64)/.*>'
+    Priority:        2
+  # OS/System-Specific Headers (POSIX/System flat headers)
+  - Regex:           '^<(aio|byteswap|dirent|dlfcn|elf|endian|err|execinfo|fcntl|features|fnmatch|ftw|gelf|getopt|grp|ifaddrs|libelf|libgen|malloc|memory|mntent|netdb|numa|numaif|paths|poll|pthread|pty|pwd|regex|resolv|sched|semaphore|spawn|strings|syscall|sysexits|syslog|termios|unistd|utmp|x86intrin)\.h>'
+    Priority:        2
+  # Third-Party Library Headers
+  - Regex:           '^<.*>'
+    Priority:        3
+  # Your Project's Other Headers
+  - Regex:           '^".*"'
+    Priority:        4

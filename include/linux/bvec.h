@@ -1,0 +1,346 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/*
+ * bvec iterator
+ *
+ * Copyright (C) 2001 Ming Lei <ming.lei@canonical.com>
+ */
+#ifndef __LINUX_BVEC_H
+#define __LINUX_BVEC_H
+
+#include <linux/highmem.h>
+#include <linux/bug.h>
+#include <linux/errno.h>
+#include <linux/limits.h>
+#include <linux/minmax.h>
+#include <linux/types.h>
+
+struct page;
+
+/**
+ * struct bio_vec - a contiguous range of physical memory addresses
+ * @bv_page:   First page associated with the address range.
+ * @bv_len:    Number of bytes in the address range.
+ * @bv_offset: Start of the address range relative to the start of @bv_page.
+ *
+ * All pages within a bio_vec starting from @bv_page are contiguous and
+ * can simply be iterated (see bvec_advance()).
+ */
+struct bio_vec {
+	struct page	*bv_page;
+	unsigned int	bv_len;
+	unsigned int	bv_offset;
+};
+
+/**
+ * bvec_set_page - initialize a bvec based off a struct page
+ * @bv:		bvec to initialize
+ * @page:	page the bvec should point to
+ * @len:	length of the bvec
+ * @offset:	offset into the page
+ */
+static inline void bvec_set_page(struct bio_vec *bv, struct page *page,
+		unsigned int len, unsigned int offset)
+{
+	bv->bv_page = page;
+	bv->bv_len = len;
+	bv->bv_offset = offset;
+}
+
+/**
+ * bvec_set_folio - initialize a bvec based off a struct folio
+ * @bv:		bvec to initialize
+ * @folio:	folio the bvec should point to
+ * @len:	length of the bvec
+ * @offset:	offset into the folio
+ */
+static inline void bvec_set_folio(struct bio_vec *bv, struct folio *folio,
+		size_t len, size_t offset)
+{
+	unsigned long nr = offset / PAGE_SIZE;
+
+	WARN_ON_ONCE(len > UINT_MAX);
+	bvec_set_page(bv, folio_page(folio, nr), len, offset % PAGE_SIZE);
+}
+
+/**
+ * bvec_set_virt - initialize a bvec based on a virtual address
+ * @bv:		bvec to initialize
+ * @vaddr:	virtual address to set the bvec to
+ * @len:	length of the bvec
+ */
+static inline void bvec_set_virt(struct bio_vec *bv, void *vaddr,
+		unsigned int len)
+{
+	bvec_set_page(bv, virt_to_page(vaddr), len, offset_in_page(vaddr));
+}
+
+/**
+ * bvec_folio - Return the first folio referenced by this bvec
+ * @bv: bvec to access
+ *
+ * A bvec can contain non-folio memory, so this should only be called by
+ * the creator of the bvec; drivers have no business looking at the owner
+ * of the memory.  It may not even be the right interface for the caller
+ * to use as a bvec can span multiple folios.  You may be better off using
+ * something like bio_for_each_folio_all() which iterates over all folios.
+ */
+static inline struct folio *bvec_folio(const struct bio_vec *bv)
+{
+	return page_folio(bv->bv_page);
+}
+
+struct bvec_iter {
+	/*
+	 * Current device address in 512 byte sectors. Only updated by the bio
+	 * iter wrappers and not the bvec iterator helpers themselves.
+	 */
+	sector_t		bi_sector;
+
+	/*
+	 * Remaining size in bytes.
+	 */
+	unsigned int		bi_size;
+
+	/*
+	 * Current index into the bvec array. This indexes into `bi_io_vec` when
+	 * iterating a bvec array that is part of a `bio`.
+	 */
+	unsigned int		bi_idx;
+
+	/*
+	 * Current offset in the bvec entry pointed to by `bi_idx`.
+	 */
+	unsigned int		bi_offset;
+} __packed __aligned(4);
+
+struct bvec_iter_all {
+	struct bio_vec	bv;
+	int		idx;
+	unsigned	done;
+};
+
+static __always_inline const struct bio_vec *
+__bvec_iter_bvec(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return bvecs + iter.bi_idx;
+}
+
+/* multi-page (mp_bvec) helpers */
+static __always_inline struct page *
+mp_bvec_iter_page(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return __bvec_iter_bvec(bvecs, iter)->bv_page;
+}
+
+static __always_inline unsigned int
+mp_bvec_iter_len(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return min(__bvec_iter_bvec(bvecs, iter)->bv_len - iter.bi_offset,
+			iter.bi_size);
+}
+
+static __always_inline unsigned int
+mp_bvec_iter_offset(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return __bvec_iter_bvec(bvecs, iter)->bv_offset + iter.bi_offset;
+}
+
+static __always_inline unsigned int
+mp_bvec_iter_page_idx(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return mp_bvec_iter_offset(bvecs, iter) / PAGE_SIZE;
+}
+
+static __always_inline struct bio_vec
+mp_bvec_iter_bvec(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return (struct bio_vec) {
+		.bv_page	= mp_bvec_iter_page(bvecs, iter),
+		.bv_len		= mp_bvec_iter_len(bvecs, iter),
+		.bv_offset	= mp_bvec_iter_offset(bvecs, iter),
+	};
+}
+
+/* For building single-page bvec in flight */
+static __always_inline unsigned int
+bvec_iter_offset(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return mp_bvec_iter_offset(bvecs, iter) % PAGE_SIZE;
+}
+
+static __always_inline unsigned int
+bvec_iter_len(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return min(mp_bvec_iter_len(bvecs, iter),
+			PAGE_SIZE - bvec_iter_offset(bvecs, iter));
+}
+
+static __always_inline struct page *
+bvec_iter_page(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return mp_bvec_iter_page(bvecs, iter) +
+		mp_bvec_iter_page_idx(bvecs, iter);
+}
+
+static __always_inline struct bio_vec
+bvec_iter_bvec(const struct bio_vec *bvecs, const struct bvec_iter iter)
+{
+	return (struct bio_vec) {
+		.bv_page	= bvec_iter_page(bvecs, iter),
+		.bv_len		= bvec_iter_len(bvecs, iter),
+		.bv_offset	= bvec_iter_offset(bvecs, iter),
+	};
+}
+
+static inline bool bvec_iter_advance(const struct bio_vec *bv,
+		struct bvec_iter *iter, unsigned bytes)
+{
+	unsigned int idx = iter->bi_idx;
+
+	if (WARN_ONCE(bytes > iter->bi_size,
+		     "Attempted to advance past end of bvec iter\n")) {
+		iter->bi_size = 0;
+		return false;
+	}
+
+	iter->bi_size -= bytes;
+	bytes += iter->bi_offset;
+
+	while (bytes && bytes >= bv[idx].bv_len) {
+		bytes -= bv[idx].bv_len;
+		idx++;
+	}
+
+	iter->bi_idx = idx;
+	iter->bi_offset = bytes;
+	return true;
+}
+
+/*
+ * A simpler version of bvec_iter_advance(), @bytes should not span
+ * across multiple bvec entries, i.e. bytes <= bv[i->bi_idx].bv_len
+ */
+static inline void bvec_iter_advance_single(const struct bio_vec *bv,
+				struct bvec_iter *iter, unsigned int bytes)
+{
+	unsigned int done = iter->bi_offset + bytes;
+
+	if (done == bv[iter->bi_idx].bv_len) {
+		done = 0;
+		iter->bi_idx++;
+	}
+	iter->bi_offset = done;
+	iter->bi_size -= bytes;
+}
+
+#define for_each_bvec(bvl, bio_vec, iter, start)			\
+	for (iter = (start);						\
+	     (iter).bi_size &&						\
+		((bvl = bvec_iter_bvec((bio_vec), (iter))), 1);	\
+	     bvec_iter_advance_single((bio_vec), &(iter), (bvl).bv_len))
+
+#define for_each_mp_bvec(bvl, bio_vec, iter, start)			\
+	for (iter = (start);						\
+	     (iter).bi_size &&						\
+		((bvl = mp_bvec_iter_bvec((bio_vec), (iter))), 1);	\
+	     bvec_iter_advance_single((bio_vec), &(iter), (bvl).bv_len))
+
+static inline struct bio_vec *bvec_init_iter_all(struct bvec_iter_all *iter_all)
+{
+	iter_all->done = 0;
+	iter_all->idx = 0;
+
+	return &iter_all->bv;
+}
+
+static inline void bvec_advance(const struct bio_vec *bvec,
+				struct bvec_iter_all *iter_all)
+{
+	struct bio_vec *bv = &iter_all->bv;
+
+	if (iter_all->done) {
+		bv->bv_page++;
+		bv->bv_offset = 0;
+	} else {
+		bv->bv_page = bvec->bv_page + (bvec->bv_offset >> PAGE_SHIFT);
+		bv->bv_offset = bvec->bv_offset & ~PAGE_MASK;
+	}
+	bv->bv_len = min_t(unsigned int, PAGE_SIZE - bv->bv_offset,
+			   bvec->bv_len - iter_all->done);
+	iter_all->done += bv->bv_len;
+
+	if (iter_all->done == bvec->bv_len) {
+		iter_all->idx++;
+		iter_all->done = 0;
+	}
+}
+
+/**
+ * bvec_kmap_local - map a bvec into the kernel virtual address space
+ * @bvec: bvec to map
+ *
+ * Must be called on single-page bvecs only.  Call kunmap_local on the returned
+ * address to unmap.
+ */
+static inline void *bvec_kmap_local(struct bio_vec *bvec)
+{
+	return kmap_local_page(bvec->bv_page) + bvec->bv_offset;
+}
+
+/**
+ * memcpy_from_bvec - copy data from a bvec
+ * @to: Kernel virtual address to copy to.
+ * @bvec: bvec to copy from
+ *
+ * Must be called on single-page bvecs only.
+ */
+static inline void memcpy_from_bvec(char *to, struct bio_vec *bvec)
+{
+	memcpy_from_page(to, bvec->bv_page, bvec->bv_offset, bvec->bv_len);
+}
+
+/**
+ * memcpy_to_bvec - copy data to a bvec
+ * @bvec: bvec to copy to
+ * @from: Kernel virtual address to copy from.
+ *
+ * Must be called on single-page bvecs only.
+ */
+static inline void memcpy_to_bvec(struct bio_vec *bvec, const char *from)
+{
+	memcpy_to_page(bvec->bv_page, bvec->bv_offset, from, bvec->bv_len);
+}
+
+/**
+ * memzero_bvec - zero all data in a bvec
+ * @bvec: bvec to zero
+ *
+ * Must be called on single-page bvecs only.
+ */
+static inline void memzero_bvec(struct bio_vec *bvec)
+{
+	memzero_page(bvec->bv_page, bvec->bv_offset, bvec->bv_len);
+}
+
+/**
+ * bvec_virt - return the virtual address for a bvec
+ * @bvec: bvec to return the virtual address for
+ *
+ * Note: the caller must ensure that @bvec->bv_page is not a highmem page.
+ */
+static inline void *bvec_virt(struct bio_vec *bvec)
+{
+	WARN_ON_ONCE(PageHighMem(bvec->bv_page));
+	return page_address(bvec->bv_page) + bvec->bv_offset;
+}
+
+/**
+ * bvec_phys - return the physical address for a bvec
+ * @bvec: bvec to return the physical address for
+ */
+static inline phys_addr_t bvec_phys(const struct bio_vec *bvec)
+{
+	return page_to_phys(bvec->bv_page) + bvec->bv_offset;
+}
+
+#endif /* __LINUX_BVEC_H */

@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0
+
+perf-test-y += noploop.o
+perf-test-y += thloop.o
+perf-test-y += named_threads.o
+perf-test-y += leafloop.o
+perf-test-y += sqrtloop.o
+perf-test-y += brstack.o
+perf-test-y += datasym.o
+perf-test-y += landlock.o
+perf-test-y += traploop.o
+perf-test-y += inlineloop.o
+perf-test-y += jitdump.o
+perf-test-y += context_switch_loop.o
+perf-test-y += deterministic.o
+perf-test-y += callchain.o
+
+ifeq ($(CONFIG_RUST_SUPPORT),y)
+    perf-test-y += code_with_type.o
+    perf-test-y += code_with_type.a
+endif
+
+CFLAGS_sqrtloop.o         = -g -O0 -fno-inline -U_FORTIFY_SOURCE
+CFLAGS_leafloop.o         = -g -O0 -fno-inline -fno-omit-frame-pointer -U_FORTIFY_SOURCE
+CFLAGS_brstack.o          = -g -O0 -fno-inline -U_FORTIFY_SOURCE
+CFLAGS_datasym.o          = -g -O0 -fno-inline -U_FORTIFY_SOURCE
+CFLAGS_traploop.o         = -g -O0 -fno-inline -U_FORTIFY_SOURCE
+CFLAGS_inlineloop.o       = -g -O2
+CFLAGS_deterministic.o    = -g -O0 -fno-inline -U_FORTIFY_SOURCE
+CFLAGS_named_threads.o    = -g -O0 -fno-inline -U_FORTIFY_SOURCE
+CFLAGS_callchain.o        = -g -O0 -fno-inline -U_FORTIFY_SOURCE

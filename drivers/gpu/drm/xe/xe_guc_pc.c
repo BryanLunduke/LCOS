@@ -1,0 +1,1448 @@
+// SPDX-License-Identifier: MIT
+/*
+ * Copyright © 2022 Intel Corporation
+ */
+
+#include "xe_guc_pc.h"
+
+#include <linux/cleanup.h>
+#include <linux/delay.h>
+#include <linux/iopoll.h>
+#include <linux/jiffies.h>
+#include <linux/ktime.h>
+#include <linux/wait_bit.h>
+
+#include <drm/drm_managed.h>
+#include <drm/drm_print.h>
+#include <generated/xe_device_wa_oob.h>
+#include <generated/xe_wa_oob.h>
+
+#include "abi/guc_actions_slpc_abi.h"
+#include "regs/xe_gt_regs.h"
+#include "regs/xe_regs.h"
+#include "xe_bo.h"
+#include "xe_device.h"
+#include "xe_force_wake.h"
+#include "xe_gt.h"
+#include "xe_gt_idle.h"
+#include "xe_gt_printk.h"
+#include "xe_gt_throttle.h"
+#include "xe_gt_types.h"
+#include "xe_guc.h"
+#include "xe_guc_ct.h"
+#include "xe_map.h"
+#include "xe_mmio.h"
+#include "xe_pcode.h"
+#include "xe_pm.h"
+#include "xe_sriov.h"
+#include "xe_wa.h"
+
+#define MCHBAR_MIRROR_BASE_SNB	0x140000
+
+#define RP_STATE_CAP		XE_REG(MCHBAR_MIRROR_BASE_SNB + 0x5998)
+#define   RP0_MASK		REG_GENMASK(7, 0)
+#define   RP1_MASK		REG_GENMASK(15, 8)
+#define   RPN_MASK		REG_GENMASK(23, 16)
+
+#define FREQ_INFO_REC	XE_REG(MCHBAR_MIRROR_BASE_SNB + 0x5ef0)
+#define   RPE_MASK		REG_GENMASK(15, 8)
+#define   RPA_MASK		REG_GENMASK(31, 16)
+
+#define GT_PERF_STATUS		XE_REG(0x1381b4)
+#define   CAGF_MASK	REG_GENMASK(19, 11)
+
+#define GT_FREQUENCY_MULTIPLIER	50
+#define GT_FREQUENCY_SCALER	3
+
+#define LNL_MERT_FREQ_CAP	800
+#define BMG_MERT_FREQ_CAP	2133
+#define BMG_MIN_FREQ		1200
+#define BMG_MERT_FLUSH_FREQ_CAP	2600
+
+#define SLPC_RESET_TIMEOUT_MS 5 /* roughly 5ms, but no need for precision */
+#define SLPC_RESET_EXTENDED_TIMEOUT_MS 1000 /* To be used only at pc_start */
+#define SLPC_ACT_FREQ_TIMEOUT_MS 100
+
+/**
+ * DOC: GuC Power Conservation (PC)
+ *
+ * GuC Power Conservation (PC) supports multiple features for the most
+ * efficient and performing use of the GT when GuC submission is enabled,
+ * including frequency management, Render-C states management, and various
+ * algorithms for power balancing.
+ *
+ * Single Loop Power Conservation (SLPC) is the name given to the suite of
+ * connected power conservation features in the GuC firmware. The firmware
+ * exposes a programming interface to the host for the control of SLPC.
+ *
+ * Frequency management:
+ * ---------------------
+ *
+ * Xe driver enables SLPC with all of its defaults features and frequency
+ * selection, which varies per platform.
+ *
+ * Power profiles add another level of control to SLPC. When power saving
+ * profile is chosen, SLPC will use conservative thresholds to ramp frequency,
+ * thus saving power. Base profile is default and ensures balanced performance
+ * for any workload.
+ *
+ * Render-C States:
+ * ----------------
+ *
+ * Render-C states is also a GuC PC feature that is now enabled in Xe for
+ * all platforms.
+ *
+ * Implementation details:
+ * -----------------------
+ * The implementation for GuC Power Management features is split as follows:
+ *
+ * xe_guc_rc:  Logic for handling GuC RC
+ * xe_gt_idle: Host side logic for RC6 and Coarse Power gating (CPG)
+ * xe_guc_pc:  Logic for all other SLPC related features
+ *
+ * There is some cross interaction between these where host C6 will need to be
+ * enabled when we plan to skip GuC RC. Also, the GuC RC mode is currently
+ * overridden through 0x3003 which is an SLPC H2G call.
+ */
+
+static struct xe_guc *pc_to_guc(struct xe_guc_pc *pc)
+{
+	return container_of(pc, struct xe_guc, pc);
+}
+
+static struct xe_guc_ct *pc_to_ct(struct xe_guc_pc *pc)
+{
+	return &pc_to_guc(pc)->ct;
+}
+
+static struct xe_gt *pc_to_gt(struct xe_guc_pc *pc)
+{
+	return guc_to_gt(pc_to_guc(pc));
+}
+
+static struct xe_device *pc_to_xe(struct xe_guc_pc *pc)
+{
+	return guc_to_xe(pc_to_guc(pc));
+}
+
+static struct iosys_map *pc_to_maps(struct xe_guc_pc *pc)
+{
+	return &pc->bo->vmap;
+}
+
+#define slpc_shared_data_read(pc_, field_) \
+	xe_map_rd_field(pc_to_xe(pc_), pc_to_maps(pc_), 0, \
+			struct slpc_shared_data, field_)
+
+#define slpc_shared_data_write(pc_, field_, val_) \
+	xe_map_wr_field(pc_to_xe(pc_), pc_to_maps(pc_), 0, \
+			struct slpc_shared_data, field_, val_)
+
+#define SLPC_EVENT(id, count) \
+	(FIELD_PREP(HOST2GUC_PC_SLPC_REQUEST_MSG_1_EVENT_ID, id) | \
+	 FIELD_PREP(HOST2GUC_PC_SLPC_REQUEST_MSG_1_EVENT_ARGC, count))
+
+static int wait_for_pc_state(struct xe_guc_pc *pc,
+			     enum slpc_global_state target_state,
+			     int timeout_ms)
+{
+	enum slpc_global_state state;
+
+	xe_device_assert_mem_access(pc_to_xe(pc));
+
+	return poll_timeout_us(state = slpc_shared_data_read(pc, header.global_state),
+			       state == target_state,
+			       20, timeout_ms * USEC_PER_MSEC, false);
+}
+
+static int wait_for_flush_complete(struct xe_guc_pc *pc)
+{
+	const unsigned long timeout = msecs_to_jiffies(30);
+
+	if (!wait_var_event_timeout(&pc->flush_freq_limit,
+				    !atomic_read(&pc->flush_freq_limit),
+				    timeout))
+		return -ETIMEDOUT;
+
+	return 0;
+}
+
+static int wait_for_act_freq_max_limit(struct xe_guc_pc *pc, u32 max_limit)
+{
+	u32 freq;
+
+	return poll_timeout_us(freq = xe_guc_pc_get_act_freq(pc),
+			       freq <= max_limit,
+			       20, SLPC_ACT_FREQ_TIMEOUT_MS * USEC_PER_MSEC, false);
+}
+
+static int pc_action_reset(struct xe_guc_pc *pc)
+{
+	struct xe_guc_ct *ct = pc_to_ct(pc);
+	u32 action[] = {
+		GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST,
+		SLPC_EVENT(SLPC_EVENT_RESET, 2),
+		xe_bo_ggtt_addr(pc->bo),
+		0,
+	};
+	int ret;
+
+	ret = xe_guc_ct_send(ct, action, ARRAY_SIZE(action), 0, 0);
+	if (ret && !(xe_device_wedged(pc_to_xe(pc)) && ret == -ECANCELED))
+		xe_gt_err(pc_to_gt(pc), "GuC PC reset failed: %pe\n",
+			  ERR_PTR(ret));
+
+	return ret;
+}
+
+static int pc_action_query_task_state(struct xe_guc_pc *pc)
+{
+	struct xe_guc_ct *ct = pc_to_ct(pc);
+	u32 action[] = {
+		GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST,
+		SLPC_EVENT(SLPC_EVENT_QUERY_TASK_STATE, 2),
+		xe_bo_ggtt_addr(pc->bo),
+		0,
+	};
+	int ret;
+
+	if (wait_for_pc_state(pc, SLPC_GLOBAL_STATE_RUNNING,
+			      SLPC_RESET_TIMEOUT_MS))
+		return -EAGAIN;
+
+	/* Blocking here to ensure the results are ready before reading them */
+	ret = xe_guc_ct_send_block(ct, action, ARRAY_SIZE(action));
+	if (ret && !(xe_device_wedged(pc_to_xe(pc)) && ret == -ECANCELED))
+		xe_gt_err(pc_to_gt(pc), "GuC PC query task state failed: %pe\n",
+			  ERR_PTR(ret));
+
+	return ret;
+}
+
+static int pc_action_set_param(struct xe_guc_pc *pc, u8 id, u32 value)
+{
+	struct xe_guc_ct *ct = pc_to_ct(pc);
+	u32 action[] = {
+		GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST,
+		SLPC_EVENT(SLPC_EVENT_PARAMETER_SET, 2),
+		id,
+		value,
+	};
+	int ret;
+
+	if (wait_for_pc_state(pc, SLPC_GLOBAL_STATE_RUNNING,
+			      SLPC_RESET_TIMEOUT_MS))
+		return -EAGAIN;
+
+	ret = xe_guc_ct_send(ct, action, ARRAY_SIZE(action), 0, 0);
+	if (ret && !(xe_device_wedged(pc_to_xe(pc)) && ret == -ECANCELED))
+		xe_gt_err(pc_to_gt(pc), "GuC PC set param[%u]=%u failed: %pe\n",
+			  id, value, ERR_PTR(ret));
+
+	return ret;
+}
+
+static int pc_action_unset_param(struct xe_guc_pc *pc, u8 id)
+{
+	u32 action[] = {
+		GUC_ACTION_HOST2GUC_PC_SLPC_REQUEST,
+		SLPC_EVENT(SLPC_EVENT_PARAMETER_UNSET, 1),
+		id,
+	};
+	struct xe_guc_ct *ct = &pc_to_guc(pc)->ct;
+	int ret;
+
+	if (wait_for_pc_state(pc, SLPC_GLOBAL_STATE_RUNNING,
+			      SLPC_RESET_TIMEOUT_MS))
+		return -EAGAIN;
+
+	ret = xe_guc_ct_send(ct, action, ARRAY_SIZE(action), 0, 0);
+	if (ret && !(xe_device_wedged(pc_to_xe(pc)) && ret == -ECANCELED))
+		xe_gt_err(pc_to_gt(pc), "GuC PC unset param failed: %pe",
+			  ERR_PTR(ret));
+
+	return ret;
+}
+
+/**
+ * xe_guc_pc_action_set_param() - Set value of SLPC param
+ * @pc: Xe_GuC_PC instance
+ * @id: Param id
+ * @value: Value to set
+ *
+ * This function can be used to set any SLPC param.
+ *
+ * Return: 0 on Success
+ */
+int xe_guc_pc_action_set_param(struct xe_guc_pc *pc, u8 id, u32 value)
+{
+	xe_device_assert_mem_access(pc_to_xe(pc));
+	return pc_action_set_param(pc, id, value);
+}
+
+/**
+ * xe_guc_pc_action_unset_param() - Revert to default value
+ * @pc: Xe_GuC_PC instance
+ * @id: Param id
+ *
+ * This function can be used revert any SLPC param to its default value.
+ *
+ * Return: 0 on Success
+ */
+int xe_guc_pc_action_unset_param(struct xe_guc_pc *pc, u8 id)
+{
+	xe_device_assert_mem_access(pc_to_xe(pc));
+	return pc_action_unset_param(pc, id);
+}
+
+static u32 decode_freq(u32 raw)
+{
+	return DIV_ROUND_CLOSEST(raw * GT_FREQUENCY_MULTIPLIER,
+				 GT_FREQUENCY_SCALER);
+}
+
+static u32 encode_freq(u32 freq)
+{
+	return DIV_ROUND_CLOSEST(freq * GT_FREQUENCY_SCALER,
+				 GT_FREQUENCY_MULTIPLIER);
+}
+
+static u32 pc_get_min_freq(struct xe_guc_pc *pc)
+{
+	u32 freq;
+
+	freq = FIELD_GET(SLPC_MIN_UNSLICE_FREQ_MASK,
+			 slpc_shared_data_read(pc, task_state_data.freq));
+
+	return decode_freq(freq);
+}
+
+static void pc_set_manual_rp_ctrl(struct xe_guc_pc *pc, bool enable)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 state = enable ? RPSWCTL_ENABLE : RPSWCTL_DISABLE;
+
+	/* Allow/Disallow punit to process software freq requests */
+	xe_mmio_write32(&gt->mmio, RP_CONTROL, state);
+}
+
+static void pc_set_cur_freq(struct xe_guc_pc *pc, u32 freq)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 rpnswreq;
+
+	pc_set_manual_rp_ctrl(pc, true);
+
+	/* Req freq is in units of 16.66 Mhz */
+	rpnswreq = REG_FIELD_PREP(REQ_RATIO_MASK, encode_freq(freq));
+	xe_mmio_write32(&gt->mmio, RPNSWREQ, rpnswreq);
+
+	/* Sleep for a small time to allow pcode to respond */
+	usleep_range(100, 300);
+
+	pc_set_manual_rp_ctrl(pc, false);
+}
+
+static int pc_set_min_freq(struct xe_guc_pc *pc, u32 freq)
+{
+	/*
+	 * Let's only check for the rpn-rp0 range. If max < min,
+	 * min becomes a fixed request.
+	 */
+	if (freq < pc->rpn_freq || freq > pc->rp0_freq)
+		return -EINVAL;
+
+	/*
+	 * GuC policy is to elevate minimum frequency to the efficient levels
+	 * Our goal is to have the admin choices respected.
+	 */
+	pc_action_set_param(pc, SLPC_PARAM_IGNORE_EFFICIENT_FREQUENCY,
+			    freq < xe_guc_pc_get_rpe_freq(pc));
+
+	return pc_action_set_param(pc,
+				   SLPC_PARAM_GLOBAL_MIN_GT_UNSLICE_FREQ_MHZ,
+				   freq);
+}
+
+static int pc_get_max_freq(struct xe_guc_pc *pc)
+{
+	u32 freq;
+
+	freq = FIELD_GET(SLPC_MAX_UNSLICE_FREQ_MASK,
+			 slpc_shared_data_read(pc, task_state_data.freq));
+
+	return decode_freq(freq);
+}
+
+static int pc_set_max_freq(struct xe_guc_pc *pc, u32 freq)
+{
+	/*
+	 * Let's only check for the rpn-rp0 range. If max < min,
+	 * min becomes a fixed request.
+	 * Also, overclocking is not supported.
+	 */
+	if (freq < pc->rpn_freq || freq > pc->rp0_freq)
+		return -EINVAL;
+
+	return pc_action_set_param(pc,
+				   SLPC_PARAM_GLOBAL_MAX_GT_UNSLICE_FREQ_MHZ,
+				   freq);
+}
+
+static u32 mtl_get_rpa_freq(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg;
+
+	if (xe_gt_is_media_type(gt))
+		reg = xe_mmio_read32(&gt->mmio, MTL_MPA_FREQUENCY);
+	else
+		reg = xe_mmio_read32(&gt->mmio, MTL_GT_RPA_FREQUENCY);
+
+	return decode_freq(REG_FIELD_GET(MTL_RPA_MASK, reg));
+}
+
+static u32 mtl_get_rpe_freq(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg;
+
+	if (xe_gt_is_media_type(gt))
+		reg = xe_mmio_read32(&gt->mmio, MTL_MPE_FREQUENCY);
+	else
+		reg = xe_mmio_read32(&gt->mmio, MTL_GT_RPE_FREQUENCY);
+
+	return decode_freq(REG_FIELD_GET(MTL_RPE_MASK, reg));
+}
+
+static u32 pvc_get_rpa_freq(struct xe_guc_pc *pc)
+{
+	/*
+	 * For PVC we still need to use fused RP0 as the approximation for RPa
+	 * For other platforms than PVC we get the resolved RPa directly from
+	 * PCODE at a different register
+	 */
+
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg;
+
+	reg = xe_mmio_read32(&gt->mmio, PVC_RP_STATE_CAP);
+	return REG_FIELD_GET(RP0_MASK, reg) * GT_FREQUENCY_MULTIPLIER;
+}
+
+static u32 tgl_get_rpa_freq(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg;
+
+	reg = xe_mmio_read32(&gt->mmio, FREQ_INFO_REC);
+	return REG_FIELD_GET(RPA_MASK, reg) * GT_FREQUENCY_MULTIPLIER;
+}
+
+static u32 pvc_get_rpe_freq(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg;
+
+	/*
+	 * For PVC we still need to use fused RP1 as the approximation for RPe
+	 */
+	reg = xe_mmio_read32(&gt->mmio, PVC_RP_STATE_CAP);
+	return REG_FIELD_GET(RP1_MASK, reg) * GT_FREQUENCY_MULTIPLIER;
+}
+
+static u32 tgl_get_rpe_freq(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg;
+
+	/*
+	 * For other platforms than PVC, we get the resolved RPe directly from
+	 * PCODE at a different register
+	 */
+	reg = xe_mmio_read32(&gt->mmio, FREQ_INFO_REC);
+	return REG_FIELD_GET(RPE_MASK, reg) * GT_FREQUENCY_MULTIPLIER;
+}
+
+/**
+ * xe_guc_pc_get_act_freq - Get Actual running frequency
+ * @pc: The GuC PC
+ *
+ * Returns: The Actual running frequency. Which might be 0 if GT is in Render-C sleep state (RC6).
+ */
+u32 xe_guc_pc_get_act_freq(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	struct xe_device *xe = gt_to_xe(gt);
+	u32 freq;
+
+	/* When in RC6, actual frequency reported will be 0. */
+	if (GRAPHICS_VERx100(xe) >= 1270) {
+		freq = xe_mmio_read32(&gt->mmio, MTL_MIRROR_TARGET_WP1);
+		freq = REG_FIELD_GET(MTL_CAGF_MASK, freq);
+	} else {
+		freq = xe_mmio_read32(&gt->mmio, GT_PERF_STATUS);
+		freq = REG_FIELD_GET(CAGF_MASK, freq);
+	}
+
+	freq = decode_freq(freq);
+
+	return freq;
+}
+
+static u32 get_cur_freq(struct xe_gt *gt)
+{
+	u32 freq;
+
+	freq = xe_mmio_read32(&gt->mmio, RPNSWREQ);
+	freq = REG_FIELD_GET(REQ_RATIO_MASK, freq);
+	return decode_freq(freq);
+}
+
+/**
+ * xe_guc_pc_get_cur_freq_fw - With fw held, get requested frequency
+ * @pc: The GuC PC
+ *
+ * Returns: the requested frequency for that GT instance
+ */
+u32 xe_guc_pc_get_cur_freq_fw(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+
+	xe_force_wake_assert_held(gt_to_fw(gt), XE_FW_GT);
+
+	return get_cur_freq(gt);
+}
+
+/**
+ * xe_guc_pc_get_cur_freq - Get Current requested frequency
+ * @pc: The GuC PC
+ * @freq: A pointer to a u32 where the freq value will be returned
+ *
+ * Returns: 0 on success,
+ *         -EAGAIN if GuC PC not ready (likely in middle of a reset).
+ */
+int xe_guc_pc_get_cur_freq(struct xe_guc_pc *pc, u32 *freq)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+
+	/*
+	 * GuC SLPC plays with cur freq request when GuCRC is enabled
+	 * Block RC6 for a more reliable read.
+	 */
+	CLASS(xe_force_wake, fw_ref)(gt_to_fw(gt), XE_FW_GT);
+	if (!xe_force_wake_ref_has_domain(fw_ref.domains, XE_FW_GT))
+		return -ETIMEDOUT;
+
+	*freq = get_cur_freq(gt);
+
+	return 0;
+}
+
+/**
+ * xe_guc_pc_get_rp0_freq - Get the RP0 freq
+ * @pc: The GuC PC
+ *
+ * Returns: RP0 freq.
+ */
+u32 xe_guc_pc_get_rp0_freq(struct xe_guc_pc *pc)
+{
+	return pc->rp0_freq;
+}
+
+/**
+ * xe_guc_pc_get_rpa_freq - Get the RPa freq
+ * @pc: The GuC PC
+ *
+ * Returns: RPa freq.
+ */
+u32 xe_guc_pc_get_rpa_freq(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	struct xe_device *xe = gt_to_xe(gt);
+
+	if (GRAPHICS_VERx100(xe) == 1260)
+		return pvc_get_rpa_freq(pc);
+	else if (GRAPHICS_VERx100(xe) >= 1270)
+		return mtl_get_rpa_freq(pc);
+	else
+		return tgl_get_rpa_freq(pc);
+}
+
+/**
+ * xe_guc_pc_get_rpe_freq - Get the RPe freq
+ * @pc: The GuC PC
+ *
+ * Returns: RPe freq.
+ */
+u32 xe_guc_pc_get_rpe_freq(struct xe_guc_pc *pc)
+{
+	struct xe_device *xe = pc_to_xe(pc);
+	u32 freq;
+
+	if (GRAPHICS_VERx100(xe) == 1260)
+		freq = pvc_get_rpe_freq(pc);
+	else if (GRAPHICS_VERx100(xe) >= 1270)
+		freq = mtl_get_rpe_freq(pc);
+	else
+		freq = tgl_get_rpe_freq(pc);
+
+	return freq;
+}
+
+/**
+ * xe_guc_pc_get_rpn_freq - Get the RPn freq
+ * @pc: The GuC PC
+ *
+ * Returns: RPn freq.
+ */
+u32 xe_guc_pc_get_rpn_freq(struct xe_guc_pc *pc)
+{
+	return pc->rpn_freq;
+}
+
+static int xe_guc_pc_get_min_freq_locked(struct xe_guc_pc *pc, u32 *freq)
+{
+	int ret;
+
+	lockdep_assert_held(&pc->freq_lock);
+
+	/* Might be in the middle of a gt reset */
+	if (!pc->freq_ready)
+		return -EAGAIN;
+
+	ret = pc_action_query_task_state(pc);
+	if (ret)
+		return ret;
+
+	*freq = pc_get_min_freq(pc);
+
+	return 0;
+}
+
+/**
+ * xe_guc_pc_get_min_freq - Get the min operational frequency
+ * @pc: The GuC PC
+ * @freq: A pointer to a u32 where the freq value will be returned
+ *
+ * Returns: 0 on success,
+ *         -EAGAIN if GuC PC not ready (likely in middle of a reset).
+ */
+int xe_guc_pc_get_min_freq(struct xe_guc_pc *pc, u32 *freq)
+{
+	guard(mutex)(&pc->freq_lock);
+
+	return xe_guc_pc_get_min_freq_locked(pc, freq);
+}
+
+static int xe_guc_pc_set_min_freq_locked(struct xe_guc_pc *pc, u32 freq)
+{
+	int ret;
+
+	lockdep_assert_held(&pc->freq_lock);
+
+	/* Might be in the middle of a gt reset */
+	if (!pc->freq_ready)
+		return -EAGAIN;
+
+	ret = pc_set_min_freq(pc, freq);
+	if (ret)
+		return ret;
+
+	pc->user_requested_min = freq;
+
+	return 0;
+}
+
+/**
+ * xe_guc_pc_set_min_freq - Set the minimal operational frequency
+ * @pc: The GuC PC
+ * @freq: The selected minimal frequency
+ *
+ * Returns: 0 on success,
+ *         -EAGAIN if GuC PC not ready (likely in middle of a reset),
+ *         -EINVAL if value out of bounds.
+ */
+int xe_guc_pc_set_min_freq(struct xe_guc_pc *pc, u32 freq)
+{
+	guard(mutex)(&pc->freq_lock);
+
+	return xe_guc_pc_set_min_freq_locked(pc, freq);
+}
+
+static int xe_guc_pc_get_max_freq_locked(struct xe_guc_pc *pc, u32 *freq)
+{
+	int ret;
+
+	lockdep_assert_held(&pc->freq_lock);
+
+	/* Might be in the middle of a gt reset */
+	if (!pc->freq_ready)
+		return -EAGAIN;
+
+	ret = pc_action_query_task_state(pc);
+	if (ret)
+		return ret;
+
+	*freq = pc_get_max_freq(pc);
+
+	return 0;
+}
+
+/**
+ * xe_guc_pc_get_max_freq - Get Maximum operational frequency
+ * @pc: The GuC PC
+ * @freq: A pointer to a u32 where the freq value will be returned
+ *
+ * Returns: 0 on success,
+ *         -EAGAIN if GuC PC not ready (likely in middle of a reset).
+ */
+int xe_guc_pc_get_max_freq(struct xe_guc_pc *pc, u32 *freq)
+{
+	guard(mutex)(&pc->freq_lock);
+
+	return xe_guc_pc_get_max_freq_locked(pc, freq);
+}
+
+static int xe_guc_pc_set_max_freq_locked(struct xe_guc_pc *pc, u32 freq)
+{
+	int ret;
+
+	lockdep_assert_held(&pc->freq_lock);
+
+	/* Might be in the middle of a gt reset */
+	if (!pc->freq_ready)
+		return -EAGAIN;
+
+	ret = pc_set_max_freq(pc, freq);
+	if (ret)
+		return ret;
+
+	pc->user_requested_max = freq;
+
+	return 0;
+}
+
+/**
+ * xe_guc_pc_set_max_freq - Set the maximum operational frequency
+ * @pc: The GuC PC
+ * @freq: The selected maximum frequency value
+ *
+ * Returns: 0 on success,
+ *         -EAGAIN if GuC PC not ready (likely in middle of a reset),
+ *         -EINVAL if value out of bounds.
+ */
+int xe_guc_pc_set_max_freq(struct xe_guc_pc *pc, u32 freq)
+{
+	if (XE_GT_WA(pc_to_gt(pc), 22019338487)) {
+		if (wait_for_flush_complete(pc) != 0)
+			return -EAGAIN;
+	}
+
+	guard(mutex)(&pc->freq_lock);
+
+	return xe_guc_pc_set_max_freq_locked(pc, freq);
+}
+
+/**
+ * xe_guc_pc_c_status - get the current GT C state
+ * @pc: XE_GuC_PC instance
+ */
+enum xe_gt_idle_state xe_guc_pc_c_status(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg, gt_c_state;
+
+	if (GRAPHICS_VERx100(gt_to_xe(gt)) >= 1270) {
+		reg = xe_mmio_read32(&gt->mmio, MTL_MIRROR_TARGET_WP1);
+		gt_c_state = REG_FIELD_GET(MTL_CC_MASK, reg);
+
+		/*
+		 * There are higher level sleep states that will cause this
+		 * field to read out as its reset state, and those are only
+		 * possible after the GT is already in C6.
+		 */
+		if (gt_c_state == MTL_CRST)
+			gt_c_state = GT_C6;
+	} else {
+		reg = xe_mmio_read32(&gt->mmio, GT_CORE_STATUS);
+		gt_c_state = REG_FIELD_GET(RCN_MASK, reg);
+	}
+
+	switch (gt_c_state) {
+	case GT_C6:
+		return GT_IDLE_C6;
+	case GT_C0:
+		return GT_IDLE_C0;
+	default:
+		return GT_IDLE_UNKNOWN;
+	}
+}
+
+/**
+ * xe_guc_pc_rc6_residency - rc6 residency counter
+ * @pc: Xe_GuC_PC instance
+ */
+u64 xe_guc_pc_rc6_residency(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg;
+
+	reg = xe_mmio_read32(&gt->mmio, GT_GFX_RC6);
+
+	return reg;
+}
+
+/**
+ * xe_guc_pc_mc6_residency - mc6 residency counter
+ * @pc: Xe_GuC_PC instance
+ */
+u64 xe_guc_pc_mc6_residency(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u64 reg;
+
+	reg = xe_mmio_read32(&gt->mmio, MTL_MEDIA_MC6);
+
+	return reg;
+}
+
+static void mtl_init_fused_rp_values(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 reg;
+
+	xe_device_assert_mem_access(pc_to_xe(pc));
+
+	if (xe_gt_is_media_type(gt))
+		reg = xe_mmio_read32(&gt->mmio, MTL_MEDIAP_STATE_CAP);
+	else
+		reg = xe_mmio_read32(&gt->mmio, MTL_RP_STATE_CAP);
+
+	pc->rp0_freq = decode_freq(REG_FIELD_GET(MTL_RP0_CAP_MASK, reg));
+
+	pc->rpn_freq = decode_freq(REG_FIELD_GET(MTL_RPN_CAP_MASK, reg));
+}
+
+static void tgl_init_fused_rp_values(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	struct xe_device *xe = gt_to_xe(gt);
+	u32 reg;
+
+	xe_device_assert_mem_access(pc_to_xe(pc));
+
+	if (xe->info.platform == XE_PVC)
+		reg = xe_mmio_read32(&gt->mmio, PVC_RP_STATE_CAP);
+	else
+		reg = xe_mmio_read32(&gt->mmio, RP_STATE_CAP);
+	pc->rp0_freq = REG_FIELD_GET(RP0_MASK, reg) * GT_FREQUENCY_MULTIPLIER;
+	pc->rpn_freq = REG_FIELD_GET(RPN_MASK, reg) * GT_FREQUENCY_MULTIPLIER;
+}
+
+static void pc_init_fused_rp_values(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	struct xe_device *xe = gt_to_xe(gt);
+
+	if (GRAPHICS_VERx100(xe) >= 1270)
+		mtl_init_fused_rp_values(pc);
+	else
+		tgl_init_fused_rp_values(pc);
+}
+
+static u32 pc_max_freq_cap(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+
+	if (XE_GT_WA(gt, 22019338487)) {
+		if (xe_gt_is_media_type(gt))
+			return min(LNL_MERT_FREQ_CAP, pc->rp0_freq);
+		else
+			return min(BMG_MERT_FREQ_CAP, pc->rp0_freq);
+	} else {
+		return pc->rp0_freq;
+	}
+}
+
+/**
+ * xe_guc_pc_raise_unslice - Initialize RPx values and request a higher GT
+ * frequency to allow faster GuC load times
+ * @pc: Xe_GuC_PC instance
+ */
+void xe_guc_pc_raise_unslice(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+
+	xe_force_wake_assert_held(gt_to_fw(gt), XE_FW_GT);
+	pc_set_cur_freq(pc, pc_max_freq_cap(pc));
+}
+
+/**
+ * xe_guc_pc_init_early - Initialize RPx values
+ * @pc: Xe_GuC_PC instance
+ */
+void xe_guc_pc_init_early(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+
+	xe_force_wake_assert_held(gt_to_fw(gt), XE_FW_GT);
+	pc_init_fused_rp_values(pc);
+}
+
+static bool pc_needs_min_freq_change(struct xe_guc_pc *pc)
+{
+	struct xe_device *xe = pc_to_xe(pc);
+	struct xe_gt *gt = pc_to_gt(pc);
+
+	if (XE_DEVICE_WA(xe, 14022085890))
+		return true;
+
+	if (xe_gt_is_media_type(gt))
+		return false;
+
+	if (xe->info.platform == XE_BATTLEMAGE ||
+	    xe->info.platform == XE_CRESCENTISLAND)
+		return true;
+
+	return false;
+}
+
+static int pc_adjust_freq_bounds(struct xe_guc_pc *pc)
+{
+	int ret;
+	u32 min_freq;
+
+	lockdep_assert_held(&pc->freq_lock);
+
+	ret = pc_action_query_task_state(pc);
+	if (ret)
+		goto out;
+
+	/*
+	 * GuC defaults to some RPmax that is not actually achievable without
+	 * overclocking. Let's adjust it to the Hardware RP0, which is the
+	 * regular maximum
+	 */
+	if (pc_get_max_freq(pc) > pc->rp0_freq) {
+		ret = pc_set_max_freq(pc, pc->rp0_freq);
+		if (ret)
+			goto out;
+	}
+
+	/*
+	 * Same thing happens for Server platforms where min is listed as
+	 * RPMax
+	 */
+	min_freq = pc_get_min_freq(pc);
+	if (min_freq > pc->rp0_freq) {
+		ret = pc_set_min_freq(pc, pc->rp0_freq);
+		if (ret)
+			goto out;
+
+		min_freq = pc->rp0_freq;
+	}
+
+	/*
+	 * Setting GT RP min frequency to 1.2GHz by default for
+	 * GT0(Graphics) Tile of BMG and CRI.
+	 *
+	 * While BMG G21 WA will apply min frequency for
+	 * both GT0(Graphics) and GT1(Media) Tile.
+	 *
+	 * This is an active frequency, so if the device is idle
+	 * we aren't expecting high power output across board
+	 *
+	 */
+	if (pc_needs_min_freq_change(pc) && min_freq < BMG_MIN_FREQ)
+		ret = pc_set_min_freq(pc, BMG_MIN_FREQ);
+
+out:
+	return ret;
+}
+
+static int pc_adjust_requested_freq(struct xe_guc_pc *pc)
+{
+	int ret = 0;
+
+	lockdep_assert_held(&pc->freq_lock);
+
+	if (pc->user_requested_min != 0) {
+		ret = pc_set_min_freq(pc, pc->user_requested_min);
+		if (ret)
+			return ret;
+	}
+
+	if (pc->user_requested_max != 0) {
+		ret = pc_set_max_freq(pc, pc->user_requested_max);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
+}
+
+static bool needs_flush_freq_limit(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+
+	return  XE_GT_WA(gt, 22019338487) &&
+		pc->rp0_freq > BMG_MERT_FLUSH_FREQ_CAP;
+}
+
+/**
+ * xe_guc_pc_apply_flush_freq_limit() - Limit max GT freq during L2 flush
+ * @pc: the xe_guc_pc object
+ *
+ * As per the WA, reduce max GT frequency during L2 cache flush
+ */
+void xe_guc_pc_apply_flush_freq_limit(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 max_freq;
+	int ret;
+
+	if (!needs_flush_freq_limit(pc))
+		return;
+
+	guard(mutex)(&pc->freq_lock);
+
+	ret = xe_guc_pc_get_max_freq_locked(pc, &max_freq);
+	if (!ret && max_freq > BMG_MERT_FLUSH_FREQ_CAP) {
+		ret = pc_set_max_freq(pc, BMG_MERT_FLUSH_FREQ_CAP);
+		if (ret) {
+			xe_gt_err_once(gt, "Failed to cap max freq on flush to %u, %pe\n",
+				       BMG_MERT_FLUSH_FREQ_CAP, ERR_PTR(ret));
+			return;
+		}
+
+		atomic_set(&pc->flush_freq_limit, 1);
+
+		/*
+		 * If user has previously changed max freq, stash that value to
+		 * restore later, otherwise use the current max. New user
+		 * requests wait on flush.
+		 */
+		if (pc->user_requested_max != 0)
+			pc->stashed_max_freq = pc->user_requested_max;
+		else
+			pc->stashed_max_freq = max_freq;
+	}
+
+	/*
+	 * Wait for actual freq to go below the flush cap: even if the previous
+	 * max was below cap, the current one might still be above it
+	 */
+	ret = wait_for_act_freq_max_limit(pc, BMG_MERT_FLUSH_FREQ_CAP);
+	if (ret)
+		xe_gt_err_once(gt, "Actual freq did not reduce to %u, %pe\n",
+			       BMG_MERT_FLUSH_FREQ_CAP, ERR_PTR(ret));
+}
+
+/**
+ * xe_guc_pc_remove_flush_freq_limit() - Remove max GT freq limit after L2 flush completes.
+ * @pc: the xe_guc_pc object
+ *
+ * Retrieve the previous GT max frequency value.
+ */
+void xe_guc_pc_remove_flush_freq_limit(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	int ret = 0;
+
+	if (!needs_flush_freq_limit(pc))
+		return;
+
+	if (!atomic_read(&pc->flush_freq_limit))
+		return;
+
+	mutex_lock(&pc->freq_lock);
+
+	ret = pc_set_max_freq(&gt->uc.guc.pc, pc->stashed_max_freq);
+	if (ret)
+		xe_gt_err_once(gt, "Failed to restore max freq %u:%d",
+			       pc->stashed_max_freq, ret);
+
+	atomic_set(&pc->flush_freq_limit, 0);
+	mutex_unlock(&pc->freq_lock);
+	wake_up_var(&pc->flush_freq_limit);
+}
+
+static int pc_set_mert_freq_cap(struct xe_guc_pc *pc)
+{
+	int ret;
+
+	if (!XE_GT_WA(pc_to_gt(pc), 22019338487))
+		return 0;
+
+	guard(mutex)(&pc->freq_lock);
+
+	/*
+	 * Get updated min/max and stash them.
+	 */
+	ret = xe_guc_pc_get_min_freq_locked(pc, &pc->stashed_min_freq);
+	if (!ret)
+		ret = xe_guc_pc_get_max_freq_locked(pc, &pc->stashed_max_freq);
+	if (ret)
+		return ret;
+
+	/*
+	 * Ensure min and max are bound by MERT_FREQ_CAP until driver loads.
+	 */
+	ret = pc_set_min_freq(pc, min(xe_guc_pc_get_rpe_freq(pc), pc_max_freq_cap(pc)));
+	if (!ret)
+		ret = pc_set_max_freq(pc, min(pc->rp0_freq, pc_max_freq_cap(pc)));
+
+	return ret;
+}
+
+/**
+ * xe_guc_pc_restore_stashed_freq - Set min/max back to stashed values
+ * @pc: The GuC PC
+ *
+ * Returns: 0 on success,
+ *          error code on failure
+ */
+int xe_guc_pc_restore_stashed_freq(struct xe_guc_pc *pc)
+{
+	int ret = 0;
+
+	if (IS_SRIOV_VF(pc_to_xe(pc)) || pc_to_xe(pc)->info.skip_guc_pc)
+		return 0;
+
+	mutex_lock(&pc->freq_lock);
+	ret = pc_set_max_freq(pc, pc->stashed_max_freq);
+	if (!ret)
+		ret = pc_set_min_freq(pc, pc->stashed_min_freq);
+	mutex_unlock(&pc->freq_lock);
+
+	return ret;
+}
+
+static void pc_init_pcode_freq(struct xe_guc_pc *pc)
+{
+	u32 min = DIV_ROUND_CLOSEST(pc->rpn_freq, GT_FREQUENCY_MULTIPLIER);
+	u32 max = DIV_ROUND_CLOSEST(pc->rp0_freq, GT_FREQUENCY_MULTIPLIER);
+
+	XE_WARN_ON(xe_pcode_init_min_freq_table(gt_to_tile(pc_to_gt(pc)), min, max));
+}
+
+static int pc_init_freqs(struct xe_guc_pc *pc)
+{
+	int ret;
+
+	mutex_lock(&pc->freq_lock);
+
+	ret = pc_adjust_freq_bounds(pc);
+	if (ret)
+		goto out;
+
+	ret = pc_adjust_requested_freq(pc);
+	if (ret)
+		goto out;
+
+	pc_init_pcode_freq(pc);
+
+	/*
+	 * The frequencies are really ready for use only after the user
+	 * requested ones got restored.
+	 */
+	pc->freq_ready = true;
+
+out:
+	mutex_unlock(&pc->freq_lock);
+	return ret;
+}
+
+static int pc_action_set_strategy(struct xe_guc_pc *pc, u32 val)
+{
+	int ret = 0;
+
+	ret = pc_action_set_param(pc,
+				  SLPC_PARAM_STRATEGIES,
+				  val);
+
+	return ret;
+}
+
+static const char *power_profile_to_string(struct xe_guc_pc *pc)
+{
+	switch (pc->power_profile) {
+	case SLPC_POWER_PROFILE_BASE:
+		return "base";
+	case SLPC_POWER_PROFILE_POWER_SAVING:
+		return "power_saving";
+	default:
+		return "invalid";
+	}
+}
+
+void xe_guc_pc_get_power_profile(struct xe_guc_pc *pc, char *profile)
+{
+	switch (pc->power_profile) {
+	case SLPC_POWER_PROFILE_BASE:
+		sprintf(profile, "[%s]    %s\n", "base", "power_saving");
+		break;
+	case SLPC_POWER_PROFILE_POWER_SAVING:
+		sprintf(profile, "%s    [%s]\n", "base", "power_saving");
+		break;
+	default:
+		sprintf(profile, "invalid");
+	}
+}
+
+int xe_guc_pc_set_power_profile(struct xe_guc_pc *pc, const char *buf)
+{
+	int ret = 0;
+	u32 val;
+
+	if (strncmp("base", buf, strlen("base")) == 0)
+		val = SLPC_POWER_PROFILE_BASE;
+	else if (strncmp("power_saving", buf, strlen("power_saving")) == 0)
+		val = SLPC_POWER_PROFILE_POWER_SAVING;
+	else
+		return -EINVAL;
+
+	guard(mutex)(&pc->freq_lock);
+	guard(xe_pm_runtime_noresume)(pc_to_xe(pc));
+
+	ret = pc_action_set_param(pc,
+				  SLPC_PARAM_POWER_PROFILE,
+				  val);
+	if (ret)
+		xe_gt_err_once(pc_to_gt(pc), "Failed to set power profile to %d: %pe\n",
+			       val, ERR_PTR(ret));
+	else
+		pc->power_profile = val;
+
+	return ret;
+}
+
+static int pc_action_set_dcc(struct xe_guc_pc *pc, bool enable)
+{
+	int ret;
+
+	ret = pc_action_set_param(pc,
+				  SLPC_PARAM_TASK_ENABLE_DCC,
+				  enable);
+	if (!ret)
+		return pc_action_set_param(pc,
+					   SLPC_PARAM_TASK_DISABLE_DCC,
+					   !enable);
+	else
+		return ret;
+}
+
+static int pc_modify_defaults(struct xe_guc_pc *pc)
+{
+	struct xe_device *xe = pc_to_xe(pc);
+	struct xe_gt *gt = pc_to_gt(pc);
+	int ret = 0;
+
+	if (xe->info.platform == XE_PANTHERLAKE) {
+		ret = pc_action_set_dcc(pc, false);
+		if (unlikely(ret))
+			xe_gt_err(gt, "Failed to modify DCC default: %pe\n", ERR_PTR(ret));
+	}
+
+	return ret;
+}
+
+/**
+ * xe_guc_pc_start - Start GuC's Power Conservation component
+ * @pc: Xe_GuC_PC instance
+ */
+int xe_guc_pc_start(struct xe_guc_pc *pc)
+{
+	struct xe_device *xe = pc_to_xe(pc);
+	struct xe_gt *gt = pc_to_gt(pc);
+	u32 size = PAGE_ALIGN(sizeof(struct slpc_shared_data));
+	ktime_t earlier;
+	int ret;
+
+	xe_gt_assert(gt, xe_device_uc_enabled(xe));
+
+	CLASS(xe_force_wake, fw_ref)(gt_to_fw(gt), XE_FW_GT);
+	if (!xe_force_wake_ref_has_domain(fw_ref.domains, XE_FW_GT))
+		return -ETIMEDOUT;
+
+	if (xe->info.skip_guc_pc) {
+		/* Request max possible since dynamic freq mgmt is not enabled */
+		pc_set_cur_freq(pc, UINT_MAX);
+		return 0;
+	}
+
+	xe_map_memset(xe, &pc->bo->vmap, 0, 0, size);
+	slpc_shared_data_write(pc, header.size, size);
+
+	earlier = ktime_get();
+	ret = pc_action_reset(pc);
+	if (ret)
+		return ret;
+
+	if (wait_for_pc_state(pc, SLPC_GLOBAL_STATE_RUNNING,
+			      SLPC_RESET_TIMEOUT_MS)) {
+		xe_gt_warn(gt, "GuC PC start taking longer than normal [freq = %dMHz (req = %dMHz), perf_limit_reasons = 0x%08X]\n",
+			   xe_guc_pc_get_act_freq(pc), get_cur_freq(gt),
+			   xe_gt_throttle_get_limit_reasons(gt));
+
+		if (wait_for_pc_state(pc, SLPC_GLOBAL_STATE_RUNNING,
+				      SLPC_RESET_EXTENDED_TIMEOUT_MS)) {
+			xe_gt_err(gt, "GuC PC Start failed: Dynamic GT frequency control and GT sleep states are now disabled.\n");
+			return -EIO;
+		}
+
+		xe_gt_warn(gt, "GuC PC excessive start time: %lldms",
+			   ktime_ms_delta(ktime_get(), earlier));
+	}
+
+	ret = pc_modify_defaults(pc);
+	if (ret)
+		return ret;
+
+	ret = pc_init_freqs(pc);
+	if (ret)
+		return ret;
+
+	ret = pc_set_mert_freq_cap(pc);
+	if (ret)
+		return ret;
+
+	/* Enable SLPC Optimized Strategy for compute */
+	ret = pc_action_set_strategy(pc, SLPC_OPTIMIZED_STRATEGY_COMPUTE);
+
+	/* Set cached value of power_profile */
+	ret = xe_guc_pc_set_power_profile(pc, power_profile_to_string(pc));
+	if (unlikely(ret))
+		xe_gt_err(gt, "Failed to set SLPC power profile: %pe\n", ERR_PTR(ret));
+
+	return ret;
+}
+
+/**
+ * xe_guc_pc_stop - Stop GuC's Power Conservation component
+ * @pc: Xe_GuC_PC instance
+ */
+void xe_guc_pc_stop(struct xe_guc_pc *pc)
+{
+	struct xe_device *xe = pc_to_xe(pc);
+
+	if (xe->info.skip_guc_pc)
+		return;
+
+	mutex_lock(&pc->freq_lock);
+	pc->freq_ready = false;
+	mutex_unlock(&pc->freq_lock);
+}
+
+/**
+ * xe_guc_pc_fini_hw - Finalize GuC's Power Conservation component
+ * @arg: opaque pointer that should point to Xe_GuC_PC instance
+ */
+static void xe_guc_pc_fini_hw(void *arg)
+{
+	struct xe_guc_pc *pc = arg;
+	struct xe_device *xe = pc_to_xe(pc);
+
+	if (xe_device_wedged(xe))
+		return;
+
+	xe_guc_pc_stop(pc);
+
+	/* Bind requested freq to mert_freq_cap before unload */
+	CLASS(xe_force_wake, fw_ref)(gt_to_fw(pc_to_gt(pc)), XE_FW_GT);
+	pc_set_cur_freq(pc, min(pc_max_freq_cap(pc), xe_guc_pc_get_rpe_freq(pc)));
+}
+
+/**
+ * xe_guc_pc_init - Initialize GuC's Power Conservation component
+ * @pc: Xe_GuC_PC instance
+ */
+int xe_guc_pc_init(struct xe_guc_pc *pc)
+{
+	struct xe_gt *gt = pc_to_gt(pc);
+	struct xe_tile *tile = gt_to_tile(gt);
+	struct xe_device *xe = gt_to_xe(gt);
+	struct xe_bo *bo;
+	u32 size = PAGE_ALIGN(sizeof(struct slpc_shared_data));
+	int err;
+
+	if (xe->info.skip_guc_pc)
+		return 0;
+
+	err = drmm_mutex_init(&xe->drm, &pc->freq_lock);
+	if (err)
+		return err;
+
+	bo = xe_managed_bo_create_pin_map(xe, tile, size,
+					  XE_BO_FLAG_VRAM_IF_DGFX(tile) |
+					  XE_BO_FLAG_GGTT |
+					  XE_BO_FLAG_GGTT_INVALIDATE |
+					  XE_BO_FLAG_PINNED_NORESTORE);
+	if (IS_ERR(bo))
+		return PTR_ERR(bo);
+
+	pc->bo = bo;
+
+	pc->power_profile = SLPC_POWER_PROFILE_BASE;
+
+	return devm_add_action_or_reset(xe->drm.dev, xe_guc_pc_fini_hw, pc);
+}
+
+static const char *pc_get_state_string(struct xe_guc_pc *pc)
+{
+	switch (slpc_shared_data_read(pc, header.global_state)) {
+	case SLPC_GLOBAL_STATE_NOT_RUNNING:
+		return "not running";
+	case SLPC_GLOBAL_STATE_INITIALIZING:
+		return "initializing";
+	case SLPC_GLOBAL_STATE_RESETTING:
+		return "resetting";
+	case SLPC_GLOBAL_STATE_RUNNING:
+		return "running";
+	case SLPC_GLOBAL_STATE_SHUTTING_DOWN:
+		return "shutting down";
+	case SLPC_GLOBAL_STATE_ERROR:
+		return "error";
+	default:
+		return "unknown";
+	}
+}
+
+/**
+ * xe_guc_pc_print - Print GuC's Power Conservation information for debug
+ * @pc: Xe_GuC_PC instance
+ * @p: drm_printer
+ */
+void xe_guc_pc_print(struct xe_guc_pc *pc, struct drm_printer *p)
+{
+	drm_printf(p, "SLPC Shared Data Header:\n");
+	drm_printf(p, "\tSize: %x\n", slpc_shared_data_read(pc, header.size));
+	drm_printf(p, "\tGlobal State: %s\n", pc_get_state_string(pc));
+
+	if (pc_action_query_task_state(pc))
+		return;
+
+	drm_printf(p, "\nSLPC Tasks Status:\n");
+	drm_printf(p, "\tGTPERF enabled: %s\n",
+		   str_yes_no(slpc_shared_data_read(pc, task_state_data.status) &
+			      SLPC_GTPERF_TASK_ENABLED));
+	drm_printf(p, "\tDCC enabled: %s\n",
+		   str_yes_no(slpc_shared_data_read(pc, task_state_data.status) &
+			      SLPC_DCC_TASK_ENABLED));
+	drm_printf(p, "\tDCC in use: %s\n",
+		   str_yes_no(slpc_shared_data_read(pc, task_state_data.status) &
+			      SLPC_IN_DCC));
+	drm_printf(p, "\tBalancer enabled: %s\n",
+		   str_yes_no(slpc_shared_data_read(pc, task_state_data.status) &
+			      SLPC_BALANCER_ENABLED));
+	drm_printf(p, "\tIBC enabled: %s\n",
+		   str_yes_no(slpc_shared_data_read(pc, task_state_data.status) &
+			      SLPC_IBC_TASK_ENABLED));
+	drm_printf(p, "\tBalancer IA LMT enabled: %s\n",
+		   str_yes_no(slpc_shared_data_read(pc, task_state_data.status) &
+			      SLPC_BALANCER_IA_LMT_ENABLED));
+	drm_printf(p, "\tBalancer IA LMT active: %s\n",
+		   str_yes_no(slpc_shared_data_read(pc, task_state_data.status) &
+			      SLPC_BALANCER_IA_LMT_ACTIVE));
+}

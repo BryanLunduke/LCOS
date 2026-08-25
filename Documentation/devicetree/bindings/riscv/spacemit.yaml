@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/riscv/spacemit.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: SpacemiT SoC-based boards
+
+maintainers:
+  - Guodong Xu <guodong@riscstar.com>
+  - Yangyu Chen <cyy@cyyself.name>
+  - Yixun Lan <dlan@gentoo.org>
+
+description:
+  SpacemiT SoC-based boards
+
+properties:
+  $nodename:
+    const: '/'
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - bananapi,bpi-cm6-io
+          - const: bananapi,bpi-cm6
+          - const: spacemit,k1
+      - items:
+          - enum:
+              - bananapi,bpi-f3
+              - milkv,jupiter
+              - spacemit,musepi-pro
+              - xunlong,orangepi-r2s
+              - xunlong,orangepi-rv2
+          - const: spacemit,k1
+      - items:
+          - enum:
+              - deepcomputing,fml13v05
+              - spacemit,k3-pico-itx
+          - const: spacemit,k3
+      - items:
+          - enum:
+              - spacemit,k3-com260-ifx
+          - const: spacemit,k3-com260
+          - const: spacemit,k3
+
+additionalProperties: true
+
+...

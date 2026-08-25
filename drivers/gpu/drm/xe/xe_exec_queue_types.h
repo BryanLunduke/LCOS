@@ -1,0 +1,350 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Copyright © 2022 Intel Corporation
+ */
+
+#ifndef _XE_EXEC_QUEUE_TYPES_H_
+#define _XE_EXEC_QUEUE_TYPES_H_
+
+#include <linux/kref.h>
+
+#include <drm/gpu_scheduler.h>
+
+#include "xe_gpu_scheduler_types.h"
+#include "xe_hw_engine_types.h"
+#include "xe_hw_fence_types.h"
+#include "xe_lrc_types.h"
+
+struct drm_syncobj;
+struct xe_execlist_exec_queue;
+struct xe_gt;
+struct xe_guc_exec_queue;
+struct xe_hw_engine;
+struct xe_vm;
+
+enum xe_exec_queue_priority {
+	XE_EXEC_QUEUE_PRIORITY_UNSET = -2, /* For execlist usage only */
+	XE_EXEC_QUEUE_PRIORITY_LOW = 0,
+	XE_EXEC_QUEUE_PRIORITY_NORMAL,
+	XE_EXEC_QUEUE_PRIORITY_HIGH,
+	XE_EXEC_QUEUE_PRIORITY_KERNEL,
+
+	XE_EXEC_QUEUE_PRIORITY_COUNT
+};
+
+/**
+ * enum xe_multi_queue_priority - Multi Queue priority values
+ *
+ * The priority values of the queues within the multi queue group.
+ */
+enum xe_multi_queue_priority {
+	/** @XE_MULTI_QUEUE_PRIORITY_LOW: Priority low */
+	XE_MULTI_QUEUE_PRIORITY_LOW = 0,
+	/** @XE_MULTI_QUEUE_PRIORITY_NORMAL: Priority normal */
+	XE_MULTI_QUEUE_PRIORITY_NORMAL,
+	/** @XE_MULTI_QUEUE_PRIORITY_HIGH: Priority high */
+	XE_MULTI_QUEUE_PRIORITY_HIGH,
+};
+
+/**
+ * struct xe_exec_queue_group - Execution multi queue group
+ *
+ * Contains multi queue group information.
+ */
+struct xe_exec_queue_group {
+	/** @primary: Primary queue of this group */
+	struct xe_exec_queue *primary;
+	/** @cgp_bo: BO for the Context Group Page */
+	struct xe_bo *cgp_bo;
+	/** @xa: xarray to store LRCs */
+	struct xarray xa;
+	/** @list: List of all secondary queues in the group */
+	struct list_head list;
+	/** @list_lock: Secondary queue list lock */
+	struct mutex list_lock;
+	/**
+	 * @suspend_lock: Makes a secondary's suspend/resume and its forwarding
+	 * to the primary atomic. Nested outside of the queue's message lock
+	 * (@xe_guc_exec_queue.sched.msg_lock).
+	 */
+	spinlock_t suspend_lock;
+	/** @sync_pending: CGP_SYNC_DONE g2h response pending */
+	bool sync_pending;
+	/** @banned: Group banned */
+	bool banned;
+	/** @stopped: Group is stopped, protected by list_lock */
+	bool stopped;
+};
+
+/**
+ * struct xe_exec_queue - Execution queue
+ *
+ * Contains all state necessary for submissions. Can either be a user object or
+ * a kernel object.
+ */
+struct xe_exec_queue {
+	/** @xef: Back pointer to xe file if this is user created exec queue */
+	struct xe_file *xef;
+
+	/** @gt: GT structure this exec queue can submit to */
+	struct xe_gt *gt;
+	/**
+	 * @hwe: A hardware of the same class. May (physical engine) or may not
+	 * (virtual engine) be where jobs actual engine up running. Should never
+	 * really be used for submissions.
+	 */
+	struct xe_hw_engine *hwe;
+	/** @refcount: ref count of this exec queue */
+	struct kref refcount;
+	/** @vm: VM (address space) for this exec queue */
+	struct xe_vm *vm;
+	/**
+	 * @user_vm: User VM (address space) for this exec queue (bind queues
+	 * only)
+	 */
+	struct xe_vm *user_vm;
+
+	/** @class: class of this exec queue */
+	enum xe_engine_class class;
+	/**
+	 * @logical_mask: logical mask of where job submitted to exec queue can run
+	 */
+	u32 logical_mask;
+	/** @name: name of this exec queue */
+	char name[MAX_FENCE_NAME_LEN];
+	/** @width: width (number BB submitted per exec) of this exec queue */
+	u16 width;
+	/** @msix_vec: MSI-X vector (for platforms that support it) */
+	u16 msix_vec;
+	/** @fence_irq: fence IRQ used to signal job completion */
+	struct xe_hw_fence_irq *fence_irq;
+
+	/**
+	 * @last_fence: last fence on exec queue, protected by vm->lock in write
+	 * mode if bind exec queue, protected by dma resv lock if non-bind exec
+	 * queue
+	 */
+	struct dma_fence *last_fence;
+
+/* queue used for kernel submission only */
+#define EXEC_QUEUE_FLAG_KERNEL			BIT(0)
+/* kernel engine only destroyed at driver unload */
+#define EXEC_QUEUE_FLAG_PERMANENT		BIT(1)
+/* for VM jobs. Caller needs to hold rpm ref when creating queue with this flag */
+#define EXEC_QUEUE_FLAG_VM			BIT(2)
+/* child of VM queue for multi-tile VM jobs */
+#define EXEC_QUEUE_FLAG_BIND_ENGINE_CHILD	BIT(3)
+/* kernel exec_queue only, set priority to highest level */
+#define EXEC_QUEUE_FLAG_HIGH_PRIORITY		BIT(4)
+/* flag to indicate low latency hint to guc */
+#define EXEC_QUEUE_FLAG_LOW_LATENCY		BIT(5)
+/* for migration (kernel copy, clear, bind) jobs */
+#define EXEC_QUEUE_FLAG_MIGRATE			BIT(6)
+/* for programming COMMON_SLICE_CHICKEN3 on first submission */
+#define EXEC_QUEUE_FLAG_DISABLE_STATE_CACHE_PERF_FIX	BIT(7)
+
+	/**
+	 * @flags: flags for this exec queue, should statically setup aside from ban
+	 * bit
+	 */
+	unsigned long flags;
+
+	union {
+		/** @multi_gt_list: list head for VM bind engines if multi-GT */
+		struct list_head multi_gt_list;
+		/** @multi_gt_link: link for VM bind engines if multi-GT */
+		struct list_head multi_gt_link;
+	};
+
+	union {
+		/** @execlist: execlist backend specific state for exec queue */
+		struct xe_execlist_exec_queue *execlist;
+		/** @guc: GuC backend specific state for exec queue */
+		struct xe_guc_exec_queue *guc;
+	};
+
+	/** @multi_queue: Multi queue information */
+	struct {
+		/** @multi_queue.group: Queue group information */
+		struct xe_exec_queue_group *group;
+		/** @multi_queue.link: Link into group's secondary queues list */
+		struct list_head link;
+		/**
+		 * @multi_queue.priority: Queue priority within the multi-queue group.
+		 * It is protected by @multi_queue.lock.
+		 */
+		enum xe_multi_queue_priority priority;
+		/** @multi_queue.lock: Lock for protecting certain members */
+		spinlock_t lock;
+		/** @multi_queue.pos: Position of queue within the multi-queue group */
+		u8 pos;
+		/** @multi_queue.valid: Queue belongs to a multi queue group */
+		u8 valid:1;
+		/** @multi_queue.is_primary: Is primary queue (Q0) of the group */
+		u8 is_primary:1;
+	} multi_queue;
+
+	/** @sched_props: scheduling properties */
+	struct {
+		/** @sched_props.timeslice_us: timeslice period in micro-seconds */
+		u32 timeslice_us;
+		/** @sched_props.preempt_timeout_us: preemption timeout in micro-seconds */
+		u32 preempt_timeout_us;
+		/** @sched_props.job_timeout_ms: job timeout in milliseconds */
+		u32 job_timeout_ms;
+		/** @sched_props.priority: priority of this exec queue */
+		enum xe_exec_queue_priority priority;
+	} sched_props;
+
+	/** @lr: long-running exec queue state */
+	struct {
+		/** @lr.pfence: preemption fence */
+		struct dma_fence *pfence;
+		/** @lr.context: preemption fence context */
+		u64 context;
+		/** @lr.seqno: preemption fence seqno */
+		u32 seqno;
+		/** @lr.link: link into VM's list of exec queues */
+		struct list_head link;
+		/**
+		 * @lr.suspended: Tracks whether the consumer-issued suspend()
+		 * succeeded and a matching resume() is still owed. suspend() can
+		 * fail (e.g. killed/banned/wedged), leaving the queue
+		 * un-suspended, so consumers must only resume() queues that were
+		 * actually suspended. Set by the suspend caller on success and
+		 * cleared by the resume caller. A queue is only ever suspended by
+		 * a single consumer at a time (preempt-fence mode and hw engine
+		 * group fault mode are mutually exclusive), so a single flag is
+		 * sufficient.
+		 */
+		bool suspended;
+	} lr;
+
+#define XE_EXEC_QUEUE_TLB_INVAL_PRIMARY_GT	0
+#define XE_EXEC_QUEUE_TLB_INVAL_MEDIA_GT	1
+#define XE_EXEC_QUEUE_TLB_INVAL_COUNT		(XE_EXEC_QUEUE_TLB_INVAL_MEDIA_GT  + 1)
+
+	/** @tlb_inval: TLB invalidations exec queue state */
+	struct {
+		/**
+		 * @tlb_inval.dep_scheduler: The TLB invalidation
+		 * dependency scheduler
+		 */
+		struct xe_dep_scheduler *dep_scheduler;
+		/**
+		 * @tlb_inval.last_fence: last fence for tlb invalidation, protected by
+		 * vm->lock in write mode
+		 */
+		struct dma_fence *last_fence;
+	} tlb_inval[XE_EXEC_QUEUE_TLB_INVAL_COUNT];
+
+	/** @vm_exec_queue_link: Link to track exec queue within a VM's list of exec queues. */
+	struct list_head vm_exec_queue_link;
+
+	/** @pxp: PXP info tracking */
+	struct {
+		/** @pxp.type: PXP session type used by this queue */
+		u8 type;
+		/** @pxp.link: link into the list of PXP exec queues */
+		struct list_head link;
+	} pxp;
+
+	/** @ufence_syncobj: User fence syncobj */
+	struct drm_syncobj *ufence_syncobj;
+
+	/** @ufence_timeline_value: User fence timeline value */
+	u64 ufence_timeline_value;
+
+	/** @replay_state: GPU hang replay state */
+	void *replay_state;
+
+	/** @ops: submission backend exec queue operations */
+	const struct xe_exec_queue_ops *ops;
+
+	/** @ring_ops: ring operations for this exec queue */
+	const struct xe_ring_ops *ring_ops;
+	/** @entity: DRM sched entity for this exec queue (1 to 1 relationship) */
+	struct drm_sched_entity *entity;
+
+#define XE_MAX_JOB_COUNT_PER_EXEC_QUEUE	1000
+	/** @job_cnt: number of drm jobs in this exec queue */
+	atomic_t job_cnt;
+
+	/**
+	 * @tlb_flush_seqno: The seqno of the last rebind tlb flush performed
+	 * Protected by @vm's resv. Unused if @vm == NULL.
+	 */
+	u64 tlb_flush_seqno;
+	/** @hw_engine_group_link: link into exec queues in the same hw engine group */
+	struct list_head hw_engine_group_link;
+	/**
+	 * @lrc_lookup_lock: Lock for protecting lrc array access. Only used when
+	 * running in parallel to queue creation is possible.
+	 */
+	spinlock_t lrc_lookup_lock;
+	/** @lrc: logical ring context for this exec queue */
+	struct xe_lrc *lrc[] __counted_by(width);
+};
+
+/**
+ * struct xe_exec_queue_ops - Submission backend exec queue operations
+ */
+struct xe_exec_queue_ops {
+	/** @init: Initialize exec queue for submission backend */
+	int (*init)(struct xe_exec_queue *q);
+	/** @kill: Kill inflight submissions for backend */
+	void (*kill)(struct xe_exec_queue *q);
+	/** @fini: Undoes the init() for submission backend */
+	void (*fini)(struct xe_exec_queue *q);
+	/**
+	 * @destroy: Destroy exec queue for submission backend. The backend
+	 * function must call xe_exec_queue_fini() (which will in turn call the
+	 * fini() backend function) to ensure the queue is properly cleaned up.
+	 */
+	void (*destroy)(struct xe_exec_queue *q);
+	/** @set_priority: Set priority for exec queue */
+	int (*set_priority)(struct xe_exec_queue *q,
+			    enum xe_exec_queue_priority priority);
+	/** @set_timeslice: Set timeslice for exec queue */
+	int (*set_timeslice)(struct xe_exec_queue *q, u32 timeslice_us);
+	/** @set_preempt_timeout: Set preemption timeout for exec queue */
+	int (*set_preempt_timeout)(struct xe_exec_queue *q, u32 preempt_timeout_us);
+	/** @set_multi_queue_priority: Set multi queue priority */
+	int (*set_multi_queue_priority)(struct xe_exec_queue *q,
+					enum xe_multi_queue_priority priority);
+	/**
+	 * @suspend: Suspend exec queue from executing, allowed to be called
+	 * multiple times in a row before resume with the caveat that
+	 * suspend_wait returns before calling suspend again.
+	 */
+	int (*suspend)(struct xe_exec_queue *q);
+	/**
+	 * @suspend_wait: Wait for an exec queue to suspend executing, should be
+	 * call after suspend. In dma-fencing path thus must return within a
+	 * reasonable amount of time. -ETIME return shall indicate an error
+	 * waiting for suspend resulting in associated VM getting killed.
+	 * -EAGAIN return indicates the wait should be tried again, if the wait
+	 * is within a work item, the work item should be requeued as deadlock
+	 * avoidance mechanism.
+	 */
+	int (*suspend_wait)(struct xe_exec_queue *q);
+	/**
+	 * @suspend_wait_blocking: Like @suspend_wait, but waits uninterruptibly
+	 * (does not abort on the calling task's signals). For cleanup/undo paths
+	 * that must complete a suspend on behalf of a queue that may belong to a
+	 * different process than the caller: a signal to the caller must not
+	 * abandon the wait, which would leave the other process's queue
+	 * suspended forever (cross-process DoS). A timeout bans like suspend_wait.
+	 */
+	int (*suspend_wait_blocking)(struct xe_exec_queue *q);
+	/**
+	 * @resume: Resume exec queue execution, exec queue must be in a suspended
+	 * state and dma fence returned from most recent suspend call must be
+	 * signalled when this function is called.
+	 */
+	void (*resume)(struct xe_exec_queue *q);
+	/** @reset_status: check exec queue reset status */
+	bool (*reset_status)(struct xe_exec_queue *q);
+};
+
+#endif

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0
+if BCM_VIDEOCORE
+
+source "drivers/staging/vc04_services/bcm2835-audio/Kconfig"
+
+endif
+

@@ -1,0 +1,681 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * AMD Processor P-state Frequency Driver Unit Test
+ *
+ * Copyright (C) 2022 Advanced Micro Devices, Inc. All Rights Reserved.
+ *
+ * Author: Meng Li <li.meng@amd.com>
+ *
+ * The AMD P-State Unit Test is a test module for testing the amd-pstate
+ * driver. 1) It can help all users to verify their processor support
+ * (SBIOS/Firmware or Hardware). 2) Kernel can have a basic function
+ * test to avoid the kernel regression during the update. 3) We can
+ * introduce more functional or performance tests to align the result
+ * together, it will benefit power and performance scale optimization.
+ *
+ * This driver implements basic framework with plans to enhance it with
+ * additional test cases to improve the depth and coverage of the test.
+ *
+ * See Documentation/admin-guide/pm/amd-pstate.rst Unit Tests for
+ * amd-pstate to get more detail.
+ */
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+#include <linux/bitfield.h>
+#include <linux/cpufeature.h>
+#include <linux/cpufreq.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/mm.h>
+#include <linux/fs.h>
+#include <linux/cleanup.h>
+
+#include <acpi/cppc_acpi.h>
+
+#include <asm/msr.h>
+
+#include "amd-pstate.h"
+
+static char *test_list;
+module_param(test_list, charp, 0444);
+MODULE_PARM_DESC(test_list,
+	"Comma-delimited list of tests to run (empty means run all tests)");
+DEFINE_FREE(cleanup_page, void *, if (_T) free_page((unsigned long)_T))
+
+struct amd_pstate_ut_struct {
+	const char *name;
+	int (*func)(u32 index);
+};
+
+/*
+ * Kernel module for testing the AMD P-State unit test
+ */
+static int amd_pstate_ut_acpi_cpc_valid(u32 index);
+static int amd_pstate_ut_check_enabled(u32 index);
+static int amd_pstate_ut_check_perf(u32 index);
+static int amd_pstate_ut_check_freq(u32 index);
+static int amd_pstate_ut_epp(u32 index);
+static int amd_pstate_ut_check_driver(u32 index);
+static int amd_pstate_ut_check_freq_attrs(u32 index);
+static int amd_pstate_ut_check_floor_freq(u32 index);
+
+static struct amd_pstate_ut_struct amd_pstate_ut_cases[] = {
+	{"amd_pstate_ut_acpi_cpc_valid",    amd_pstate_ut_acpi_cpc_valid   },
+	{"amd_pstate_ut_check_enabled",     amd_pstate_ut_check_enabled    },
+	{"amd_pstate_ut_check_perf",        amd_pstate_ut_check_perf       },
+	{"amd_pstate_ut_check_freq",        amd_pstate_ut_check_freq       },
+	{"amd_pstate_ut_epp",               amd_pstate_ut_epp              },
+	{"amd_pstate_ut_check_driver",      amd_pstate_ut_check_driver     },
+	{"amd_pstate_ut_check_freq_attrs",  amd_pstate_ut_check_freq_attrs },
+	{"amd_pstate_ut_check_floor_freq",  amd_pstate_ut_check_floor_freq },
+};
+
+static bool test_in_list(const char *list, const char *name)
+{
+	size_t name_len = strlen(name);
+	const char *p = list;
+
+	while (*p) {
+		const char *sep = strchr(p, ',');
+		size_t token_len = sep ? sep - p : strlen(p);
+
+		if (token_len == name_len && !strncmp(p, name, token_len))
+			return true;
+		if (!sep)
+			break;
+		p = sep + 1;
+	}
+
+	return false;
+}
+
+static bool get_shared_mem(void)
+{
+	bool result = false;
+
+	if (!boot_cpu_has(X86_FEATURE_CPPC))
+		result = true;
+
+	return result;
+}
+
+/*
+ * check the _CPC object is present in SBIOS.
+ */
+static int amd_pstate_ut_acpi_cpc_valid(u32 index)
+{
+	if (!acpi_cpc_valid()) {
+		pr_err("%s the _CPC object is not present in SBIOS!\n", __func__);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
+ * check if amd pstate is enabled
+ */
+static int amd_pstate_ut_check_enabled(u32 index)
+{
+	u64 cppc_enable = 0;
+	int ret;
+
+	if (get_shared_mem())
+		return 0;
+
+	ret = rdmsrq_safe(MSR_AMD_CPPC_ENABLE, &cppc_enable);
+	if (ret) {
+		pr_err("%s rdmsrq_safe MSR_AMD_CPPC_ENABLE ret=%d error!\n", __func__, ret);
+		return ret;
+	}
+
+	if (!cppc_enable) {
+		pr_err("%s amd pstate must be enabled!\n", __func__);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
+ * check if performance values are reasonable.
+ * highest_perf >= nominal_perf > lowest_nonlinear_perf > lowest_perf > 0
+ */
+static int amd_pstate_ut_check_perf(u32 index)
+{
+	int cpu = 0, ret = 0;
+	u32 highest_perf = 0, nominal_perf = 0, lowest_nonlinear_perf = 0, lowest_perf = 0;
+	u64 cap1 = 0;
+	struct cppc_perf_caps cppc_perf;
+	union perf_cached cur_perf;
+
+	for_each_online_cpu(cpu) {
+		struct cpufreq_policy *policy __free(put_cpufreq_policy) = NULL;
+		struct amd_cpudata *cpudata;
+
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		cpudata = policy->driver_data;
+
+		if (get_shared_mem()) {
+			ret = cppc_get_perf_caps(cpu, &cppc_perf);
+			if (ret) {
+				pr_err("%s cppc_get_perf_caps ret=%d error!\n", __func__, ret);
+				return ret;
+			}
+
+			highest_perf = cppc_perf.highest_perf;
+			nominal_perf = cppc_perf.nominal_perf;
+			lowest_nonlinear_perf = cppc_perf.lowest_nonlinear_perf;
+			lowest_perf = cppc_perf.lowest_perf;
+		} else {
+			ret = rdmsrq_safe_on_cpu(cpu, MSR_AMD_CPPC_CAP1, &cap1);
+			if (ret) {
+				pr_err("%s read CPPC_CAP1 ret=%d error!\n", __func__, ret);
+				return ret;
+			}
+
+			highest_perf = FIELD_GET(AMD_CPPC_HIGHEST_PERF_MASK, cap1);
+			nominal_perf = FIELD_GET(AMD_CPPC_NOMINAL_PERF_MASK, cap1);
+			lowest_nonlinear_perf = FIELD_GET(AMD_CPPC_LOWNONLIN_PERF_MASK, cap1);
+			lowest_perf = FIELD_GET(AMD_CPPC_LOWEST_PERF_MASK, cap1);
+		}
+
+		cur_perf = READ_ONCE(cpudata->perf);
+		if (highest_perf != cur_perf.highest_perf && !cpudata->hw_prefcore) {
+			pr_err("%s cpu%d highest=%d %d highest perf doesn't match\n",
+				__func__, cpu, highest_perf, cur_perf.highest_perf);
+			return -EINVAL;
+		}
+		if (nominal_perf != cur_perf.nominal_perf ||
+		   (lowest_nonlinear_perf != cur_perf.lowest_nonlinear_perf) ||
+		   (lowest_perf != cur_perf.lowest_perf)) {
+			pr_err("%s cpu%d nominal=%d %d lowest_nonlinear=%d %d lowest=%d %d, they should be equal!\n",
+				__func__, cpu, nominal_perf, cur_perf.nominal_perf,
+				lowest_nonlinear_perf, cur_perf.lowest_nonlinear_perf,
+				lowest_perf, cur_perf.lowest_perf);
+			return -EINVAL;
+		}
+
+		if (!((highest_perf >= nominal_perf) &&
+			(nominal_perf > lowest_nonlinear_perf) &&
+			(lowest_nonlinear_perf >= lowest_perf) &&
+			(lowest_perf > 0))) {
+			pr_err("%s cpu%d highest=%d >= nominal=%d > lowest_nonlinear=%d > lowest=%d > 0, the formula is incorrect!\n",
+				__func__, cpu, highest_perf, nominal_perf,
+				lowest_nonlinear_perf, lowest_perf);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Check if frequency values are reasonable.
+ * max_freq >= nominal_freq > lowest_nonlinear_freq > min_freq > 0
+ * check max freq when set support boost mode.
+ */
+static int amd_pstate_ut_check_freq(u32 index)
+{
+	int cpu = 0;
+
+	for_each_online_cpu(cpu) {
+		struct cpufreq_policy *policy __free(put_cpufreq_policy) = NULL;
+		struct amd_cpudata *cpudata;
+
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		cpudata = policy->driver_data;
+
+		if (!((policy->cpuinfo.max_freq >= cpudata->nominal_freq) &&
+			(cpudata->nominal_freq > cpudata->lowest_nonlinear_freq) &&
+			(cpudata->lowest_nonlinear_freq >= policy->cpuinfo.min_freq) &&
+			(policy->cpuinfo.min_freq > 0))) {
+			pr_err("%s cpu%d max=%d >= nominal=%d > lowest_nonlinear=%d > min=%d > 0, the formula is incorrect!\n",
+				__func__, cpu, policy->cpuinfo.max_freq, cpudata->nominal_freq,
+				cpudata->lowest_nonlinear_freq, policy->cpuinfo.min_freq);
+			return -EINVAL;
+		}
+
+		if (cpudata->lowest_nonlinear_freq != policy->min) {
+			pr_err("%s cpu%d cpudata_lowest_nonlinear_freq=%d policy_min=%d, they should be equal!\n",
+				__func__, cpu, cpudata->lowest_nonlinear_freq, policy->min);
+			return -EINVAL;
+		}
+
+		if (cpudata->boost_supported) {
+			if ((policy->max != policy->cpuinfo.max_freq) &&
+			    (policy->max != cpudata->nominal_freq)) {
+				pr_err("%s cpu%d policy_max=%d should be equal cpu_max=%d or cpu_nominal=%d !\n",
+					__func__, cpu, policy->max, policy->cpuinfo.max_freq,
+					cpudata->nominal_freq);
+				return -EINVAL;
+			}
+		} else {
+			pr_err("%s cpu%d must support boost!\n", __func__, cpu);
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static int amd_pstate_set_mode(enum amd_pstate_mode mode)
+{
+	const char *mode_str = amd_pstate_get_mode_string(mode);
+
+	pr_debug("->setting mode to %s\n", mode_str);
+
+	return amd_pstate_update_status(mode_str, strlen(mode_str));
+}
+
+static int amd_pstate_ut_epp(u32 index)
+{
+	static const char * const epp_strings[] = {
+		"dynamic",
+		"power",
+		"balance_power",
+		"balance_performance",
+		"performance",
+	};
+	char *buf __free(cleanup_page) = NULL;
+	struct cpufreq_policy *policy = NULL;
+	unsigned long orig_dynamic_epp = 0;
+	enum amd_pstate_mode orig_mode;
+	struct amd_cpudata *cpudata;
+	unsigned long orig_policy;
+	int ret, cpu = 0;
+	u16 epp;
+	int i;
+
+	policy = cpufreq_cpu_get(cpu);
+	if (!policy)
+		return -ENODEV;
+
+	orig_mode = amd_pstate_get_status();
+	if (policy->driver_data) {
+		cpudata = policy->driver_data;
+		orig_dynamic_epp = cpudata->dynamic_epp;
+	}
+
+	/* Drop reference before potential driver change. */
+	cpufreq_cpu_put(policy);
+	policy = NULL;
+
+	buf = (char *)__get_free_page(GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = amd_pstate_set_mode(AMD_PSTATE_ACTIVE);
+	if (ret)
+		goto out;
+
+	policy = cpufreq_cpu_get(cpu);
+	if (!policy) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	down_write(&policy->rwsem);
+	cpudata = policy->driver_data;
+	orig_policy = cpudata->policy;
+	cpudata->policy = CPUFREQ_POLICY_POWERSAVE;
+
+	for (epp = 0; epp <= U8_MAX; epp++) {
+		u8 val;
+
+		/* write all EPP values */
+		memset(buf, 0, PAGE_SIZE);
+		snprintf(buf, PAGE_SIZE, "%d", epp);
+		ret = store_energy_performance_preference(policy, buf, strlen(buf));
+		if (ret < 0)
+			goto out;
+
+		/* check if the EPP value reads back correctly for raw numbers */
+		memset(buf, 0, PAGE_SIZE);
+		ret = show_energy_performance_preference(policy, buf);
+		if (ret < 0)
+			goto out;
+		strreplace(buf, '\n', '\0');
+		ret = kstrtou8(buf, 0, &val);
+		if (!ret && epp != val) {
+			pr_err("Raw EPP value mismatch: %d != %d\n", epp, val);
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(epp_strings); i++) {
+		memset(buf, 0, PAGE_SIZE);
+		snprintf(buf, PAGE_SIZE, "%s", epp_strings[i]);
+		ret = store_energy_performance_preference(policy, buf, strlen(buf));
+		if (ret < 0)
+			goto out;
+
+		memset(buf, 0, PAGE_SIZE);
+		ret = show_energy_performance_preference(policy, buf);
+		if (ret < 0)
+			goto out;
+		strreplace(buf, '\n', '\0');
+		/*
+		 * "dynamic" mode reports the EPP as "dynamic(profile:X)"
+		 * Trim at "(" and just compare tie the epp string.
+		 */
+		strreplace(buf, '(', '\0');
+
+		if (strcmp(buf, epp_strings[i])) {
+			pr_err("String EPP value mismatch: %s != %s\n", buf, epp_strings[i]);
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+
+	ret = 0;
+
+out:
+	if (policy) {
+		cpudata->policy = orig_policy;
+		/*
+		 * If the driver had enabled dynamic_epp to begin with,
+		 * restore it here before dropping policy reference.
+		 */
+		if (orig_dynamic_epp) {
+			int ret2;
+
+			ret2 = store_energy_performance_preference(policy,
+								  epp_strings[0],
+								  strlen(epp_strings[0]));
+			if (!ret && (ret2 < 0))
+				ret = ret2;
+		}
+		up_write(&policy->rwsem);
+		cpufreq_cpu_put(policy);
+	}
+
+	if (orig_mode != amd_pstate_get_status()) {
+		int ret2;
+
+		ret2 = amd_pstate_set_mode(orig_mode);
+		if (!ret && ret2)
+			ret = ret2;
+	}
+
+	return ret;
+}
+
+static int amd_pstate_ut_check_driver(u32 index)
+{
+	enum amd_pstate_mode mode1, mode2 = AMD_PSTATE_DISABLE;
+	enum amd_pstate_mode orig_mode = amd_pstate_get_status();
+	int ret;
+
+	for (mode1 = AMD_PSTATE_DISABLE; mode1 < AMD_PSTATE_MAX; mode1++) {
+		ret = amd_pstate_set_mode(mode1);
+		if (ret)
+			return ret;
+		for (mode2 = AMD_PSTATE_DISABLE; mode2 < AMD_PSTATE_MAX; mode2++) {
+			if (mode1 == mode2)
+				continue;
+			ret = amd_pstate_set_mode(mode2);
+			if (ret)
+				goto out;
+		}
+	}
+
+out:
+	if (ret)
+		pr_warn("%s: failed to update status for %s->%s: %d\n", __func__,
+			amd_pstate_get_mode_string(mode1),
+			amd_pstate_get_mode_string(mode2), ret);
+
+	amd_pstate_set_mode(orig_mode);
+	return ret;
+}
+
+enum attr_category {
+	ATTR_ALWAYS,
+	ATTR_PREFCORE,
+	ATTR_EPP,
+	ATTR_FLOOR_FREQ,
+};
+
+static const struct {
+	const char	*name;
+	enum attr_category category;
+} expected_freq_attrs[] = {
+	{"amd_pstate_max_freq",				ATTR_ALWAYS},
+	{"amd_pstate_lowest_nonlinear_freq",		ATTR_ALWAYS},
+	{"amd_pstate_highest_perf",			ATTR_ALWAYS},
+	{"amd_pstate_prefcore_ranking",			ATTR_PREFCORE},
+	{"amd_pstate_hw_prefcore",			ATTR_PREFCORE},
+	{"energy_performance_preference",		ATTR_EPP},
+	{"energy_performance_available_preferences",	ATTR_EPP},
+	{"amd_pstate_floor_freq",			ATTR_FLOOR_FREQ},
+	{"amd_pstate_floor_count",			ATTR_FLOOR_FREQ},
+};
+
+static bool attr_in_driver(struct freq_attr **driver_attrs, const char *name)
+{
+	int j;
+
+	for (j = 0; driver_attrs[j]; j++) {
+		if (!strcmp(driver_attrs[j]->attr.name, name))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Verify that for each mode the driver's live ->attr array contains exactly
+ * the attributes that should be visible.  Expected visibility is derived
+ * independently from hw_prefcore, cpu features, and the current mode —
+ * not from the driver's own visibility functions.
+ */
+static int amd_pstate_ut_check_freq_attrs(u32 index)
+{
+	enum amd_pstate_mode orig_mode = amd_pstate_get_status();
+	static const enum amd_pstate_mode modes[] = {
+		AMD_PSTATE_PASSIVE, AMD_PSTATE_ACTIVE, AMD_PSTATE_GUIDED,
+	};
+	bool has_prefcore, has_floor_freq;
+	int m, i, ret;
+
+	has_floor_freq = cpu_feature_enabled(X86_FEATURE_CPPC_PERF_PRIO);
+
+	/*
+	 * Determine prefcore support from any online CPU's cpudata.
+	 * hw_prefcore reflects the platform-wide decision made at init.
+	 */
+	has_prefcore = false;
+	for_each_online_cpu(i) {
+		struct cpufreq_policy *policy __free(put_cpufreq_policy) = NULL;
+		struct amd_cpudata *cpudata;
+
+		policy = cpufreq_cpu_get(i);
+		if (!policy)
+			continue;
+		cpudata = policy->driver_data;
+		has_prefcore = cpudata->hw_prefcore;
+		break;
+	}
+
+	for (m = 0; m < ARRAY_SIZE(modes); m++) {
+		struct freq_attr **driver_attrs;
+
+		ret = amd_pstate_set_mode(modes[m]);
+		if (ret)
+			goto out;
+
+		driver_attrs = amd_pstate_get_current_attrs();
+		if (!driver_attrs) {
+			pr_err("%s: no driver attrs in mode %s\n",
+			       __func__, amd_pstate_get_mode_string(modes[m]));
+			ret = -EINVAL;
+			goto out;
+		}
+
+		for (i = 0; i < ARRAY_SIZE(expected_freq_attrs); i++) {
+			bool expected, found;
+
+			switch (expected_freq_attrs[i].category) {
+			case ATTR_ALWAYS:
+				expected = true;
+				break;
+			case ATTR_PREFCORE:
+				expected = has_prefcore;
+				break;
+			case ATTR_EPP:
+				expected = (modes[m] == AMD_PSTATE_ACTIVE);
+				break;
+			case ATTR_FLOOR_FREQ:
+				expected = has_floor_freq;
+				break;
+			default:
+				expected = false;
+				break;
+			}
+
+			found = attr_in_driver(driver_attrs,
+					       expected_freq_attrs[i].name);
+
+			if (expected != found) {
+				pr_err("%s: mode %s: attr %s expected %s but is %s\n",
+				       __func__,
+				       amd_pstate_get_mode_string(modes[m]),
+				       expected_freq_attrs[i].name,
+				       expected ? "visible" : "hidden",
+				       found ? "visible" : "hidden");
+				ret = -EINVAL;
+				goto out;
+			}
+		}
+	}
+
+	ret = 0;
+out:
+	amd_pstate_set_mode(orig_mode);
+	return ret;
+}
+
+static int amd_pstate_ut_check_floor_freq(u32 index)
+{
+	struct cpufreq_policy *policy __free(put_cpufreq_policy) = NULL;
+	char *buf __free(cleanup_page) = NULL;
+	unsigned int orig_floor_freq;
+	unsigned int floor_freq;
+	int ret, cpu = 0;
+
+	if (!cpu_feature_enabled(X86_FEATURE_CPPC_PERF_PRIO))
+		return -EOPNOTSUPP;
+
+	policy = cpufreq_cpu_get(cpu);
+	if (!policy)
+		return -ENODEV;
+
+	buf = (char *)__get_free_page(GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	guard(rwsem_write)(&policy->rwsem);
+
+	if (!policy->driver_data)
+		return -ENODEV;
+
+	/* Retrieve original floor frequency */
+	memset(buf, 0, PAGE_SIZE);
+	ret = show_amd_pstate_floor_freq(policy, buf);
+	if (ret < 0)
+		return ret;
+
+	ret = kstrtou32(buf, 0, &orig_floor_freq);
+	if (ret)
+		return ret;
+
+	memset(buf, 0, PAGE_SIZE);
+	snprintf(buf, PAGE_SIZE, "%u", policy->cpuinfo.min_freq);
+
+	/* Set floor frequency to cpuinfo.min_freq */
+	ret = store_amd_pstate_floor_freq(policy, buf, strlen(buf));
+	if (ret < 0) {
+		pr_err("Failed to set floor frequency to %s\n", buf);
+		return ret;
+	}
+
+	memset(buf, 0, PAGE_SIZE);
+	ret = show_amd_pstate_floor_freq(policy, buf);
+	if (ret < 0)
+		return ret;
+
+	strreplace(buf, '\n', '\0');
+	ret = kstrtou32(buf, 0, &floor_freq);
+	if (ret)
+		return ret;
+
+	/* Confirm sysfs reflects the change correctly. */
+	if (floor_freq != policy->cpuinfo.min_freq) {
+		pr_err("Floor frequency value mismatch: %u != %u\n",
+		       floor_freq, policy->cpuinfo.min_freq);
+		return -EINVAL;
+	}
+
+	memset(buf, 0, PAGE_SIZE);
+	snprintf(buf, PAGE_SIZE, "%u", orig_floor_freq);
+
+	/* Restore the original value. */
+	ret = store_amd_pstate_floor_freq(policy, buf, strlen(buf));
+	if (ret < 0) {
+		pr_err("Failed to restore floor frequency to %s\n", buf);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int __init amd_pstate_ut_init(void)
+{
+	u32 i = 0, arr_size = ARRAY_SIZE(amd_pstate_ut_cases);
+	enum amd_pstate_mode mode = amd_pstate_get_status();
+
+	/* don't test if no running amd-pstate driver */
+	if (mode == AMD_PSTATE_UNDEFINED || mode == AMD_PSTATE_DISABLE)
+		return -EOPNOTSUPP;
+
+	for (i = 0; i < arr_size; i++) {
+		int ret;
+
+		if (test_list && *test_list &&
+		    !test_in_list(test_list, amd_pstate_ut_cases[i].name))
+			continue;
+
+		ret = amd_pstate_ut_cases[i].func(i);
+
+		if (ret) {
+			/* Platform does not support the feature being tested. */
+			if (ret == -EOPNOTSUPP) {
+				pr_err("%-4d %-20s\t skipped!\n", i+1, amd_pstate_ut_cases[i].name);
+				continue;
+			}
+			pr_err("%-4d %-20s\t fail: %d!\n", i+1, amd_pstate_ut_cases[i].name, ret);
+		} else {
+			pr_info("%-4d %-20s\t success!\n", i+1, amd_pstate_ut_cases[i].name);
+		}
+	}
+
+	return 0;
+}
+
+static void __exit amd_pstate_ut_exit(void)
+{
+}
+
+module_init(amd_pstate_ut_init);
+module_exit(amd_pstate_ut_exit);
+
+MODULE_AUTHOR("Meng Li <li.meng@amd.com>");
+MODULE_DESCRIPTION("AMD P-state driver Test module");
+MODULE_LICENSE("GPL");

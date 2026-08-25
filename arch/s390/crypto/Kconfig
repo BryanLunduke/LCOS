@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0
+
+menu "Accelerated Cryptographic Algorithms for CPU (s390)"
+
+config CRYPTO_AES_S390
+	tristate "Ciphers: AES, modes: ECB, CBC, CTR, XTS, GCM"
+	select CRYPTO_AEAD
+	select CRYPTO_SKCIPHER
+	help
+	  AEAD cipher: AES with GCM
+	  Length-preserving ciphers: AES with ECB, CBC, XTS, and CTR modes
+
+	  Architecture: s390
+
+	  As of z9 the ECB and CBC modes are hardware accelerated
+	  for 128 bit keys.
+
+	  As of z10 the ECB and CBC modes are hardware accelerated
+	  for all AES key sizes.
+
+	  As of z196 the CTR mode is hardware accelerated for all AES
+	  key sizes and XTS mode is hardware accelerated for 256 and
+	  512 bit keys.
+
+config CRYPTO_HMAC_S390
+	tristate "Keyed-hash message authentication code: HMAC"
+	select CRYPTO_HASH
+	help
+	  s390 specific HMAC hardware support for SHA224, SHA256, SHA384 and
+	  SHA512.
+
+	  Architecture: s390
+
+endmenu

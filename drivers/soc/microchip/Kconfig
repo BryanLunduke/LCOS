@@ -1,0 +1,34 @@
+config POLARFIRE_SOC_IRQ_MUX
+	bool "Microchip PolarFire SoC's GPIO IRQ Mux"
+	depends on ARCH_MICROCHIP
+	select REGMAP
+	select REGMAP_MMIO
+	default y
+	help
+	  Support for the interrupt mux on Polarfire SoC. It sits between
+	  the GPIO controllers and the PLIC, as only 41 interrupts are shared
+	  between 3 GPIO controllers with a total of 70 interrupts.
+
+config POLARFIRE_SOC_SYS_CTRL
+	tristate "Microchip PolarFire SoC (MPFS) system controller support"
+	depends on POLARFIRE_SOC_MAILBOX
+	depends on MTD
+	help
+	  This driver adds support for the PolarFire SoC (MPFS) system controller.
+
+	  To compile this driver as a module, choose M here. the
+	  module will be called mpfs_system_controller.
+
+	  If unsure, say N.
+
+config POLARFIRE_SOC_SYSCONS
+	bool "PolarFire SoC (MPFS) syscon drivers"
+	default y
+	depends on ARCH_MICROCHIP
+	select MFD_CORE
+	help
+	  These drivers add support for the syscons on PolarFire SoC (MPFS).
+	  Without these drivers core parts of the kernel such as clocks
+	  and resets will not function correctly.
+
+	  If unsure, and on a PolarFire SoC, say y.

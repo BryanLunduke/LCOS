@@ -1,0 +1,152 @@
+#
+# Copyright (c) 2014, 2025, Oracle and/or its affiliates. All rights reserved.
+# DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+#
+# This code is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License version 2 only, as
+# published by the Free Software Foundation.  Oracle designates this
+# particular file as subject to the "Classpath" exception as provided
+# by Oracle in the LICENSE file that accompanied this code.
+#
+# This code is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+# version 2 for more details (a copy is included in the LICENSE file that
+# accompanied this code).
+#
+# You should have received a copy of the GNU General Public License version
+# 2 along with this work; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+# or visit www.oracle.com if you need additional information or have any
+# questions.
+#
+
+include MakeFileStart.gmk
+
+################################################################################
+
+include Modules.gmk
+include ZipArchive.gmk
+
+SRC_ZIP_WORK_DIR := $(SUPPORT_OUTPUTDIR)/src
+$(if $(filter $(TOPDIR)/%, $(SUPPORT_OUTPUTDIR)), $(eval SRC_ZIP_BASE := $(TOPDIR)), $(eval SRC_ZIP_BASE := $(SUPPORT_OUTPUTDIR)))
+
+################################################################################
+# Create the directory structure for src.zip using symlinks.
+#   <module>/<package>/<file>.java
+# or:
+#   <module>/META-INF/preview/<package>/<file>.java
+# for preview enabled sources.
+#
+# Generate the src dirs in the first make invocation and then call this makefile
+# again to create src.zip.
+
+ALL_MODULES := $(FindAllModules)
+
+# Module source directories ($d) are things like (but not limited to):
+# - $TOPDIR/src/<module>/share/classes
+# - $SUPPORT_OUTPUTDIR/gensrc/<module>
+#
+# A symbolic link is created for each directory. For example:
+# - $TOPDIR/src/<module>/share/classes
+# is linked from:
+# - $SRC_ZIP_WORK_DIR/src/<module>/share/classes/<module>
+#
+# Each link has the form:
+# - $SRC_ZIP_WORK_DIR/<link-dir>/<module>
+# and always has the name of its module (even if the module already appears in <link-dir>.
+#
+# Then the contents of all link parent directories are given as ZIP includes:
+# - $SRC_ZIP_WORK_DIR/<link-dir>
+# results in ZIP file entries starting:
+# - <module>/...
+# where multiple source links/directories can contribute to the same module's sources.
+#
+$(foreach m, $(ALL_MODULES), \
+  $(foreach d, $(call FindModuleSrcDirs, $m), \
+    $(eval $d_TARGET := $(SRC_ZIP_WORK_DIR)/$(patsubst $(TOPDIR)/%,%,$(patsubst $(SUPPORT_OUTPUTDIR)/%,%,$d))/$m) \
+    $(if $(SRC_GENERATED), , \
+      $(eval $$($d_TARGET): $d ; \
+          $$(if $(filter $(SRC_ZIP_BASE)/%, $d), $$(link-file-relative), $$(link-file-absolute)) \
+      ) \
+    ) \
+    $(eval SRC_ZIP_SRCS += $$($d_TARGET)) \
+    $(eval SRC_ZIP_SRCS_$m += $$($d_TARGET)) \
+  ) \
+)
+
+# Preview source directories are currently limited to:
+# - $SUPPORT_OUTPUTDIR/gensrc-valueclasses/<module>
+# If this is changed, the 'patsubst' rewriting will need updating.
+#
+# The difficulty with this case is that we need to have a directory of the form:
+# - $SRC_ZIP_WORK_DIR/<link-dir>/<module>
+# containing (either directly or via symbolic linking) a `META-INF/preview`
+# subdirectory which then contains the sources.
+#
+# The easiest way to achieve this is to symbolically link:
+# - $SRC_ZIP_WORK_DIR/<link-dir>/<module>/META-INF/preview
+# and then use the parent directory:
+# - $SRC_ZIP_WORK_DIR/<link-dir>/<module>
+# as the actual target for the ZIP file generation. However, this requires
+# an extra rule to associate the symbolic link and the parent directory.
+#
+$(foreach m, $(ALL_MODULES), \
+  $(foreach d, $(call FindModulePreviewSrcDirs, $m), \
+    $(eval $d_TARGET := $(SRC_ZIP_WORK_DIR)/$(patsubst $(SUPPORT_OUTPUTDIR)/%,%,$d)/$m) \
+    $(if $(SRC_GENERATED), , \
+      $(eval $$($d_TARGET)/META-INF/preview: $d ; \
+          $$(if $(filter $(SRC_ZIP_BASE)/%, $d), $$(link-file-relative), $$(link-file-absolute)) \
+      ) \
+      $(eval $$($d_TARGET): $$($d_TARGET)/META-INF/preview) \
+    ) \
+    $(eval SRC_ZIP_SRCS += $$($d_TARGET)) \
+    $(eval SRC_ZIP_SRCS_$m += $$($d_TARGET)) \
+  ) \
+)
+
+TARGETS += $(SRC_ZIP_SRCS)
+
+################################################################################
+# Only evaluate the creation of src.zip in a sub make call when the symlinked
+# src directory structure has been generated.
+ifeq ($(SRC_GENERATED), true)
+
+  # Rewrite the EXCLUDE_TRANSLATIONS locales as exclude patters for java files
+  TRANSLATIONS_PATTERN := $(addprefix %_, $(addsuffix .java, $(EXCLUDE_TRANSLATIONS)))
+
+  # Add excludes for translations for all modules except jdk.localedata
+  $(foreach s, $(SRC_ZIP_SRCS), \
+    $(if $(filter $(notdir $s), jdk.localedata), , \
+      $(eval BUILD_SRC_ZIP_EXCLUDE_PATTERNS_$(dir $s) := $$(TRANSLATIONS_PATTERN)) \
+    ) \
+  )
+
+  $(eval $(call SetupZipArchive, BUILD_SRC_ZIP, \
+      SRC := $(dir $(SRC_ZIP_SRCS)), \
+      INCLUDES := $(SRC_ZIP_INCLUDES), \
+      INCLUDE_FILES := $(SRC_ZIP_INCLUDE_FILES), \
+      EXCLUDES := $(SRC_ZIP_EXCLUDES), \
+      EXCLUDE_FILES := $(SRC_ZIP_EXCLUDE_FILES), \
+      SUFFIXES := .java, \
+      ZIP := $(SUPPORT_OUTPUTDIR)/src.zip, \
+      FOLLOW_SYMLINKS := true, \
+  ))
+
+  do-zip: $(BUILD_SRC_ZIP)
+
+  .PHONY: do-zip
+endif
+
+zip: $(SRC_ZIP_SRCS)
+	+$(MAKE) $(MAKE_ARGS) -f ZipSource.gmk do-zip SRC_GENERATED=true
+
+TARGETS += zip
+
+.PHONY: zip
+
+################################################################################
+
+include MakeFileEnd.gmk

@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+//
+// Device Tree file for LX2160 REV2
+//
+// Copyright 2025 NXP
+
+/dts-v1/;
+
+#include "fsl-lx216x.dtsi"
+#include "fsl-lx216xa-pcie-gen3.dtsi"
+#include "fsl-lx2160a-serdes.dtsi"

@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mtd/raw-nand-chip.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Raw NAND Chip Common Properties
+
+maintainers:
+  - Miquel Raynal <miquel.raynal@bootlin.com>
+
+allOf:
+  - $ref: nand-chip.yaml#
+  - $ref: raw-nand-property.yaml#
+
+description: |
+  The ECC strength and ECC step size properties define the user
+  desires in terms of correction capability of a controller. Together,
+  they request the ECC engine to correct {strength} bit errors per
+  {size} bytes for a particular raw NAND chip.
+
+  The interpretation of these parameters is implementation-defined, so
+  not all implementations must support all possible
+  combinations. However, implementations are encouraged to further
+  specify the value(s) they support.
+
+properties:
+  $nodename:
+    pattern: "^nand@[a-f0-9]$"
+
+  reg:
+    description:
+      Contains the chip-select IDs.
+
+required:
+  - reg
+
+# This is a generic file other binding inherit from and extend
+additionalProperties: true

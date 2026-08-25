@@ -1,0 +1,155 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Copyright 2019 Advanced Micro Devices, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Authors: AMD
+ *
+ */
+
+#ifndef AMDGPU_DM_AMDGPU_DM_HDCP_H_
+#define AMDGPU_DM_AMDGPU_DM_HDCP_H_
+
+#include "mod_hdcp.h"
+#include "hdcp.h"
+#include "dc.h"
+#include "dm_cp_psp.h"
+
+/*
+ * Minimal declarations needed by this header.
+ * Full amdgpu/DM definitions come from amdgpu_dm.h included by each .c file.
+ */
+#define AMDGPU_DM_MAX_DISPLAY_COUNT 32
+struct amdgpu_dm_connector;
+
+struct mod_hdcp;
+struct mod_hdcp_link;
+struct mod_hdcp_display;
+struct cp_psp;
+struct amdgpu_device;
+struct psp_context;
+struct file;
+struct kobject;
+struct bin_attribute;
+struct mod_hdcp_atomic_op_i2c;
+struct mod_hdcp_atomic_op_aux;
+
+struct hdcp_workqueue {
+	struct work_struct cpirq_work;
+	struct work_struct property_update_work;
+	struct delayed_work callback_dwork;
+	struct delayed_work watchdog_timer_dwork;
+	struct delayed_work property_validate_dwork;
+	struct amdgpu_dm_connector *aconnector[AMDGPU_DM_MAX_DISPLAY_COUNT];
+	struct mutex mutex;
+
+	struct mod_hdcp hdcp;
+	struct mod_hdcp_output output;
+	struct mod_hdcp_display display;
+	struct mod_hdcp_link link;
+
+	enum mod_hdcp_encryption_status encryption_status[AMDGPU_DM_MAX_DISPLAY_COUNT];
+	/* when display is unplugged from mst hub, connctor will be
+	 * destroyed within dm_dp_mst_connector_destroy. connector
+	 * hdcp perperties, like type, undesired, desired, enabled,
+	 * will be lost. So, save hdcp properties into hdcp_work within
+	 * amdgpu_dm_atomic_commit_tail. if the same display is
+	 * plugged back with same display index, its hdcp properties
+	 * will be retrieved from hdcp_work within dm_dp_mst_get_modes
+	 */
+	/* un-desired, desired, enabled */
+	unsigned int content_protection[AMDGPU_DM_MAX_DISPLAY_COUNT];
+	/* hdcp1.x, hdcp2.x */
+	unsigned int hdcp_content_type[AMDGPU_DM_MAX_DISPLAY_COUNT];
+
+	uint8_t max_link;
+
+	uint8_t *srm;
+	uint8_t *srm_temp;
+	uint32_t srm_version;
+	uint32_t srm_size;
+	struct bin_attribute attr;
+};
+
+void hdcp_update_display(struct hdcp_workqueue *hdcp_work,
+			 unsigned int link_index,
+			 struct amdgpu_dm_connector *aconnector,
+			 uint8_t content_type,
+			 bool enable_encryption);
+
+void hdcp_reset_display(struct hdcp_workqueue *work, unsigned int link_index);
+void hdcp_handle_cpirq(struct hdcp_workqueue *work, unsigned int link_index);
+void hdcp_destroy(struct kobject *kobj, struct hdcp_workqueue *work);
+
+struct hdcp_workqueue *hdcp_create_workqueue(struct amdgpu_device *adev, struct cp_psp *cp_psp, struct dc *dc);
+
+#if IS_ENABLED(CONFIG_DRM_AMD_DC_KUNIT_TEST)
+void process_output(struct hdcp_workqueue *hdcp_work);
+bool hdcp_get_content_protection_from_status(
+	unsigned int hdcp_content_type,
+	enum mod_hdcp_encryption_status encryption_status,
+	unsigned int *content_protection);
+void hdcp_get_link_display_adjustments(
+	bool enable_encryption,
+	u8 content_type,
+	bool fused_io_supported,
+	bool hdcp_lc_force_fw_enable,
+	bool hdcp_lc_enable_sw_fallback,
+	struct mod_hdcp_link_adjustment *link_adjust,
+	struct mod_hdcp_display_adjustment *display_adjust);
+void hdcp_update_display_encryption_control(struct hdcp_workqueue *hdcp_work,
+					    struct hdcp_workqueue *hdcp_w,
+					    unsigned int conn_index,
+					    bool enable_encryption);
+void event_property_update(struct work_struct *work);
+void event_property_validate(struct work_struct *work);
+void event_callback(struct work_struct *work);
+void event_watchdog_timer(struct work_struct *work);
+void event_cpirq(struct work_struct *work);
+void link_lock(struct hdcp_workqueue *work, bool lock);
+void hdcp_remove_display(struct hdcp_workqueue *hdcp_work, unsigned int link_index,
+			 struct amdgpu_dm_connector *aconnector);
+uint8_t *psp_get_srm(struct psp_context *psp, uint32_t *srm_version, uint32_t *srm_size);
+int psp_set_srm(struct psp_context *psp, u8 *srm, uint32_t srm_size, uint32_t *srm_version);
+bool enable_assr(void *handle, struct dc_link *link);
+void update_config(void *handle, struct cp_psp_stream_config *config);
+ssize_t srm_data_write(struct file *filp, struct kobject *kobj,
+		       const struct bin_attribute *bin_attr, char *buffer,
+		       loff_t pos, size_t count);
+ssize_t srm_data_read(struct file *filp, struct kobject *kobj,
+		      const struct bin_attribute *bin_attr, char *buffer,
+		      loff_t pos, size_t count);
+bool lp_write_i2c(void *handle, uint32_t address, const uint8_t *data, uint32_t size);
+bool lp_read_i2c(void *handle, uint32_t address, uint8_t offset, uint8_t *data, uint32_t size);
+bool lp_write_dpcd(void *handle, uint32_t address, const uint8_t *data, uint32_t size);
+bool lp_read_dpcd(void *handle, uint32_t address, uint8_t *data, uint32_t size);
+bool lp_atomic_write_poll_read_i2c(void *handle,
+				   const struct mod_hdcp_atomic_op_i2c *write,
+				   const struct mod_hdcp_atomic_op_i2c *poll,
+				   struct mod_hdcp_atomic_op_i2c *read,
+				   uint32_t poll_timeout_us, uint8_t poll_mask_msb);
+bool lp_atomic_write_poll_read_aux(void *handle,
+				   const struct mod_hdcp_atomic_op_aux *write,
+				   const struct mod_hdcp_atomic_op_aux *poll,
+				   struct mod_hdcp_atomic_op_aux *read,
+				   uint32_t poll_timeout_us, uint8_t poll_mask_msb);
+#endif
+
+#endif /* AMDGPU_DM_AMDGPU_DM_HDCP_H_ */

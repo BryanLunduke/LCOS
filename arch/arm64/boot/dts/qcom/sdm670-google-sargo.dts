@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device tree for Google Pixel 3a (non-XL).
+ *
+ * Copyright (c) Richard Acayan. All rights reserved.
+ */
+
+/dts-v1/;
+
+#include "sdm670-google-common.dtsi"
+
+/ {
+	model = "Google Pixel 3a";
+	compatible = "google,sargo", "qcom,sdm670";
+};
+
+&battery {
+	charge-full-design-microamp-hours = <3000000>;
+};
+
+&framebuffer {
+	height = <2220>;
+};
+
+&panel {
+	compatible = "samsung,s6e3fa7-ams559nk06";
+};
+
+&rmi4_f12 {
+	touchscreen-x-mm = <62>;
+	touchscreen-y-mm = <127>;
+};

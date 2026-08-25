@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Gain Amplifiers, etc.
+#
+# When adding new entries keep the list in alphabetical order
+
+menu "Amplifiers"
+
+config AD8366
+	tristate "Analog Devices AD8366 and similar Gain Amplifiers"
+	depends on SPI
+	depends on GPIOLIB
+	select BITREVERSE
+	help
+	  Say yes here to build support for Analog Devices AD8366 and similar
+	  gain amplifiers. This driver supports the following gain amplifiers
+	  from Analog Devices:
+	    AD8366 Dual-Digital Variable Gain Amplifier (VGA)
+	    ADA4961 BiCMOS RF Digital Gain Amplifier (DGA)
+	    ADL5240 Digitally controlled variable gain amplifier (VGA)
+	    ADRF5702: 0.125 dB LSB, 8-Bit, Silicon Digital Attenuator
+	    ADRF5703: 0.25 dB LSB, 7-Bit, Silicon Digital Attenuator
+	    ADRF5720: 0.5 dB LSB, 6-Bit, Silicon Digital Attenuator
+	    ADRF5730: 0.5 dB LSB, 6-Bit, Silicon Digital Attenuator
+	    ADRF5731: 2 dB LSB, 4-Bit, Silicon Digital Attenuator
+	    HMC271A: 1dB LSB 5-Bit Digital Attenuator SMT
+	    HMC792A 0.25 dB LSB GaAs MMIC 6-Bit Digital Attenuator
+	    HMC1018A: 1.0 dB LSB GaAs MMIC 5-BIT Digital Attenuator
+	    HMC1019A: 0.5 dB LSB GaAs MMIC 5-BIT Digital Attenuator
+	    HMC1119 0.25 dB LSB, 7-Bit, Silicon Digital Attenuator
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called ad8366.
+
+config ADA4250
+	tristate "Analog Devices ADA4250 Instrumentation Amplifier"
+	depends on SPI
+	select REGMAP_SPI
+	help
+	  Say yes here to build support for Analog Devices ADA4250
+	  SPI Amplifier's support. The driver provides direct access via
+	  sysfs.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called ada4250.
+
+config ADL8113
+	tristate "Analog Devices ADL8113 Low Noise Amplifier"
+	depends on GPIOLIB
+	help
+	  Say yes here to build support for Analog Devices ADL8113 Low Noise
+	  Amplifier with integrated bypass switches. The device supports four
+	  operation modes controlled by GPIO pins: internal amplifier,
+	  internal bypass, and two external bypass modes.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called adl8113.
+
+config HMC425
+	tristate "Analog Devices HMC425A and similar GPIO Gain Amplifiers"
+	depends on GPIOLIB
+	help
+	  Say yes here to build support for Analog Devices HMC425A and similar
+	  gain amplifiers or step attenuators.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called hmc425a.
+
+endmenu

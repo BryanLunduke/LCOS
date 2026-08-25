@@ -1,0 +1,43 @@
+   Bindings for specific devices:
+
+      i) Xilinx ML300 Framebuffer
+
+      Simple framebuffer device from the ML300 reference design (also on the
+      ML403 reference design as well as others).
+
+      Optional properties:
+       - resolution = <xres yres> : pixel resolution of framebuffer.  Some
+                                    implementations use a different resolution.
+                                    Default is <d#640 d#480>
+       - virt-resolution = <xvirt yvirt> : Size of framebuffer in memory.
+                                           Default is <d#1024 d#480>.
+       - rotate-display (empty) : rotate display 180 degrees.
+
+      v) Xilinx hwicap
+
+		Xilinx hwicap devices provide access to the configuration logic
+		of the FPGA through the Internal Configuration Access Port
+		(ICAP).  The ICAP enables partial reconfiguration of the FPGA,
+		readback of the configuration information, and some control over
+		'warm boots' of the FPGA fabric.
+
+		Required properties:
+		- xlnx,family : The family of the FPGA, necessary since the
+                      capabilities of the underlying ICAP hardware
+                      differ between different families.  May be
+                      'virtex2p', 'virtex4', or 'virtex5'.
+		- compatible : should contain "xlnx,xps-hwicap-1.00.a" or
+				"xlnx,opb-hwicap-1.00.b".
+
+      vii) Xilinx USB Host controller
+
+      The Xilinx USB host controller is EHCI compatible but with a different
+      base address for the EHCI registers, and it is always a big-endian
+      USB Host controller. The hardware can be configured as high speed only,
+      or high speed/full speed hybrid.
+
+      Required properties:
+      - xlnx,support-usb-fs: A value 0 means the core is built as high speed
+                             only. A value 1 means the core also supports
+                             full speed devices.
+

@@ -1,0 +1,115 @@
+config USB_CDNS_SUPPORT
+	tristate "Cadence USB Support"
+	depends on USB_SUPPORT && HAS_DMA
+	depends on USB || USB_GADGET
+	depends on USB if !USB_GADGET
+	depends on USB_GADGET if !USB
+	select USB_XHCI_PLATFORM if USB_XHCI_HCD
+	select USB_ROLE_SWITCH
+	help
+	  Say Y here if your system has a Cadence USBSS or USBSSP
+	  dual-role controller.
+	  It supports: dual-role switch, Host-only, and Peripheral-only.
+
+if USB_CDNS_SUPPORT
+
+config USB_CDNS3
+	tristate "Cadence USB dual-role controller (USBSS and USBSSP)"
+	depends on USB_CDNS_SUPPORT
+	help
+	  Say Y or M here if your system has an on-chip Cadence USB
+	  dual-role controller. This covers both USBSS (USB 3.0) and
+	  USBSSP (SuperSpeed Plus) IP; the driver detects the variant at
+	  runtime.
+
+	  The core driver (core, DRD, generic platform binding for the
+	  "cdns,usb3" device tree compatible, optional host and gadget)
+	  builds as one module named cdns.ko when built as a loadable
+	  module.
+
+	  It supports: dual-role switch, Host-only, and Peripheral-only.
+
+if USB_CDNS3
+
+config USB_CDNS3_HOST
+	bool "Cadence USB host controller (xHCI)"
+	depends on USB=y || USB=USB_CDNS3
+	help
+	  Say Y here to enable host controller functionality for Cadence
+	  USBSS and USBSSP dual-role controllers.
+
+	  The host controller is xHCI compliant and uses the standard
+	  xHCI driver.
+
+config USB_CDNS3_GADGET
+	bool "Cadence USB device controller (USBSS and USBSSP)"
+	depends on USB_GADGET=y || USB_GADGET=USB_CDNS3
+	help
+	  Say Y here to include Cadence USB device (gadget) support for
+	  both USBSS (USB 3.0) and USBSSP (SuperSpeed Plus) IP in the
+	  cdns.ko module. The implementation is selected at runtime from
+	  the detected controller version.
+
+	  USBSS gadget supports FF, HS and SS mode (not LS or SSP).
+	  USBSSP gadget supports FF, HS, SS and SSP mode (not LS).
+
+comment "Platform glue driver support"
+
+config USB_CDNS3_PCI_WRAP
+	tristate "Cadence USB3 support on PCIe-based platforms"
+	depends on USB_PCI && ACPI
+	default USB_CDNS3
+	help
+	  If you're using the USBSS Core IP with a PCIe, please say
+	  'Y' or 'M' here.
+
+	  If you choose to build this driver as module it will
+	  be dynamically linked and module will be called cdns3-pci.ko
+
+config USB_CDNSP_PCI
+	tristate "Cadence USBSSP support on PCIe-based platforms"
+	depends on USB_PCI && ACPI
+	default USB_CDNS3
+	help
+	  If you're using the USBSSP Core IP with a PCIe, please say
+	  'Y' or 'M' here.
+
+	  If you choose to build this driver as module it will
+	  be dynamically linked and module will be called cdnsp-pci.ko
+
+config USB_CDNS3_TI
+	tristate "Cadence USB3 support on TI platforms"
+	depends on ARCH_K3 || COMPILE_TEST
+	default USB_CDNS3
+	help
+	  Say 'Y' or 'M' here if you are building for Texas Instruments
+	  platforms that contain Cadence USB3 controller core.
+
+	  e.g. J721e.
+
+config USB_CDNS3_IMX
+	tristate "Cadence USB3 support on NXP i.MX platforms"
+	depends on ARCH_MXC || COMPILE_TEST
+	default USB_CDNS3
+	help
+	  Say 'Y' or 'M' here if you are building for NXP i.MX
+	  platforms that contain Cadence USB3 controller core.
+
+	  For example, imx8qm and imx8qxp.
+
+config USB_CDNS3_STARFIVE
+	tristate "Cadence USB3 support on StarFive SoC platforms"
+	depends on ARCH_STARFIVE || COMPILE_TEST
+	default USB_CDNS3
+	help
+	  Say 'Y' or 'M' here if you are building for StarFive SoCs
+	  platforms that contain Cadence USB3 controller core.
+
+	  e.g. JH7110.
+
+	  If you choose to build this driver as module it will
+	  be dynamically linked and module will be called cdns3-starfive.ko
+
+endif # USB_CDNS3
+
+endif # USB_CDNS_SUPPORT

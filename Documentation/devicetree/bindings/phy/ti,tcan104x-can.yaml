@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/ti,tcan104x-can.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: TCAN104x CAN TRANSCEIVER PHY
+
+maintainers:
+  - Aswath Govindraju <a-govindraju@ti.com>
+
+properties:
+  $nodename:
+    pattern: "^can-phy"
+
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - microchip,ata6561
+              - ti,tcan1051
+          - const: ti,tcan1042
+      - items:
+          - const: ti,tcan1046
+          - const: nxp,tja1048
+      - enum:
+          - ti,tcan1042
+          - ti,tcan1043
+          - nxp,tja1048
+          - nxp,tja1051
+          - nxp,tja1057
+          - nxp,tjr1443
+
+  '#phy-cells':
+    enum: [0, 1]
+
+  silent-gpios:
+    description:
+      gpio node to toggle silent signal on transceiver
+    maxItems: 1
+
+  standby-gpios:
+    description:
+      gpio node to toggle standby signal on transceiver. For two Items, item 1
+      is for stbn1, item 2 is for stbn2.
+    minItems: 1
+    maxItems: 2
+
+  enable-gpios:
+    description:
+      gpio node to toggle enable signal on transceiver
+    maxItems: 1
+
+  max-bitrate:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      max bit rate supported in bps
+    minimum: 1
+
+  mux-states:
+    description:
+      mux controller node to route the signals from controller to
+      transceiver.
+    maxItems: 1
+
+required:
+  - compatible
+  - '#phy-cells'
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          enum:
+            - nxp,tjr1443
+            - ti,tcan1042
+            - ti,tcan1043
+    then:
+      properties:
+        '#phy-cells':
+          const: 0
+        silent-gpios: false
+        standby-gpios:
+          maxItems: 1
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: nxp,tja1048
+    then:
+      properties:
+        '#phy-cells':
+          const: 1
+        enable-gpios: false
+        silent-gpios: false
+        standby-gpios:
+          minItems: 2
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: nxp,tja1051
+    then:
+      properties:
+        '#phy-cells':
+          const: 0
+        standby-gpios: false
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: nxp,tja1057
+    then:
+      properties:
+        '#phy-cells':
+          const: 0
+        enable-gpios: false
+        standby-gpios: false
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    transceiver1: can-phy {
+      compatible = "ti,tcan1043";
+      #phy-cells = <0>;
+      max-bitrate = <5000000>;
+      standby-gpios = <&wakeup_gpio1 16 GPIO_ACTIVE_LOW>;
+      enable-gpios = <&main_gpio1 67 GPIO_ACTIVE_HIGH>;
+      mux-states = <&mux0 1>;
+    };

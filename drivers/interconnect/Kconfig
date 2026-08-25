@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-2.0-only
+menuconfig INTERCONNECT
+	bool "On-Chip Interconnect management support"
+	help
+	  Support for management of the on-chip interconnects.
+
+	  This framework is designed to provide a generic interface for
+	  managing the interconnects in a SoC.
+
+	  If unsure, say no.
+
+if INTERCONNECT
+
+source "drivers/interconnect/imx/Kconfig"
+source "drivers/interconnect/mediatek/Kconfig"
+source "drivers/interconnect/qcom/Kconfig"
+source "drivers/interconnect/samsung/Kconfig"
+
+config INTERCONNECT_CLK
+	tristate
+	depends on COMMON_CLK
+	help
+	  Support for wrapping clocks into the interconnect nodes.
+
+config INTERCONNECT_KUNIT_TEST
+	tristate "KUnit tests for Interconnect framework"
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  This builds the KUnit test suite for the generic system interconnect
+	  framework.
+
+	  The tests cover the core functionality of the interconnect subsystem,
+	  including provider/consumer APIs, topology management, and bandwidth
+	  aggregation logic.
+
+	  If unsure, say N.
+
+endif

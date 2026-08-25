@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# linux/arch/arm64/crypto/Makefile
+#
+# Copyright (C) 2014 Linaro Ltd <ard.biesheuvel@linaro.org>
+#
+
+obj-$(CONFIG_CRYPTO_SM4_ARM64_CE) += sm4-ce-cipher.o
+sm4-ce-cipher-y := sm4-ce-cipher-glue.o sm4-ce-cipher-core.o
+
+obj-$(CONFIG_CRYPTO_SM4_ARM64_CE_BLK) += sm4-ce.o
+sm4-ce-y := sm4-ce-glue.o sm4-ce-core.o
+
+obj-$(CONFIG_CRYPTO_SM4_ARM64_CE_CCM) += sm4-ce-ccm.o
+sm4-ce-ccm-y := sm4-ce-ccm-glue.o sm4-ce-ccm-core.o
+
+obj-$(CONFIG_CRYPTO_SM4_ARM64_CE_GCM) += sm4-ce-gcm.o
+sm4-ce-gcm-y := sm4-ce-gcm-glue.o sm4-ce-gcm-core.o
+
+obj-$(CONFIG_CRYPTO_SM4_ARM64_NEON_BLK) += sm4-neon.o
+sm4-neon-y := sm4-neon-glue.o sm4-neon-core.o
+
+obj-$(CONFIG_CRYPTO_GHASH_ARM64_CE) += ghash-ce.o
+ghash-ce-y := ghash-ce-glue.o ghash-ce-core.o
+
+obj-$(CONFIG_CRYPTO_AES_ARM64_CE_CCM) += aes-ce-ccm.o
+aes-ce-ccm-y := aes-ce-ccm-glue.o aes-ce-ccm-core.o
+
+obj-$(CONFIG_CRYPTO_AES_ARM64_CE_BLK) += aes-ce-blk.o
+aes-ce-blk-y := aes-glue-ce.o
+
+obj-$(CONFIG_CRYPTO_AES_ARM64_NEON_BLK) += aes-neon-blk.o
+aes-neon-blk-y := aes-glue-neon.o
+
+obj-$(CONFIG_CRYPTO_AES_ARM64_BS) += aes-neon-bs.o
+aes-neon-bs-y := aes-neonbs-core.o aes-neonbs-glue.o
