@@ -1,0 +1,67 @@
+#pragma once
+
+#include "nix/util/types.hh"
+#include "nix/util/signature/local-keys.hh"
+
+#include <map>
+#include <optional>
+
+namespace nix {
+
+/**
+ * An abstract signer
+ *
+ * Derive from this class to implement a custom signature scheme.
+ *
+ * It is only necessary to implement signature of bytes and provide a
+ * public key.
+ */
+struct Signer
+{
+private:
+    /* VTable anchor to avoid weak linkage of the vtable - it breaks
+       dynamic_cast across shared libraries on Darwin. */
+    virtual void anchor();
+
+public:
+    virtual ~Signer() = default;
+
+    /**
+     * Sign the given data, creating a (detached) signature.
+     *
+     * @param data data to be signed.
+     *
+     * @return the [detached
+     * signature](https://en.wikipedia.org/wiki/Detached_signature),
+     * i.e. just the signature itself without a copy of the signed data.
+     */
+    virtual Signature signDetached(std::string_view data) const = 0;
+
+    /**
+     * View the public key associated with this `Signer`.
+     */
+    virtual const PublicKey & getPublicKey() = 0;
+};
+
+using Signers = std::map<std::string, Signer *>;
+
+/**
+ * Local signer
+ *
+ * The private key is held in this machine's RAM
+ */
+struct LocalSigner : Signer
+{
+    LocalSigner(SecretKey && privateKey);
+
+    Signature signDetached(std::string_view s) const override;
+
+    const PublicKey & getPublicKey() override;
+
+private:
+
+    SecretKey privateKey;
+    PublicKey publicKey;
+};
+
+} // namespace nix

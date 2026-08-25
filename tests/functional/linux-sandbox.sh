@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+
+source common.sh
+
+needLocalStore "the sandbox only runs on the builder side, so it makes no sense to test it with the daemon"
+
+TODO_NixOS
+
+requireSandboxSupport
+requiresUnprivilegedUserNamespaces
+
+# Note: we need to bind-mount $SHELL into the chroot. Currently we
+# only support the case where $SHELL is in the Nix store, because
+# otherwise things get complicated (e.g. if it's in /bin, do we need
+# /lib as well?).
+if [[ ! $SHELL =~ /nix/store ]]; then skipTest "Shell is not from Nix store"; fi
+# An alias to automatically bind-mount the $SHELL on nix-build invocations
+nix-sandbox-build () { nix-build --no-out-link --sandbox-paths /nix/store "$@"; }
+
+export NIX_STORE_DIR=/my/store
+export NIX_REMOTE=$TEST_ROOT/store0
+
+outPath=$(nix-sandbox-build dependencies.nix)
+
+[[ $outPath =~ /my/store/.*-dependencies ]]
+
+nix path-info -r "$outPath" | grep input-2
+
+nix store ls -R -l "$outPath" | grep foobar
+
+nix store cat "$outPath"/foobar | grep FOOBAR
+
+# Test --check without hash rewriting.
+nix-sandbox-build dependencies.nix --check
+
+# Test that sandboxed builds with --check and -K can move .check directory to store
+nix-sandbox-build check.nix -A nondeterministic
+
+# `100 + 4` means non-deterministic, see doc/manual/source/command-ref/status-build-failure.md
+expectStderr 104 nix-sandbox-build check.nix -A nondeterministic --check -K > "$TEST_ROOT"/log
+grepQuietInverse 'error: renaming' "$TEST_ROOT"/log
+grepQuiet 'may not be deterministic' "$TEST_ROOT"/log
+
+# Test that sandboxed builds cannot write to /etc easily
+# `100` means build failure without extra info, see doc/manual/source/command-ref/status-build-failure.md
+expectStderr 100 nix-sandbox-build -E 'with import '"${config_nix}"'; mkDerivation { name = "etc-write"; buildCommand = "echo > /etc/test"; }' |
+    grepQuiet "/etc/test: Permission denied"
+
+
+## Test mounting of SSL certificates into the sandbox
+testCert () {
+    expectation=$1 # "missing" | "present"
+    mode=$2        # "normal" | "fixed-output"
+    certFile=$3    # a string that can be the path to a cert file
+    # `100` means build failure without extra info, see doc/manual/source/command-ref/status-build-failure.md
+    [ "$mode" == fixed-output ] && ret=1 || ret=100
+    expectStderr "$ret" nix-sandbox-build linux-sandbox-cert-test.nix --argstr mode "$mode" --option ssl-cert-file "$certFile" |
+        grepQuiet "CERT_${expectation}_IN_SANDBOX"
+}
+
+nocert=$TEST_ROOT/no-cert-file.pem
+cert=$TEST_ROOT/some-cert-file.pem
+symlinkcert=$TEST_ROOT/symlink-cert-file.pem
+transitivesymlinkcert=$TEST_ROOT/transitive-symlink-cert-file.pem
+symlinkDir=$TEST_ROOT/symlink-dir
+echo -n "CERT_CONTENT" > "$cert"
+ln -s "$cert" "$symlinkcert"
+ln -s "$symlinkcert" "$transitivesymlinkcert"
+ln -s "$TEST_ROOT" "$symlinkDir"
+
+# No cert in sandbox when not a fixed-output derivation
+testCert missing normal       "$cert"
+
+# No cert in sandbox when ssl-cert-file is empty
+testCert missing fixed-output ""
+
+# No cert in sandbox when ssl-cert-file is a nonexistent file
+testCert missing fixed-output "$nocert"
+
+# Cert in sandbox when ssl-cert-file is set to an existing file
+testCert present fixed-output "$cert"
+
+# Cert in sandbox when ssl-cert-file is set to a (potentially transitive) symlink to an existing file
+testCert present fixed-output "$symlinkcert"
+testCert present fixed-output "$transitivesymlinkcert"
+
+# Symlinks should be added in the sandbox directly and not followed
+nix-sandbox-build symlink-derivation.nix -A depends_on_symlink
+nix-sandbox-build symlink-derivation.nix -A test_sandbox_paths \
+    --option extra-sandbox-paths "/file=$cert" \
+    --option extra-sandbox-paths "/dir=$TEST_ROOT" \
+    --option extra-sandbox-paths "/symlinkDir=$symlinkDir" \
+    --option extra-sandbox-paths "/symlink=$symlinkcert"
+
+invalidLeafPaths=(
+    "/foo/.."
+    "/foo/."
+    "/.."
+    "/."
+)
+
+for badPath in "${invalidLeafPaths[@]}"; do
+    expectStderr 1 nix-sandbox-build simple-failing.nix --option extra-sandbox-paths "$badPath=$cert" |
+        grepQuiet "invalid filename"
+done
+
+badPaths=(
+    "/../escape"
+    "/foo/../../escape"
+    "//foo///.//../../escape"
+    "/./../escape"
+    "///.//./../escape//"
+    "/a/b/../../../escape"
+)
+
+sources=(
+    "$cert"
+    "$symlinkcert"
+    "$symlinkDir"
+    "$TEST_ROOT"
+)
+
+for badPath in "${badPaths[@]}"; do
+    for source in "${sources[@]}"; do
+        expectStderr 1 nix-sandbox-build simple-failing.nix --option extra-sandbox-paths "$badPath=$source" |
+            grepQuiet "escapes the chroot"
+    done
+done
+
+# Trailing slash in the destination should fail for non-directory files.
+expectStderr 1 nix-sandbox-build simple-failing.nix --option extra-sandbox-paths "/a/=$cert" | grepQuiet "error: creating regular file.*: No such file or directory"
+expectStderr 1 nix-sandbox-build simple-failing.nix --option extra-sandbox-paths "/a/=$symlinkcert" | grepQuiet "error: creating symlink.*: No such file or directory"
+
+# Escaping to chroot directory.
+expectStderr 1 nix-sandbox-build simple-failing.nix --option extra-sandbox-paths "/foo/../=$cert" | grepQuiet "error: creating regular file.*: No such file or directory"
+
+# Can't overmount the chroot.
+expectStderr 1 nix-sandbox-build simple-failing.nix --option extra-sandbox-paths "/foo/../=$TEST_ROOT" | grepQuiet "error: .*escapes the chroot"
+
+# The build should fail, not the mounting.
+expectStderr 100 nix-sandbox-build simple-failing.nix --option extra-sandbox-paths "/a/=$TEST_ROOT"
+expectStderr 100 nix-sandbox-build simple-failing.nix --option extra-sandbox-paths "/a/=$TEST_ROOT/"
+
+nix-sandbox-build symlink-derivation.nix -A test_sandbox_paths \
+    --option extra-sandbox-paths "/./file=$cert" \
+    --option extra-sandbox-paths "//dir/=$TEST_ROOT/" \
+    --option extra-sandbox-paths "///./symlinkDir=$symlinkDir" \
+    --option extra-sandbox-paths "/symlink=$symlinkcert"

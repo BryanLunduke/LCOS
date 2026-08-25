@@ -1,0 +1,301 @@
+name: "CI"
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      dogfood:
+        description: 'Use dogfood Nix build'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Not worth the hassle to explicitly list. This workflow is unprivileged anyway.
+permissions: read-all # zizmor: ignore[excessive-permissions]
+
+jobs:
+  eval:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: ./.github/actions/install-nix-action
+      with:
+        dogfood: ${{ github.event_name == 'workflow_dispatch' && inputs.dogfood || github.event_name != 'workflow_dispatch' }}
+        extra_nix_config:
+          experimental-features = nix-command flakes
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        use_cache: false
+    - run: nix flake show --all-systems --json
+
+  pre-commit-checks:
+    name: pre-commit checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-nix-action
+        with:
+          dogfood: ${{ github.event_name == 'workflow_dispatch' && inputs.dogfood || github.event_name != 'workflow_dispatch' }}
+          extra_nix_config: experimental-features = nix-command flakes
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: ./ci/gha/tests/pre-commit-checks
+
+  basic-checks:
+    name: aggregate basic checks
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    needs: [pre-commit-checks, eval]
+    steps:
+      - name: Exit with any errors
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          exit 1
+
+  tests:
+    needs: basic-checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: on ubuntu
+            runs-on: ubuntu-24.04
+            os: linux
+            instrumented: false
+            primary: true
+            stdenv: stdenv
+          - scenario: on macos
+            runs-on: macos-14
+            os: darwin
+            instrumented: false
+            primary: true
+            stdenv: stdenv
+          - scenario: on ubuntu (with sanitizers / coverage)
+            runs-on: ubuntu-24.04
+            os: linux
+            instrumented: true
+            primary: false
+            stdenv: clangStdenv
+    name: tests ${{ matrix.scenario }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: ./.github/actions/install-nix-action
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        dogfood: ${{ github.event_name == 'workflow_dispatch' && inputs.dogfood || github.event_name != 'workflow_dispatch' }}
+        # The sandbox would otherwise be disabled by default on Darwin
+        extra_nix_config: "sandbox = true"
+    # Since ubuntu 22.30, unprivileged usernamespaces are no longer allowed to map to the root user:
+    # https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces
+    - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      if: matrix.os == 'linux'
+    - name: Run component tests
+      run: |
+        nix build --file ci/gha/tests/wrapper.nix componentTests -L \
+          --arg withInstrumentation ${{ matrix.instrumented }} \
+          --argstr stdenv "${{ matrix.stdenv }}"
+    - name: Run VM tests
+      run: |
+        nix build --file ci/gha/tests/wrapper.nix vmTests -L \
+          --arg withInstrumentation ${{ matrix.instrumented }} \
+          --argstr stdenv "${{ matrix.stdenv }}"
+      if: ${{ matrix.os == 'linux' }}
+    - name: Run flake checks and prepare the installer tarball
+      run: |
+        ci/gha/tests/build-checks
+        ci/gha/tests/prepare-installer-for-github-actions
+      if: ${{ matrix.primary }}
+    - name: Collect code coverage
+      run: |
+        nix build --file ci/gha/tests/wrapper.nix codeCoverage.coverageReports -L \
+          --arg withInstrumentation ${{ matrix.instrumented }} \
+          --argstr stdenv "${{ matrix.stdenv }}" \
+          --out-link coverage-reports
+        cat coverage-reports/index.txt >> $GITHUB_STEP_SUMMARY
+      if: ${{ matrix.instrumented }}
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: coverage-reports
+        path: coverage-reports/
+      if: ${{ matrix.instrumented }}
+    - name: Upload installer tarball
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: installer-${{matrix.os}}
+        path: out/*
+      if: ${{ matrix.primary }}
+
+  windows_tests:
+    needs: basic-checks
+    name: windows unit tests
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: ./.github/actions/install-nix-action
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        dogfood: ${{ github.event_name == 'workflow_dispatch' && inputs.dogfood || github.event_name != 'workflow_dispatch' }}
+    - name: Run Windows unit tests
+      run: |
+        nix build --file ci/gha/tests/windows.nix unitTests.nix-util-tests -L
+
+  installer_test:
+    needs: [tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: on ubuntu
+            runs-on: ubuntu-24.04
+            os: linux
+            rust-installer: false
+          - scenario: on macos
+            runs-on: macos-14
+            os: darwin
+            rust-installer: false
+          - scenario: on ubuntu (rust)
+            runs-on: ubuntu-24.04
+            os: linux
+            rust-installer: true
+          - scenario: on macos (rust)
+            runs-on: macos-14
+            os: darwin
+            rust-installer: true
+    name: installer test ${{ matrix.scenario }}
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Download installer tarball
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: installer-${{matrix.os}}
+        path: out
+    - name: Looking up the installer tarball URL
+      id: installer-tarball-url
+      run: echo "installer-url=file://$GITHUB_WORKSPACE/out" >> "$GITHUB_OUTPUT"
+    - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      if: ${{ !matrix.rust-installer }}
+      with:
+        install_url: ${{ format('{0}/install', steps.installer-tarball-url.outputs.installer-url) }}
+        install_options: ${{ format('--tarball-url-prefix {0}', steps.installer-tarball-url.outputs.installer-url) }}
+    - name: Run rust installer
+      if: ${{ matrix.rust-installer }}
+      run: |
+        chmod +x out/nix-installer
+        ./out/nix-installer install --no-confirm
+      env:
+        RUST_BACKTRACE: full
+    - run: sudo apt install fish zsh
+      if: matrix.os == 'linux'
+    - run: brew install fish
+      if: matrix.os == 'darwin'
+    - run: exec bash -c "nix-instantiate -E 'builtins.currentTime' --eval"
+    - run: exec sh -c "nix-instantiate -E 'builtins.currentTime' --eval"
+    - run: exec zsh -c "nix-instantiate -E 'builtins.currentTime' --eval"
+    - run: exec fish -c "nix-instantiate -E 'builtins.currentTime' --eval"
+    - run: exec bash -c "nix-channel --add https://releases.nixos.org/nixos/unstable/nixos-23.05pre466020.60c1d71f2ba nixpkgs"
+    - run: exec bash -c "nix-channel --update && nix-env -iA nixpkgs.hello && hello"
+
+  clang-tidy:
+    needs: basic-checks
+    runs-on: ubuntu-24.04
+    name: clang-tidy
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: ./.github/actions/install-nix-action
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        dogfood: ${{ github.event_name == 'workflow_dispatch' && inputs.dogfood || github.event_name != 'workflow_dispatch' }}
+        extra_nix_config: "sandbox = true"
+    - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+    - name: Run clang-tidy
+      run: nix build .#hydraJobs.clangTidy.x86_64-linux -L
+
+
+  flake_regressions:
+    needs: tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout nix
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Checkout flake-regressions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NixOS/flake-regressions
+          path: flake-regressions
+          persist-credentials: false
+      - name: Checkout flake-regressions-data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NixOS/flake-regressions-data
+          path: flake-regressions/tests
+          persist-credentials: false
+      - name: Download installer tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: installer-linux
+          path: out
+      - name: Looking up the installer tarball URL
+        id: installer-tarball-url
+        run: |
+          echo "installer-url=file://$GITHUB_WORKSPACE/out" >> "$GITHUB_OUTPUT"
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          install_url: ${{ format('{0}/install', steps.installer-tarball-url.outputs.installer-url) }}
+          install_options: ${{ format('--tarball-url-prefix {0}', steps.installer-tarball-url.outputs.installer-url) }}
+      - name: Run flake regressions tests
+        run: |
+          touch flake-regressions/tests/{0utkarsh/nixconfig,HariAmoor-professional/nixos-config}/disabled
+          MAX_FLAKES=25 flake-regressions/eval-all.sh
+
+  profile_build:
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: >-
+      github.event_name == 'push' &&
+      github.ref_name == 'master'
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: ./.github/actions/install-nix-action
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        dogfood: ${{ github.event_name == 'workflow_dispatch' && inputs.dogfood || github.event_name != 'workflow_dispatch' }}
+        extra_nix_config: |
+          experimental-features = flakes nix-command ca-derivations impure-derivations
+          max-jobs = 1
+    - run: |
+        nix build -L --file ./ci/gha/profile-build buildTimeReport --out-link build-time-report.md
+        cat build-time-report.md >> $GITHUB_STEP_SUMMARY

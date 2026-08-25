@@ -1,0 +1,217 @@
+#pragma once
+///@file
+
+#include <limits>
+#include <set>
+#include <string>
+
+#include "nix/store/store-api.hh"
+#include "nix/store/submit-store.hh"
+#include "nix/util/sync.hh"
+#include "nix/util/file-descriptor.hh"
+#include "nix/store/gc-store.hh"
+#include "nix/store/log-store.hh"
+
+namespace nix {
+
+class Pipe;
+class Pid;
+struct FdSink;
+struct FdSource;
+template<typename T>
+class Pool;
+class RemoteFSAccessor;
+
+struct RemoteStoreConfig : virtual StoreConfig
+{
+private:
+    void anchor() override;
+
+public:
+    RemoteStoreConfig(const Params & params, FilePathType pathType)
+        : StoreConfig(params, pathType)
+    {
+    }
+
+    Setting<int> maxConnections{
+        this, 1, "max-connections", "Maximum number of concurrent connections to the Nix daemon."};
+
+    Setting<unsigned int> maxConnectionAge{
+        this,
+        std::numeric_limits<unsigned int>::max(),
+        "max-connection-age",
+        "Maximum age of a connection before it is closed."};
+};
+
+/**
+ * \todo RemoteStore is a misnomer - should be something like
+ * DaemonStore.
+ */
+struct RemoteStore : public virtual Store, public virtual GcStore, public virtual LogStore, public virtual SubmitStore
+{
+private:
+    void anchor() override;
+
+public:
+    using Config = RemoteStoreConfig;
+
+    const Config & config;
+
+    RemoteStore(const Config & config);
+
+    /* Implementations of abstract store API methods. */
+
+    bool isValidPathUncached(const StorePath & path) override;
+
+    StorePathSet queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute = NoSubstitute) override;
+
+    StorePathSet queryAllValidPaths() override;
+
+    void queryPathInfoUncached(
+        const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override;
+
+    void queryReferrers(const StorePath & path, StorePathSet & referrers) override;
+
+    StorePathSet queryValidDerivers(const StorePath & path) override;
+
+    StorePathSet queryDerivationOutputs(const StorePath & path) override;
+
+    std::map<std::string, std::optional<StorePath>>
+    queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore = nullptr) override;
+    std::optional<StorePath> queryPathFromHashPart(const std::string & hashPart) override;
+
+    StorePathSet querySubstitutablePaths(const StorePathSet & paths) override;
+
+    void querySubstitutablePathInfos(const StorePathCAMap & paths, SubstitutablePathInfos & infos) override;
+
+    /**
+     * Add a content-addressable store path. `dump` will be drained.
+     */
+    ref<const ValidPathInfo> addCAToStore(
+        Source & dump,
+        std::string_view name,
+        ContentAddressMethod caMethod,
+        HashAlgorithm hashAlgo,
+        const StorePathSet & references,
+        RepairFlag repair);
+
+    /**
+     * Add a content-addressable store path. `dump` will be drained.
+     */
+    StorePath addToStoreFromDump(
+        Source & dump,
+        std::string_view name,
+        FileSerialisationMethod dumpMethod = FileSerialisationMethod::NixArchive,
+        ContentAddressMethod hashMethod = FileIngestionMethod::NixArchive,
+        HashAlgorithm hashAlgo = HashAlgorithm::SHA256,
+        const StorePathSet & references = StorePathSet(),
+        RepairFlag repair = NoRepair) override;
+
+    void addToStore(const ValidPathInfo & info, Source & nar, RepairFlag repair, CheckSigsFlag checkSigs) override;
+
+    void
+    addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override;
+
+    void registerDrvOutputUnchecked(const Realisation & info) override;
+
+    void submitOutput(const SingleDerivedPath & path, const OutputName & output) override;
+
+    ref<const ValidPathInfo> addToStoreScanning(
+        Source & dump,
+        std::string_view name,
+        FileSerialisationMethod dumpMethod,
+        ContentAddressMethod hashMethod,
+        HashAlgorithm hashAlgo) override;
+
+    void queryRealisationUncached(
+        const DrvOutput &, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override;
+
+    ref<Builder> getBuilder(std::shared_ptr<Store> evalStore) override;
+
+    void addTempRoot(const StorePath & path) override;
+
+    Roots findRoots(bool censor) override;
+
+    void collectGarbage(const GCOptions & options, GCResults & results) override;
+
+    void deleteBuildTraces(const std::set<DrvOutput> & keys) override
+    {
+        // TODO support this in the protocol someday
+        unsupported("deleteBuildTraces");
+    };
+
+    void optimiseStore() override;
+
+    bool verifyStore(bool checkContents, RepairFlag repair) override;
+
+    void addSignatures(const StorePath & storePath, const std::set<Signature> & sigs) override;
+
+    MissingPaths queryMissing(const std::vector<DerivedPath> & targets) override;
+
+    void addBuildLog(const StorePath & drvPath, std::string_view log) override;
+
+    std::optional<std::string> getVersion() override;
+
+    void connect() override;
+
+    unsigned int getProtocol() override;
+
+    std::optional<TrustedFlag> isTrustedClient() override;
+
+    void flushBadConnections();
+
+    /**
+     * Shutdown all connections (both idle and in-use) to break any blocking I/O.
+     * This is called on interrupt to allow graceful termination when the client
+     * disconnects during a long-running operation.
+     */
+    void shutdownConnections();
+
+    struct Connection;
+
+    ref<Connection> openConnectionWrapper();
+
+protected:
+
+    virtual ref<Connection> openConnection() = 0;
+
+    void initConnection(Connection & conn);
+
+    ref<Pool<Connection>> connections;
+
+    virtual void setOptions(Connection & conn);
+
+    void setOptions() override;
+
+    struct ConnectionHandle;
+
+    ConnectionHandle getConnection();
+
+    friend struct ConnectionHandle;
+
+    virtual ref<SourceAccessor> getFSAccessor(bool requireValidPath = true) override;
+
+    virtual std::shared_ptr<SourceAccessor>
+    getFSAccessor(const StorePath & path, bool requireValidPath = true) override;
+
+    virtual void narFromPath(const StorePath & path, Sink & sink) override;
+
+private:
+
+    /**
+     * Same as the default implemenation of `RemoteStore::getFSAccessor`, but with a more preceise return type.
+     */
+    ref<RemoteFSAccessor> getRemoteFSAccessor(bool requireValidPath = true);
+
+    std::atomic_bool failed{false};
+
+    /**
+     * Track all active connection file descriptors (both idle and in-use).
+     * Used by shutdownConnections() to break blocking I/O on interrupt.
+     */
+    Sync<std::set<Descriptor>> connectionFds;
+
+    friend struct RemoteBuilder;
+};
+
+} // namespace nix

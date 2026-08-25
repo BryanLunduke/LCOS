@@ -1,0 +1,256 @@
+#include "cmd-config-private.hh"
+
+#include <cstdio>
+
+#include <signal.h>
+
+#if USE_READLINE
+#  include <readline/history.h>
+#  include <readline/readline.h>
+#else
+// editline < 1.15.2 don't wrap their API for C++ usage
+// (added in https://github.com/troglobit/editline/commit/91398ceb3427b730995357e9d120539fb9bb7461).
+// This results in linker errors due to to name-mangling of editline C symbols.
+// For compatibility with these versions, we wrap the API here
+// (wrapping multiple times on newer versions is no problem).
+extern "C" {
+#  include <editline.h>
+}
+#endif
+
+#include "nix/util/finally.hh"
+#include "nix/cmd/repl-interacter.hh"
+#include "nix/util/file-system.hh"
+#include "nix/util/serialise.hh"
+#include "nix/util/environment-variables.hh"
+
+namespace nix {
+
+namespace {
+// Used to communicate to NixRepl::getLine whether a signal occurred in ::readline.
+volatile sig_atomic_t g_signal_received = 0;
+
+void sigintHandler(int signo)
+{
+    g_signal_received = signo;
+}
+}; // namespace
+
+static detail::ReplCompleterMixin * curRepl; // ugly
+
+#if !USE_READLINE
+static char * completionCallback(char * s, int * match) noexcept
+try {
+    auto possible = curRepl->completePrefix(s);
+    if (possible.size() == 1) {
+        *match = 1;
+        auto * res = strdup(possible.begin()->c_str() + strlen(s));
+        if (!res)
+            throw Error("allocation failure");
+        return res;
+    } else if (possible.size() > 1) {
+        auto checkAllHaveSameAt = [&](size_t pos) {
+            auto & first = *possible.begin();
+            for (auto & p : possible) {
+                if (p.size() <= pos || p[pos] != first[pos])
+                    return false;
+            }
+            return true;
+        };
+        size_t start = strlen(s);
+        size_t len = 0;
+        while (checkAllHaveSameAt(start + len))
+            ++len;
+        if (len > 0) {
+            *match = 1;
+            auto * res = strdup(std::string(*possible.begin(), start, len).c_str());
+            if (!res)
+                throw Error("allocation failure");
+            return res;
+        }
+    }
+
+    *match = 0;
+    return nullptr;
+} catch (...) {
+    return nullptr;
+}
+
+static int listPossibleCallback(char * s, char *** avp) noexcept
+try {
+    auto possible = curRepl->completePrefix(s);
+
+    if (possible.size() > (std::numeric_limits<int>::max() / sizeof(char *)))
+        throw Error("too many completions");
+
+    int ac = 0;
+    char ** vp = nullptr;
+
+    auto check = [&](auto * p) {
+        if (!p) {
+            if (vp) {
+                while (--ac >= 0)
+                    free(vp[ac]);
+                free(vp);
+            }
+            throw Error("allocation failure");
+        }
+        return p;
+    };
+
+    vp = check((char **) malloc(possible.size() * sizeof(char *)));
+
+    for (auto & p : possible)
+        vp[ac++] = check(strdup(p.c_str()));
+
+    *avp = vp;
+
+    return ac;
+} catch (...) {
+    *avp = nullptr;
+    return 0;
+}
+#endif
+
+ReadlineLikeInteracter::Guard ReadlineLikeInteracter::init(detail::ReplCompleterMixin * repl)
+{
+    // Allow nix-repl specific settings in .inputrc
+    rl_readline_name = "nix-repl";
+    try {
+        createDirs(historyFile.parent_path());
+    } catch (SystemError & e) {
+        logWarning(e.info());
+    }
+#if !USE_READLINE
+    /* editline's read_history uses a fixed 256-byte buffer (SCREEN_INC),
+       which silently splits lines longer than 255 characters into separate
+       history entries. Read the file ourselves to avoid the length limit. See:
+       https://github.com/troglobit/editline/blob/2e0504d31e6878208036a4dd91f44841dabb1ee7/src/editline.c#L1617-L1635
+
+       ::rl_initialize must be called before the subsequent calls to
+       ::add_history to ensure that the buffer has actually been allocated
+       (but before setting ::el_hist_size).
+       Best I can tell it's supposed to idempotent, e.g. ::readline calls it
+       unconditionally anyway. */
+
+    ::el_hist_size = 1000; /* FIXME: Why the arbitrary limit? */
+    ::rl_initialize();
+
+    auto fd = openFileReadonly(historyFile);
+    if (!fd) {
+        NativeSysError err("opening file %s", PathFmt(historyFile));
+        if (!err.is(std::errc::no_such_file_or_directory) && !err.is(std::errc::not_a_directory))
+            logWarning(err.info());
+    } else {
+        try {
+            FdSource source(fd.get());
+            while (true)
+                add_history(source.readLine().c_str());
+        } catch (EndOfFile &) {
+        } catch (SystemError & e) {
+            logWarning(e.info());
+        }
+    }
+#else
+    read_history(historyFile.string().c_str());
+#endif
+    auto oldRepl = curRepl;
+    curRepl = repl;
+    Guard restoreRepl([oldRepl] { curRepl = oldRepl; });
+#if !USE_READLINE
+    rl_set_complete_func(completionCallback);
+    rl_set_list_possib_func(listPossibleCallback);
+#endif
+    return restoreRepl;
+}
+
+static constexpr const char * promptForType(ReplPromptType promptType)
+{
+    switch (promptType) {
+    case ReplPromptType::ReplPrompt:
+        return "nix-repl> ";
+    case ReplPromptType::ContinuationPrompt:
+        return "        > "; // 9 spaces + >
+    }
+    assert(false);
+}
+
+bool ReadlineLikeInteracter::getLine(std::string & input, ReplPromptType promptType)
+{
+#ifndef _WIN32 // TODO use more signals.hh for this
+    struct sigaction act, old;
+    sigset_t savedSignalMask, set;
+
+    auto setupSignals = [&]() {
+        act.sa_handler = sigintHandler;
+        sigfillset(&act.sa_mask);
+        act.sa_flags = 0;
+        if (sigaction(SIGINT, &act, &old))
+            throw SysError("installing handler for SIGINT");
+
+        sigemptyset(&set);
+        sigaddset(&set, SIGINT);
+        if (sigprocmask(SIG_UNBLOCK, &set, &savedSignalMask))
+            throw SysError("unblocking SIGINT");
+    };
+    auto restoreSignals = [&]() {
+        if (sigprocmask(SIG_SETMASK, &savedSignalMask, nullptr))
+            throw SysError("restoring signals");
+
+        if (sigaction(SIGINT, &old, 0))
+            throw SysError("restoring handler for SIGINT");
+    };
+
+    setupSignals();
+#endif
+
+    /* Buffer for the non-interactive input. */
+    std::string buffer;
+    const char * s = nullptr;
+    char * rl = nullptr;
+
+    /* Use plain std::getline for non-interactive mode, which we also use for
+       testing purposes. readline/editline seem to disagree too much about how
+       to handle final prompts etc., so it's easier to bypass those. The tests
+       are mostly about testing the core repl logic, not input handling. */
+    if (isInteractive) {
+        rl = ::readline(promptForType(promptType));
+        s = rl;
+    } else {
+        s = std::getline(std::cin, buffer) ? buffer.c_str() : nullptr;
+    }
+
+    Finally doFree([&]() { ::free(rl); });
+
+#ifndef _WIN32 // TODO use more signals.hh for this
+    restoreSignals();
+#endif
+
+    if (g_signal_received) {
+        g_signal_received = 0;
+        input.clear();
+        return true;
+    }
+
+    /* Echo the prompt into the output if run in non-interactive mode, somewhat
+       for the purposes of characterisation tests. */
+    if (auto e = getEnv("_NIX_TEST_REPL_ECHO"); s && e && *e == "1") {
+        // This is probably not right for multi-line input, but we don't use that
+        // in the characterisation tests, so it's fine.
+        std::cout << promptForType(promptType) << s << std::endl;
+    }
+
+    if (!s)
+        return false;
+    input += s;
+    input += '\n';
+
+    return true;
+}
+
+ReadlineLikeInteracter::~ReadlineLikeInteracter()
+{
+    write_history(historyFile.string().c_str());
+}
+
+}; // namespace nix

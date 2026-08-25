@@ -1,0 +1,74 @@
+#pragma once
+///@file
+
+#include "nix/util/ref.hh"
+#include "nix/store/nar-info.hh"
+#include "nix/store/realisation.hh"
+
+namespace nix {
+
+struct SQLiteSettings;
+struct NarInfoDiskCacheSettings;
+
+struct NarInfoDiskCache
+{
+private:
+    /* VTable anchor to avoid weak linkage of the vtable - it breaks
+       dynamic_cast across shared libraries on Darwin. */
+    virtual void anchor();
+public:
+    using Settings = NarInfoDiskCacheSettings;
+
+    const Settings & settings;
+
+    NarInfoDiskCache(const Settings & settings)
+        : settings(settings)
+    {
+    }
+
+    typedef enum { oValid, oInvalid, oUnknown } Outcome;
+
+    virtual ~NarInfoDiskCache() {}
+
+    struct CacheInfo
+    {
+        int id = 0;
+        bool wantMassQuery = false;
+        int priority = 0;
+    };
+
+    /**
+     * Create or update the cached nix-cache-info for the binary cache at `uri`.
+     * Note that `info.id` is ignored. This function returns the id of the cache entry.
+     */
+    virtual int createCache(const std::string & uri, const std::string & storeDir, const CacheInfo & info) = 0;
+
+    virtual std::optional<CacheInfo> upToDateCacheExists(const std::string & uri) = 0;
+
+    virtual std::pair<Outcome, std::shared_ptr<NarInfo>>
+    lookupNarInfo(const std::string & uri, const std::string & hashPart) = 0;
+
+    virtual void
+    upsertNarInfo(const std::string & uri, const std::string & hashPart, std::shared_ptr<const ValidPathInfo> info) = 0;
+
+    virtual void upsertRealisation(const std::string & uri, const Realisation & realisation) = 0;
+    virtual void upsertAbsentRealisation(const std::string & uri, const DrvOutput & id) = 0;
+    virtual std::pair<Outcome, std::shared_ptr<Realisation>>
+    lookupRealisation(const std::string & uri, const DrvOutput & id) = 0;
+
+    /**
+     * Return a singleton cache object that can be used concurrently by
+     * multiple threads.
+     *
+     * @note the parameters are only used to initialize this the first time this is called.
+     * In subsequent calls, these arguments are ignored.
+     *
+     * @todo Probably should instead create a memo table so multiple settings -> multiple instances,
+     * but this is not yet a problem in practice.
+     */
+    static ref<NarInfoDiskCache> get(const Settings & settings, SQLiteSettings);
+
+    static ref<NarInfoDiskCache> getTest(const Settings & settings, SQLiteSettings, std::filesystem::path dbPath);
+};
+
+} // namespace nix

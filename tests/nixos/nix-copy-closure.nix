@@ -1,0 +1,107 @@
+# Test ‘nix-copy-closure’.
+
+{
+  lib,
+  config,
+  nixpkgs,
+  ...
+}:
+
+let
+  pkgs = config.nodes.client.nixpkgs.pkgs;
+
+  pkgA = pkgs.cowsay;
+  pkgB = pkgs.wget;
+  pkgC = pkgs.hello;
+  pkgD = pkgs.tmux;
+  pkgE = pkgs.tree;
+
+in
+{
+  name = "nix-copy-closure";
+
+  nodes = {
+    client =
+      {
+        config,
+        lib,
+        pkgs,
+        ...
+      }:
+      {
+        virtualisation.writableStore = true;
+        virtualisation.additionalPaths = [
+          pkgA
+          pkgD.drvPath
+          pkgE.drvPath
+        ];
+        nix.settings.substituters = lib.mkForce [ ];
+      };
+
+    server =
+      { config, pkgs, ... }:
+      {
+        services.openssh.enable = true;
+        virtualisation.writableStore = true;
+        # Including pkgC.drvPath (versus just pkgC) so common build deps
+        # are already in the store, limiting what the --include-outputs test
+        # needs to copy.
+        virtualisation.additionalPaths = [
+          pkgB
+          pkgC.drvPath
+        ];
+      };
+  };
+
+  testScript =
+    { nodes }:
+    /* python */ ''
+      # fmt: off
+      import subprocess
+
+      start_all()
+
+      # Create an SSH key on the client.
+      subprocess.run([
+        "${pkgs.openssh}/bin/ssh-keygen", "-t", "ed25519", "-f", "key", "-N", ""
+      ], capture_output=True, check=True)
+
+      client.copy_from_host("key", "/root/.ssh/id_ed25519")
+      client.succeed("chmod 600 /root/.ssh/id_ed25519")
+
+      # Install the SSH key on the server.
+      server.copy_from_host("key.pub", "/root/.ssh/authorized_keys")
+      server.wait_for_unit("sshd")
+      server.wait_for_unit("multi-user.target")
+      server.wait_for_unit("network-addresses-eth1.service")
+
+      client.wait_for_unit("network-addresses-eth1.service")
+      client.succeed(f"ssh -o StrictHostKeyChecking=no {server.name} 'echo hello world'")
+
+      # Copy the closure of package A from the client to the server.
+      server.fail("nix-store --check-validity ${pkgA}")
+      client.succeed("nix-copy-closure --to server --gzip ${pkgA} >&2")
+      server.succeed("nix-store --check-validity ${pkgA}")
+
+      # Copy the closure of package B from the server to the client.
+      client.fail("nix-store --check-validity ${pkgB}")
+      client.succeed("nix-copy-closure --from server --gzip ${pkgB} >&2")
+      client.succeed("nix-store --check-validity ${pkgB}")
+
+      # Copy the closure of package C via the SSH substituter.
+      client.fail("nix-store -r ${pkgC}")
+      client.succeed("nix-store --substituters ssh://root@server?trusted=1 -r ${pkgC} >&2")
+      client.succeed("nix-store --check-validity ${pkgC}")
+
+      # Copy the derivation of package D from the client to the server.
+      server.fail("nix-store --check-validity ${pkgD.drvPath}")
+      client.succeed("nix-copy-closure --to server --gzip ${pkgD.drvPath} >&2")
+      server.succeed("nix-store --check-validity ${pkgD.drvPath}")
+      server.fail("nix-store --check-validity ${pkgD}")
+
+      # Copy the derivation and outputs of package E from client to server.
+      server.fail("nix-store --check-validity ${pkgE}")
+      client.succeed("nix-copy-closure --to server --gzip --include-outputs ${pkgE.drvPath} >&2")
+      server.succeed("nix-store --check-validity ${pkgE}")
+    '';
+}

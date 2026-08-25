@@ -1,0 +1,43 @@
+error:
+       … while evaluating the attribute 'body'
+         at /pwd/lang/eval-fail-scope-5.nix:1:1:
+            1| let {
+             | ^
+            2|
+
+       … from the definition of 'body'
+         at /pwd/lang/eval-fail-scope-5.nix:13:3:
+           12|
+           13|   body = f { };
+             |   ^
+           14|
+
+       … from call site
+         at /pwd/lang/eval-fail-scope-5.nix:13:10:
+           12|
+           13|   body = f { };
+             |          ^
+           14|
+
+       … while calling 'f'
+         at /pwd/lang/eval-fail-scope-5.nix:7:5:
+            6|   f =
+            7|     {
+             |     ^
+            8|       x ? y,
+
+       … in an operand of '+'
+         at /pwd/lang/eval-fail-scope-5.nix:11:5:
+           10|     }:
+           11|     x + y;
+             |     ^
+           12|
+
+       … entering the infinite recursion
+
+       error: infinite recursion encountered
+       at /pwd/lang/eval-fail-scope-5.nix:8:11:
+            7|     {
+            8|       x ? y,
+             |           ^
+            9|       y ? x,

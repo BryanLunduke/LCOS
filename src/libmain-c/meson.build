@@ -1,0 +1,77 @@
+project(
+  'nix-main-c',
+  'cpp',
+  version : files('.version'),
+  default_options : [
+    'cpp_std=c++23',
+    # TODO(Qyriad): increase the warning level
+    'warning_level=1',
+    'errorlogs=true', # Please print logs for tests that fail
+  ],
+  meson_version : '>= 1.8',
+  license : 'LGPL-2.1-or-later',
+)
+
+cxx = meson.get_compiler('cpp')
+
+subdir('nix-meson-build-support/deps-lists')
+
+deps_private_maybe_subproject = [
+  dependency('nix-util'),
+  dependency('nix-store'),
+  dependency('nix-main'),
+]
+deps_public_maybe_subproject = [
+  dependency('nix-util-c'),
+  dependency('nix-store-c'),
+]
+subdir('nix-meson-build-support/subprojects')
+
+subdir('nix-meson-build-support/common')
+
+sources = files(
+  'nix_api_main.cc',
+)
+
+include_dirs = [ include_directories('.') ]
+
+headers = files(
+  'nix_api_main.h',
+)
+
+subdir('nix-meson-build-support/export-all-symbols')
+subdir('nix-meson-build-support/windows-version')
+
+# For linking -c bindings into the cli for plugins.
+build_both_libraries = get_option('plugin-c-api')
+
+library_kwargs = {
+  'soversion' : nix_soversion,
+  'dependencies' : deps_public + deps_private + deps_other,
+  'include_directories' : include_dirs,
+  'link_args' : linker_export_flags,
+  'install' : true,
+}
+
+if build_both_libraries
+  this_libraries = both_libraries(
+    'nixmainc',
+    sources,
+    kwargs : library_kwargs,
+    override_options : [ 'b_lto=false' ],
+  )
+else
+  this_library = library(
+    'nixmainc',
+    sources,
+    kwargs : library_kwargs,
+  )
+endif
+
+plugin_c_api_enabled = build_both_libraries
+
+install_headers(headers, preserve_path : true)
+
+libraries_private = []
+
+subdir('nix-meson-build-support/export')

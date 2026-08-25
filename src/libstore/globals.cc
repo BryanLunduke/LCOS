@@ -1,0 +1,618 @@
+#include "nix/store/globals.hh"
+#include "nix/store/profiles.hh"
+#include "nix/util/config-impl.hh"
+#include "nix/util/config-global.hh"
+#include "nix/util/current-process.hh"
+#include "nix/util/executable-path.hh"
+#include "nix/util/file-system.hh"
+#include "nix/util/args.hh"
+#include "nix/util/abstract-setting-to-json.hh"
+#include "nix/util/compute-levels.hh"
+#include "nix/util/executable-path.hh"
+#include "nix/store/filetransfer.hh"
+
+#include <algorithm>
+#include <map>
+#include <mutex>
+#include <thread>
+
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+#ifndef _WIN32
+#  include <sys/utsname.h>
+#endif
+
+#ifdef __GLIBC__
+#  include <gnu/lib-names.h>
+#  include <nss.h>
+#  include <dlfcn.h>
+#endif
+
+#ifdef __APPLE__
+#  include "nix/util/processes.hh"
+#endif
+
+#ifdef __APPLE__
+#  include <sys/sysctl.h>
+#endif
+
+#ifdef _WIN32
+#  include "nix/util/windows-known-folders.hh"
+#endif
+
+#include "store-config-private.hh"
+
+namespace nix {
+
+void Settings::anchor() {}
+
+void NarInfoDiskCacheSettings::anchor() {}
+
+void LogFileSettings::anchor() {}
+
+void AutoAllocateUidSettings::anchor() {}
+
+Settings settings;
+
+static GlobalConfig::Register rSettings(&settings);
+
+Settings::Settings()
+    : nixStateDir(getEnvOsNonEmpty(OS_STR("NIX_STATE_DIR"))
+                      .transform([](auto && s) { return std::filesystem::path(s); })
+                      .or_else([]() -> std::optional<std::filesystem::path> {
+#ifdef _WIN32
+#  ifdef NIX_STATE_DIR
+#    error "NIX_STATE_DIR should not be defined on Windows"
+#  endif
+                          return windows::known_folders::getProgramData() / "nix" / "state";
+#else
+                          return NIX_STATE_DIR;
+#endif
+                      })
+                      .transform([](auto && s) { return canonPath(s); })
+                      .value())
+{
+#ifndef _WIN32
+    buildUsersGroup = isRootUser() ? "nixbld" : "";
+#endif
+    allowSymlinkedStore = getEnv("NIX_IGNORE_SYMLINK_STORE") == "1";
+
+    /* Backwards compatibility. */
+    auto s = getEnv("NIX_REMOTE_SYSTEMS");
+    if (s) {
+        Strings ss;
+        for (auto & p : tokenizeString<Strings>(*s, ":"))
+            ss.push_back("@" + p);
+        builders = concatStringsSep("\n", ss);
+    }
+
+#if (defined(__linux__) || defined(__FreeBSD__)) && defined(SANDBOX_SHELL)
+    sandboxPaths = {{"/bin/sh", {.source = SANDBOX_SHELL}}};
+#endif
+
+    /* chroot-like behavior from Apple's sandbox */
+#ifdef __APPLE__
+    for (PathView p : {
+             "/System/Library/Frameworks",
+             "/System/Library/PrivateFrameworks",
+             "/bin/sh",
+             "/bin/bash",
+             "/private/tmp",
+             "/private/var/tmp",
+             "/usr/lib",
+         }) {
+        sandboxPaths.get().insert_or_assign(std::string{p}, ChrootPath{.source = std::string{p}});
+    }
+    allowedImpureHostPrefixes = std::set<std::filesystem::path>{"/System/Library", "/usr/lib", "/dev", "/bin/sh"};
+#endif
+}
+
+void loadConfFile(AbstractConfig & config)
+{
+    auto applyConfigFile = [&](const std::filesystem::path & path) {
+        try {
+            std::string contents = readFile(path);
+            config.applyConfig(contents, path.string());
+        } catch (SystemError &) {
+        }
+    };
+
+    applyConfigFile(nixConfFile());
+
+    /* We only want to send overrides to the daemon, i.e. stuff from
+       ~/.nix/nix.conf or the command line. */
+    config.resetOverridden();
+
+    auto files = nixUserConfFiles();
+    for (auto file = files.rbegin(); file != files.rend(); file++) {
+        applyConfigFile(file->string());
+    }
+
+    auto nixConfEnv = getEnv("NIX_CONFIG");
+    if (nixConfEnv.has_value()) {
+        config.applyConfig(nixConfEnv.value(), "NIX_CONFIG");
+    }
+}
+
+/**
+ * On Windows, NIX_CONF_DIR (and other directories like NIX_STATE_DIR, NIX_LOG_DIR)
+ * are not defined at compile time, so we determine paths at runtime using the
+ * Windows known folders API (FOLDERID_ProgramData). This allows Nix to work
+ * correctly regardless of which drive Windows is installed on.
+ */
+const std::filesystem::path & nixConfDir()
+{
+    static const std::filesystem::path dir = getEnvOsNonEmpty(OS_STR("NIX_CONF_DIR"))
+                                                 .transform([](auto && s) { return std::filesystem::path(s); })
+                                                 .or_else([]() -> std::optional<std::filesystem::path> {
+#ifdef _WIN32
+#  ifdef NIX_CONF_DIR
+#    error "NIX_CONF_DIR should not be defined on Windows"
+#  endif
+                                                     return windows::known_folders::getProgramData() / "nix" / "conf";
+#else
+                                                     return NIX_CONF_DIR;
+#endif
+                                                 })
+                                                 .transform([](auto && s) { return canonPath(s); })
+                                                 .value();
+    return dir;
+}
+
+const std::vector<std::filesystem::path> & nixUserConfFiles()
+{
+    static const std::vector<std::filesystem::path> files = [] {
+        // Use the paths specified in NIX_USER_CONF_FILES if it has been defined
+        auto nixConfFiles = getEnvOs(OS_STR("NIX_USER_CONF_FILES"));
+        if (nixConfFiles.has_value()) {
+            return ExecutablePath::parse(*nixConfFiles).directories;
+        }
+
+        // Use the paths specified by the XDG spec
+        std::vector<std::filesystem::path> files;
+        auto dirs = getConfigDirs();
+        for (auto & dir : dirs) {
+            files.insert(files.end(), dir / "nix.conf");
+        }
+        return files;
+    }();
+    return files;
+}
+
+unsigned int Settings::getDefaultCores()
+{
+    const unsigned int concurrency = std::max(1U, std::thread::hardware_concurrency());
+    const unsigned int maxCPU = getMaxCPU();
+
+    if (maxCPU > 0)
+        return maxCPU;
+    else
+        return concurrency;
+}
+
+#ifdef __APPLE__
+static bool hasVirt()
+{
+
+    int hasVMM;
+    int hvSupport;
+    size_t size;
+
+    size = sizeof(hasVMM);
+    if (sysctlbyname("kern.hv_vmm_present", &hasVMM, &size, NULL, 0) == 0) {
+        if (hasVMM)
+            return false;
+    }
+
+    // whether the kernel and hardware supports virt
+    size = sizeof(hvSupport);
+    if (sysctlbyname("kern.hv_support", &hvSupport, &size, NULL, 0) == 0) {
+        return hvSupport == 1;
+    } else {
+        return false;
+    }
+}
+#endif
+
+StringSet Settings::getDefaultSystemFeatures()
+{
+    /* For backwards compatibility, accept some "features" that are
+       used in Nixpkgs to route builds to certain machines but don't
+       actually require anything special on the machines. */
+    StringSet features{"nixos-test", "benchmark", "big-parallel"};
+
+#ifdef __linux__
+    features.insert("uid-range");
+#endif
+
+#ifdef __linux__
+    if (access("/dev/kvm", R_OK | W_OK) == 0)
+        features.insert("kvm");
+#endif
+
+#ifdef __APPLE__
+    if (hasVirt())
+        features.insert("apple-virt");
+#endif
+
+    return features;
+}
+
+StringSet Settings::getDefaultExtraPlatforms()
+{
+    StringSet extraPlatforms;
+
+    if (std::string{NIX_LOCAL_SYSTEM} == "x86_64-linux" && !isWSL1())
+        extraPlatforms.insert("i686-linux");
+
+#ifdef __linux__
+    StringSet levels = computeLevels();
+    for (auto iter = levels.begin(); iter != levels.end(); ++iter)
+        extraPlatforms.insert(*iter + "-linux");
+#elif defined(__APPLE__)
+    // Rosetta 2 emulation layer can run x86_64 binaries on aarch64
+    // machines. Note that we can’t force processes from executing
+    // x86_64 in aarch64 environments or vice versa since they can
+    // always exec with their own binary preferences.
+    //
+    // The runtime file exists iff Rosetta 2 is installed; checking it avoids
+    // spawning a subprocess during static initialization of `settings`.
+    if (std::string{NIX_LOCAL_SYSTEM} == "aarch64-darwin"
+        && pathExists("/Library/Apple/usr/libexec/oah/libRosettaRuntime"))
+        extraPlatforms.insert("x86_64-darwin");
+#endif
+
+    return extraPlatforms;
+}
+
+bool Settings::isWSL1()
+{
+#ifdef __linux__
+    struct utsname utsbuf;
+    uname(&utsbuf);
+    // WSL1 uses -Microsoft suffix
+    // WSL2 uses -microsoft-standard suffix
+    return hasSuffix(utsbuf.release, "-Microsoft");
+#else
+    return false;
+#endif
+}
+
+const ExternalBuilder * LocalSettings::findExternalDerivationBuilderIfSupported(const BasicDerivation & drv)
+{
+    if (auto it = std::ranges::find_if(
+            externalBuilders.get(), [&](const auto & handler) { return handler.systems.contains(drv.platform); });
+        it != externalBuilders.get().end())
+        return &*it;
+    return nullptr;
+}
+
+ProfileDirsOptions Settings::getProfileDirsOptions() const
+{
+    return {
+        .nixStateDir = nixStateDir,
+        .useXDGBaseDirectories = useXDGBaseDirectories,
+    };
+}
+
+std::string nixVersion = PACKAGE_VERSION;
+
+NLOHMANN_JSON_SERIALIZE_ENUM(
+    SandboxMode,
+    {
+        {SandboxMode::smEnabled, true},
+        {SandboxMode::smRelaxed, "relaxed"},
+        {SandboxMode::smDisabled, false},
+    });
+
+template<>
+SandboxMode BaseSetting<SandboxMode>::parse(const std::string & str) const
+{
+    if (str == "true")
+        return smEnabled;
+    else if (str == "relaxed")
+        return smRelaxed;
+    else if (str == "false")
+        return smDisabled;
+    else
+        throw UsageError("option '%s' has invalid value '%s'", name, str);
+}
+
+template<>
+struct BaseSetting<SandboxMode>::trait
+{
+    static constexpr bool appendable = false;
+};
+
+template<>
+std::string BaseSetting<SandboxMode>::to_string() const
+{
+    if (value == smEnabled)
+        return "true";
+    else if (value == smRelaxed)
+        return "relaxed";
+    else if (value == smDisabled)
+        return "false";
+    else
+        unreachable();
+}
+
+template<>
+void BaseSetting<SandboxMode>::convertToArg(Args & args, const std::string & category)
+{
+    args.addFlag({
+        .longName = name,
+        .aliases = aliases,
+        .description = "Enable sandboxing.",
+        .category = category,
+        .handler = {[this]() { override(smEnabled); }},
+    });
+    args.addFlag({
+        .longName = "no-" + name,
+        .aliases = aliases,
+        .description = "Disable sandboxing.",
+        .category = category,
+        .handler = {[this]() { override(smDisabled); }},
+    });
+    args.addFlag({
+        .longName = "relaxed-" + name,
+        .aliases = aliases,
+        .description = "Enable sandboxing, but allow builds to disable it.",
+        .category = category,
+        .handler = {[this]() { override(smRelaxed); }},
+    });
+}
+
+void to_json(nlohmann::json & j, const ChrootPath & cp)
+{
+    j = nlohmann::json{{"source", cp.source.string()}, {"optional", cp.optional}};
+}
+
+void from_json(const nlohmann::json & j, ChrootPath & cp)
+{
+    cp.source = j.at("source").get<std::string>();
+    cp.optional = j.at("optional").get<bool>();
+}
+
+template<>
+PathsInChroot BaseSetting<PathsInChroot>::parse(const std::string & str) const
+{
+    PathsInChroot pathsInChroot;
+    for (auto i : tokenizeString<StringSet>(str)) {
+        if (i.empty())
+            continue;
+        bool optional = false;
+        if (i[i.size() - 1] == '?') {
+            optional = true;
+            i.pop_back();
+        }
+        size_t p = i.find('=');
+        std::string inside, outside;
+        if (p == std::string::npos) {
+            inside = i;
+            outside = i;
+        } else {
+            inside = i.substr(0, p);
+            outside = i.substr(p + 1);
+        }
+        pathsInChroot[inside] = {.source = outside, .optional = optional};
+    }
+    return pathsInChroot;
+}
+
+template<>
+std::string BaseSetting<PathsInChroot>::to_string() const
+{
+    std::vector<std::string> accum;
+    for (auto & [name, cp] : value) {
+        auto nameStr = name.string();
+        auto sourceStr = cp.source.string();
+        std::string s = name == cp.source ? nameStr : nameStr + "=" + sourceStr;
+        if (cp.optional)
+            s += "?";
+        accum.push_back(std::move(s));
+    }
+    return concatStringsSep(" ", accum);
+}
+
+unsigned int MaxBuildJobsSetting::parse(const std::string & str) const
+{
+    if (str == "auto")
+        return std::max(1U, std::thread::hardware_concurrency());
+    else {
+        if (auto n = string2Int<decltype(value)>(str))
+            return *n;
+        else
+            throw UsageError("configuration setting '%s' should be 'auto' or an integer", name);
+    }
+}
+
+template<>
+LocalSettings::ExternalBuilders BaseSetting<LocalSettings::ExternalBuilders>::parse(const std::string & str) const
+{
+    try {
+        return nlohmann::json::parse(str).template get<LocalSettings::ExternalBuilders>();
+    } catch (std::exception & e) {
+        throw UsageError("parsing setting '%s': %s", name, e.what());
+    }
+}
+
+template<>
+std::string BaseSetting<LocalSettings::ExternalBuilders>::to_string() const
+{
+    return nlohmann::json(value).dump();
+}
+
+template<>
+void BaseSetting<PathsInChroot>::appendOrSet(PathsInChroot newValue, bool append)
+{
+    if (!append)
+        value.clear();
+    value.insert(std::make_move_iterator(newValue.begin()), std::make_move_iterator(newValue.end()));
+}
+
+template<>
+struct BaseSetting<std::vector<StoreReference>>::trait
+{
+    static constexpr bool appendable = true;
+};
+
+template<>
+struct BaseSetting<std::set<StoreReference>>::trait
+{
+    static constexpr bool appendable = true;
+};
+
+template<>
+StoreReference BaseSetting<StoreReference>::parse(const std::string & str) const
+{
+    return StoreReference::parse(str);
+}
+
+template<>
+std::string BaseSetting<StoreReference>::to_string() const
+{
+    return value.render();
+}
+
+template<>
+std::vector<StoreReference> BaseSetting<std::vector<StoreReference>>::parse(const std::string & str) const
+{
+    std::vector<StoreReference> res;
+    for (const auto & s : tokenizeString<Strings>(str))
+        res.push_back(StoreReference::parse(s));
+    return res;
+}
+
+template<>
+std::string BaseSetting<std::vector<StoreReference>>::to_string() const
+{
+    Strings ss;
+    for (const auto & ref : value)
+        ss.push_back(ref.render());
+    return concatStringsSep(" ", ss);
+}
+
+template<>
+void BaseSetting<std::vector<StoreReference>>::appendOrSet(std::vector<StoreReference> newValue, bool append)
+{
+    if (append)
+        value.insert(value.end(), std::make_move_iterator(newValue.begin()), std::make_move_iterator(newValue.end()));
+    else
+        value = std::move(newValue);
+}
+
+template<>
+std::set<StoreReference> BaseSetting<std::set<StoreReference>>::parse(const std::string & str) const
+{
+    std::set<StoreReference> res;
+    for (const auto & s : tokenizeString<Strings>(str))
+        res.insert(StoreReference::parse(s));
+    return res;
+}
+
+template<>
+std::string BaseSetting<std::set<StoreReference>>::to_string() const
+{
+    Strings ss;
+    for (const auto & ref : value)
+        ss.push_back(ref.render());
+    return concatStringsSep(" ", ss);
+}
+
+template<>
+void BaseSetting<std::set<StoreReference>>::appendOrSet(std::set<StoreReference> newValue, bool append)
+{
+    if (append)
+        value.insert(std::make_move_iterator(newValue.begin()), std::make_move_iterator(newValue.end()));
+    else
+        value = std::move(newValue);
+}
+
+template class BaseSetting<StoreReference>;
+template class BaseSetting<std::vector<StoreReference>>;
+template class BaseSetting<std::set<StoreReference>>;
+
+static void preloadNSS()
+{
+    /* builtin:fetchurl can trigger a DNS lookup, which with glibc can trigger a dynamic library load of
+       one of the glibc NSS libraries in a sandboxed child, which will fail unless the library's already
+       been loaded in the parent. So we force a lookup of an invalid domain to force the NSS machinery to
+       load its lookup libraries in the parent before any child gets a chance to. */
+    static std::once_flag dns_resolve_flag;
+
+    std::call_once(dns_resolve_flag, []() {
+#ifdef __GLIBC__
+        /* On linux, glibc will run every lookup through the nss layer.
+         * That means every lookup goes, by default, through nscd, which acts as a local
+         * cache.
+         * Because we run builds in a sandbox, we also remove access to nscd otherwise
+         * lookups would leak into the sandbox.
+         *
+         * But now we have a new problem, we need to make sure the nss_dns backend that
+         * does the dns lookups when nscd is not available is loaded or available.
+         *
+         * We can't make it available without leaking nix's environment, so instead we'll
+         * load the backend, and configure nss so it does not try to run dns lookups
+         * through nscd.
+         *
+         * This is technically only used for builtins:fetch* functions so we only care
+         * about dns.
+         *
+         * All other platforms are unaffected.
+         */
+        if (!dlopen(LIBNSS_DNS_SO, RTLD_NOW))
+            warn("unable to load nss_dns backend");
+        // FIXME: get hosts entry from nsswitch.conf.
+        __nss_configure_lookup("hosts", "files dns");
+#endif
+    });
+}
+
+static bool initLibStoreDone = false;
+
+void assertLibStoreInitialized()
+{
+    if (!initLibStoreDone) {
+        printError("The program must call nix::initNix() before calling any libstore library functions.");
+        abort();
+    };
+}
+
+void initLibStore(bool loadConfig)
+{
+    if (initLibStoreDone)
+        return;
+
+    initLibUtil();
+
+    if (loadConfig)
+        loadConfFile(globalConfig);
+
+    preloadNSS();
+
+    /* Because of an objc quirk[1], calling curl_global_init for the first time
+       after fork() will always result in a crash.
+       Up until now the solution has been to set OBJC_DISABLE_INITIALIZE_FORK_SAFETY
+       for every nix process to ignore that error.
+       Instead of working around that error we address it at the core -
+       by calling curl_global_init here, which should mean curl will already
+       have been initialized by the time we try to do so in a forked process.
+
+       [1]
+       https://github.com/apple-oss-distributions/objc4/blob/01edf1705fbc3ff78a423cd21e03dfc21eb4d780/runtime/objc-initialize.mm#L614-L636
+    */
+    curl_global_init(CURL_GLOBAL_ALL);
+#ifdef __APPLE__
+    /* On macOS, don't use the per-session TMPDIR (as set e.g. by
+       sshd). This breaks build users because they don't have access
+       to the TMPDIR, in particular in ‘nix-store --serve’. */
+    if (hasPrefix(defaultTempDir().string(), "/var/folders/"))
+        unsetenv("TMPDIR");
+#endif
+
+    initLibStoreDone = true;
+}
+
+} // namespace nix

@@ -1,0 +1,24 @@
+{
+  "entries": {
+    "bar": {
+      "entries": {
+        "baz": {
+          "executable": true,
+          "size": 19,
+          "type": "regular"
+        },
+        "quux": {
+          "target": "/over/there",
+          "type": "symlink"
+        }
+      },
+      "type": "directory"
+    },
+    "foo": {
+      "executable": false,
+      "size": 15,
+      "type": "regular"
+    }
+  },
+  "type": "directory"
+}

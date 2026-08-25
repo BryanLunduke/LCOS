@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+
+source common.sh
+
+echo "building test path"
+storePath="$(nix-build nar-access.nix -A a --no-out-link)"
+
+cd "$TEST_ROOT"
+
+# Dump path to nar.
+narFile="$TEST_ROOT/path.nar"
+nix-store --dump "$storePath" > "$narFile"
+
+# Check that find and nar ls match.
+( cd "$storePath"; find . | sort ) > files.find
+nix nar ls -R -d "$narFile" "" | sort > files.ls-nar
+diff -u files.find files.ls-nar
+
+# Check that file contents of data match.
+nix nar cat "$narFile" /foo/data > data.cat-nar
+diff -u data.cat-nar "$storePath/foo/data"
+
+# Check that file contents of baz match.
+nix nar cat "$narFile" /foo/baz > baz.cat-nar
+diff -u baz.cat-nar "$storePath/foo/baz"
+nix nar cat /dev/stdin /foo/baz < "$narFile" > baz.cat-nar-pipe
+expect 1 nix nar cat "$narFile" /foo/baz/doesntexist 2>&1 | grep "NAR does not contain regular file '/foo/baz/doesntexist'"
+
+nix store cat "$storePath/foo/baz" > baz.cat-nar
+diff -u baz.cat-nar "$storePath/foo/baz"
+
+TODO_NixOS
+
+# Check that 'nix store cat' fails on invalid store paths.
+invalidPath="$(dirname "$storePath")/99999999999999999999999999999999-foo"
+cp -r "$storePath" "$invalidPath"
+expect 1 nix store cat "$invalidPath/foo/baz"
+
+# Test --json.
+
+# Shallow listing of root (no --recursive)
+diff -u \
+    <(nix nar ls --json "$narFile" / | jq -S) \
+    <(jq -S <<'EOF'
+{
+  "type": "directory",
+  "entries": {
+    "foo": {},
+    "foo-x": {},
+    "qux": {},
+    "zyx": {}
+  }
+}
+EOF
+    )
+
+# Recursive listing of /foo from NAR (includes narOffset)
+diff -u \
+    <(nix nar ls --json -R "$narFile" /foo | jq -S) \
+    <(jq -S <<'EOF'
+{
+  "type": "directory",
+  "entries": {
+    "bar": {
+      "type": "regular",
+      "executable": false,
+      "size": 0,
+      "narOffset": 368
+    },
+    "baz": {
+      "type": "regular",
+      "executable": false,
+      "size": 0,
+      "narOffset": 552
+    },
+    "data": {
+      "type": "regular",
+      "executable": false,
+      "size": 58,
+      "narOffset": 736
+    }
+  }
+}
+EOF
+    )
+
+# Single file from NAR
+diff -u \
+    <(nix nar ls --json -R "$narFile" /foo/bar | jq -S) \
+    <(jq -S <<'EOF'
+{
+  "type": "regular",
+  "executable": false,
+  "size": 0,
+  "narOffset": 368
+}
+EOF
+    )
+
+# Shallow listing from store
+diff -u \
+    <(nix store ls --json "$storePath" | jq -S) \
+    <(jq -S <<'EOF'
+{
+  "type": "directory",
+  "entries": {
+    "foo": {},
+    "foo-x": {},
+    "qux": {},
+    "zyx": {}
+  }
+}
+EOF
+    )
+
+# Recursive listing from store (no narOffset)
+diff -u \
+    <(nix store ls --json -R "$storePath/foo" | jq -S) \
+    <(jq -S <<'EOF'
+{
+  "type": "directory",
+  "entries": {
+    "bar": {
+      "type": "regular",
+      "executable": false,
+      "size": 0
+    },
+    "baz": {
+      "type": "regular",
+      "executable": false,
+      "size": 0
+    },
+    "data": {
+      "type": "regular",
+      "executable": false,
+      "size": 58
+    }
+  }
+}
+EOF
+    )
+
+# Single file from store
+diff -u \
+    <(nix store ls --json -R "$storePath/foo/bar" | jq -S) \
+    <(jq -S <<'EOF'
+{
+  "type": "regular",
+  "executable": false,
+  "size": 0
+}
+EOF
+    )
+
+# Test missing files.
+expect 1 nix store ls --json -R "$storePath/xyzzy" 2>&1 | grep 'does not exist'
+expect 1 nix store ls "$storePath/xyzzy" 2>&1 | grep 'does not exist'
+
+# Test failure to dump.
+if nix-store --dump "$storePath" >/dev/full ; then
+    echo "dumping to /dev/full should fail"
+    exit 1
+fi

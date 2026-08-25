@@ -1,0 +1,28 @@
+#pragma once
+
+#include "nix/expr/value.hh"
+#include "nix/expr/symbol-table.hh"
+
+namespace nix {
+
+class EvalState;
+
+/**
+ * Print a value in the deprecated format used by `nix-instantiate --eval` and
+ * `nix-env` (for manifests).
+ *
+ * This output can't be changed because it's part of the `nix-instantiate` API,
+ * but it produces ambiguous output; unevaluated thunks and lambdas (and a few
+ * other types) are printed as Nix path syntax like `<CODE>`.
+ *
+ * See: https://github.com/NixOS/nix/issues/9730
+ */
+void printAmbiguous(
+    EvalState & state,
+    Value & v,
+    std::ostream & str,
+    std::set<const void *> * seen,
+    NixStringContext * context = nullptr,
+    size_t depth = 0);
+
+} // namespace nix

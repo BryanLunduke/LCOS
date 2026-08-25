@@ -1,0 +1,608 @@
+{
+  lib,
+  pkgs,
+  src,
+  officialRelease,
+  maintainers,
+}:
+
+scope:
+
+let
+  inherit (scope)
+    callPackage
+    ;
+  inherit
+    (scope.callPackage (
+      { stdenv }:
+      {
+        inherit stdenv;
+      }
+    ) { })
+    stdenv
+    ;
+  inherit (pkgs.buildPackages)
+    meson
+    ninja
+    pkg-config
+    ;
+
+  baseVersion = lib.fileContents ../.version;
+
+  versionSuffix = lib.optionalString (!officialRelease) "pre";
+
+  fineVersionSuffix =
+    lib.optionalString (!officialRelease)
+      "pre${
+        builtins.substring 0 8 (src.lastModifiedDate or src.lastModified or "19700101")
+      }_${src.shortRev or "dirty"}";
+
+  fineVersion = baseVersion + fineVersionSuffix;
+
+  root = ../.;
+
+  # Indirection for Nixpkgs to override when package.nix files are vendored
+  filesetToSource = lib.fileset.toSource;
+
+  /**
+    Given a stdenv and set of layers, create a mkDerivation-like function
+  */
+  mkPackageBuilderFor =
+    stdenv': exts: userFn:
+    stdenv'.mkDerivation (lib.extends (lib.composeManyExtensions exts) userFn);
+
+  mkPackageBuilder = mkPackageBuilderFor stdenv;
+
+  setVersionLayer = finalAttrs: prevAttrs: {
+    preConfigure =
+      prevAttrs.preConfigure or ""
+      +
+      # Update the repo-global .version file.
+      # Symlink ./.version points there, but by default only workDir is writable.
+      ''
+        chmod u+w ./.version
+        echo ${finalAttrs.version} > ./.version
+      '';
+  };
+
+  localSourceLayer =
+    finalAttrs: prevAttrs:
+    let
+      workDirPath =
+        # Ideally we'd pick finalAttrs.workDir, but for now `mkDerivation` has
+        # the requirement that everything except passthru and meta must be
+        # serialized by mkDerivation, which doesn't work for this.
+        prevAttrs.workDir;
+
+      workDirSubpath = lib.path.removePrefix root workDirPath;
+      sources =
+        assert prevAttrs.fileset._type == "fileset";
+        prevAttrs.fileset;
+      src = lib.fileset.toSource {
+        fileset = sources;
+        inherit root;
+      };
+
+    in
+    {
+      sourceRoot = "${src.name}/" + workDirSubpath;
+      inherit src;
+
+      # Clear what `derivation` can't/shouldn't serialize; see prevAttrs.workDir.
+      fileset = null;
+      workDir = null;
+    };
+
+  resolveRelPath = p: lib.path.removePrefix root p;
+
+  makeFetchedSourceLayer =
+    finalScope: finalAttrs: prevAttrs:
+    let
+      workDirPath =
+        # Ideally we'd pick finalAttrs.workDir, but for now `mkDerivation` has
+        # the requirement that everything except passthru and meta must be
+        # serialized by mkDerivation, which doesn't work for this.
+        prevAttrs.workDir;
+
+      workDirSubpath = resolveRelPath workDirPath;
+
+    in
+    {
+      sourceRoot = "${finalScope.patchedSrc.name}/" + workDirSubpath;
+      src = finalScope.patchedSrc;
+      version =
+        let
+          n = lib.length finalScope.patches;
+        in
+        if n == 0 then prevAttrs.version else prevAttrs.version + "+${toString n}";
+
+      # Clear what `derivation` can't/shouldn't serialize; see prevAttrs.workDir.
+      fileset = null;
+      workDir = null;
+    };
+
+  mesonLayer = finalAttrs: prevAttrs: {
+    # NOTE:
+    # As of https://github.com/NixOS/nixpkgs/blob/8baf8241cea0c7b30e0b8ae73474cb3de83c1a30/pkgs/by-name/me/meson/setup-hook.sh#L26,
+    # `mesonBuildType` defaults to `plain` if not specified. We want our Nix-built binaries to be optimized by default.
+    # More on build types here: https://mesonbuild.com/Builtin-options.html#details-for-buildtype.
+    mesonBuildType = "release";
+    # NOTE:
+    # Users who are debugging Nix builds are expected to set the environment variable `mesonBuildType`, per the
+    # guidance in https://github.com/NixOS/nix/blob/8a3fc27f1b63a08ac983ee46435a56cf49ebaf4a/doc/manual/source/development/debugging.md?plain=1#L10.
+    # For this reason, we don't want to refer to `finalAttrs.mesonBuildType` here, but rather use the environment variable.
+    preConfigure =
+      prevAttrs.preConfigure or ""
+      +
+        lib.optionalString
+          (
+            !(stdenv.hostPlatform.isWindows || stdenv.hostPlatform.isCygwin)
+            # build failure
+            && !stdenv.hostPlatform.isStatic
+          )
+          ''
+            case "$mesonBuildType" in
+            release|minsize) appendToVar mesonFlags "-Db_lto=true"  ;;
+            *)               appendToVar mesonFlags "-Db_lto=false" ;;
+            esac
+          '';
+    nativeBuildInputs = [
+      meson
+      ninja
+    ]
+    ++ prevAttrs.nativeBuildInputs or [ ];
+    mesonFlags =
+      prevAttrs.mesonFlags or [ ]
+      ++ (lib.optionals scope.withUnityBuild [
+        "-Dunity=on"
+        "-Dunity_size=8192"
+        "-Db_pch=false"
+      ]);
+    mesonCheckFlags = prevAttrs.mesonCheckFlags or [ ] ++ [
+      "--print-errorlogs"
+    ];
+  };
+
+  mesonBuildLayer = finalAttrs: prevAttrs: rec {
+    nativeBuildInputs = prevAttrs.nativeBuildInputs or [ ] ++ [
+      pkg-config
+    ];
+    separateDebugInfo = !stdenv.hostPlatform.isStatic;
+    # needed by separateDebugInfo
+    # SEE: https://github.com/NixOS/nixpkgs/pull/394674/commits/a4d355342976e9e9823fb94f133bc43ebec9da5b
+    __structuredAttrs = separateDebugInfo;
+  };
+
+  mesonLibraryLayer = finalAttrs: prevAttrs: {
+    preConfigure =
+      let
+        interpositionFlags = [
+          "-fno-semantic-interposition"
+          "-Wl,-Bsymbolic-functions"
+        ];
+      in
+      # NOTE: By default GCC disables interprocedular optimizations (in particular inlining) for
+      # position-independent code and thus shared libraries.
+      # Since LD_PRELOAD tricks aren't worth losing out on optimizations, we disable it for good.
+      # This is not the case for Clang, where inlining is done by default even without -fno-semantic-interposition.
+      # https://reviews.llvm.org/D102453
+      # https://fedoraproject.org/wiki/Changes/PythonNoSemanticInterpositionSpeedup
+      prevAttrs.preConfigure or ""
+      + lib.optionalString stdenv.cc.isGNU ''
+        export CFLAGS="''${CFLAGS:-} ${toString interpositionFlags}"
+        export CXXFLAGS="''${CXXFLAGS:-} ${toString interpositionFlags}"
+      '';
+    outputs = prevAttrs.outputs or [ "out" ] ++ [ "dev" ];
+  };
+
+  fixupStaticLayer = finalAttrs: prevAttrs: {
+    postFixup =
+      prevAttrs.postFixup or ""
+      + lib.optionalString (stdenv.hostPlatform.isStatic) ''
+        # HACK: Otherwise the result will have the entire buildInputs closure
+        # injected by the pkgsStatic stdenv
+        # <https://github.com/NixOS/nixpkgs/issues/83667>
+        rm -f $out/nix-support/propagated-build-inputs
+      '';
+  };
+
+  # Work around weird `--as-needed` linker behavior with BSD, see
+  # https://github.com/mesonbuild/meson/issues/3593
+  bsdNoLinkAsNeeded =
+    finalAttrs: prevAttrs:
+    lib.optionalAttrs stdenv.hostPlatform.isBSD {
+      mesonFlags = [ (lib.mesonBool "b_asneeded" false) ] ++ prevAttrs.mesonFlags or [ ];
+    };
+
+  enableSanitizersLayer =
+    finalAttrs: prevAttrs:
+    let
+      sanitizers =
+        lib.optional scope.withASan "address"
+        ++ lib.optional scope.withUBSan "undefined"
+        ++ lib.optional scope.withTSan "thread"
+        ++ lib.optional scope.withFuzzer "fuzzer-no-link";
+    in
+    # Thread sanitizer can't be used with ASan or UBSan
+    assert scope.withTSan -> !(scope.withASan || scope.withUBSan);
+    {
+      mesonFlags =
+        (prevAttrs.mesonFlags or [ ])
+        ++ lib.optionals (lib.length sanitizers > 0) (
+          [
+            (lib.mesonOption "b_sanitize" (lib.concatStringsSep "," sanitizers))
+          ]
+          ++ (lib.optionals stdenv.cc.isClang [
+            # https://www.github.com/mesonbuild/meson/issues/764
+            (lib.mesonBool "b_lundef" false)
+          ])
+        );
+    };
+
+  enableClangTidyLayer =
+    finalAttrs: prevAttrs:
+    lib.optionalAttrs scope.withClangTidy {
+      nativeBuildInputs = (prevAttrs.nativeBuildInputs or [ ]) ++ [
+        pkgs.buildPackages.llvmPackages.clang-tools # provides run-clang-tidy
+      ];
+
+      buildInputs = (prevAttrs.buildInputs or [ ]) ++ [
+        scope.nix-clang-tidy-plugin # provides nix-clang-tidy.pc with plugin_path
+      ];
+
+      # Use debug build for faster compilation (no optimizations)
+      mesonBuildType = "debug";
+
+      # Skip tests - we only care about clang-tidy results
+      doCheck = false;
+
+      # Run clang-tidy after the normal build
+      postBuild = (prevAttrs.postBuild or "") + ''
+        echo "Running clang-tidy on ${finalAttrs.pname}..."
+        ninja clang-tidy
+      '';
+    };
+
+  nixDefaultsLayer = finalAttrs: prevAttrs: {
+    strictDeps = prevAttrs.strictDeps or true;
+    enableParallelBuilding = true;
+    pos = builtins.unsafeGetAttrPos "pname" prevAttrs;
+    meta = prevAttrs.meta or { } // {
+      homepage = prevAttrs.meta.homepage or "https://nixos.org/nix";
+      longDescription =
+        prevAttrs.longDescription or ''
+          Nix is a powerful package manager for mainly Linux and other Unix systems that
+          makes package management reliable and reproducible. It provides atomic
+          upgrades and rollbacks, side-by-side installation of multiple versions of
+          a package, multi-user package management and easy setup of build
+          environments.
+        '';
+      license = prevAttrs.meta.license or lib.licenses.lgpl21Plus;
+      maintainers = prevAttrs.meta.maintainers or [ ] ++ scope.maintainers;
+      platforms = prevAttrs.meta.platforms or (lib.platforms.unix ++ lib.platforms.windows);
+    };
+  };
+
+  /**
+    Append patches to the source layer.
+  */
+  appendPatches =
+    scope: patches:
+    scope.overrideScope (
+      finalScope: prevScope: {
+        patches = prevScope.patches ++ patches;
+      }
+    );
+
+in
+
+# This becomes the pkgs.nixComponents attribute set
+{
+  version = baseVersion + versionSuffix;
+  inherit versionSuffix;
+  inherit officialRelease;
+  inherit maintainers;
+
+  inherit filesetToSource;
+
+  /**
+    Whether meson components are built with [AddressSanitizer](https://clang.llvm.org/docs/AddressSanitizer.html).
+  */
+  withASan = false;
+
+  /**
+    Whether meson components are built with [UndefinedBehaviorSanitizer](https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html).
+  */
+  withUBSan = false;
+
+  /**
+    Whether meson components are built with [ThreadSanitizer](https://clang.llvm.org/docs/ThreadSanitizer.html).
+  */
+  withTSan = false;
+
+  /**
+    Whether meson components are built with [libFuzzer instrumentation](https://llvm.org/docs/LibFuzzer.html).
+  */
+  withFuzzer = false;
+
+  /**
+    Whether to build unit-test executables in Meson test components.
+  */
+  withUnitTests = true;
+
+  /**
+    Whether to build the libFuzzer targets in Meson test components.
+  */
+  withFuzzTargets = false;
+
+  /**
+    Whether meson components are checked with [clang-tidy](https://clang.llvm.org/extra/clang-tidy/).
+  */
+  withClangTidy = false;
+
+  /**
+    Whether to use [unity builds](https://mesonbuild.com/Unity-builds.html#unity-builds).
+  */
+  withUnityBuild = true;
+
+  /**
+    Whether to embed the public C API into nix-cli so plugins can resolve those symbols from the executable.
+  */
+  withPluginCAPI = !(stdenv.hostPlatform.isWindows || stdenv.hostPlatform.isStatic);
+
+  /**
+    A user-provided extension function to apply to each component derivation.
+  */
+  mesonComponentOverrides = finalAttrs: prevAttrs: { };
+
+  /**
+    An overridable derivation layer for handling the sources.
+  */
+  sourceLayer = localSourceLayer;
+
+  /**
+    Resolve a path value to either itself or a path in the `src`, depending
+    whether `overrideSource` was called.
+  */
+  resolvePath = p: p;
+
+  /**
+    Apply an extension function (i.e. overlay-shaped) to all component derivations.
+  */
+  overrideAllMesonComponents =
+    f:
+    scope.overrideScope (
+      finalScope: prevScope: {
+        mesonComponentOverrides = lib.composeExtensions scope.mesonComponentOverrides f;
+      }
+    );
+
+  /**
+    Provide an alternate source. This allows the expressions to be vendored without copying the sources,
+    but it does make the build non-granular; all components will use a complete source.
+
+    Packaging expressions will be ignored.
+
+    Single argument: the source to use.
+
+    See also `appendPatches`
+  */
+  overrideSource =
+    src:
+    scope.overrideScope (
+      finalScope: prevScope: {
+        sourceLayer = makeFetchedSourceLayer finalScope;
+        /**
+          Unpatched source for the build of Nix. Packaging expressions will be ignored.
+        */
+        src = src;
+        /**
+          Patches for the whole Nix source. Changes to packaging expressions will be ignored.
+        */
+        patches = [ ];
+        /**
+          Fetched and patched source to be used in component derivations.
+        */
+        patchedSrc =
+          if finalScope.patches == [ ] then
+            src
+          else
+            pkgs.buildPackages.srcOnly (
+              pkgs.buildPackages.stdenvNoCC.mkDerivation {
+                name = "${finalScope.src.name or "nix-source"}-patched";
+                inherit (finalScope) src patches;
+              }
+            );
+        resolvePath = p: finalScope.patchedSrc + "/${resolveRelPath p}";
+        filesetToSource = { root, fileset }: finalScope.resolvePath root;
+        appendPatches = appendPatches finalScope;
+      }
+    );
+
+  /**
+    Append patches to be applied to the whole Nix source.
+    This affects all components.
+
+    Changes to the packaging expressions will be ignored.
+  */
+  appendPatches =
+    patches:
+    # switch to "fetched" source first, so that patches apply to the whole tree.
+    (scope.overrideSource "${./..}").appendPatches patches;
+
+  mkMesonDerivation = mkPackageBuilder [
+    nixDefaultsLayer
+    scope.sourceLayer
+    setVersionLayer
+    mesonLayer
+    fixupStaticLayer
+    enableSanitizersLayer
+    scope.mesonComponentOverrides
+  ];
+  mkMesonExecutable = mkPackageBuilder [
+    nixDefaultsLayer
+    bsdNoLinkAsNeeded
+    scope.sourceLayer
+    setVersionLayer
+    mesonLayer
+    mesonBuildLayer
+    fixupStaticLayer
+    enableSanitizersLayer
+    enableClangTidyLayer
+    scope.mesonComponentOverrides
+  ];
+  mkMesonLibrary = mkPackageBuilder [
+    nixDefaultsLayer
+    bsdNoLinkAsNeeded
+    scope.sourceLayer
+    mesonLayer
+    setVersionLayer
+    mesonBuildLayer
+    mesonLibraryLayer
+    fixupStaticLayer
+    enableSanitizersLayer
+    enableClangTidyLayer
+    scope.mesonComponentOverrides
+  ];
+
+  nix-util = callPackage ../src/libutil/package.nix { };
+  nix-util-c = callPackage ../src/libutil-c/package.nix { };
+  nix-util-test-support = callPackage ../src/libutil-test-support/package.nix { };
+  nix-util-tests = callPackage ../src/libutil-tests/package.nix { };
+
+  nix-store = callPackage ../src/libstore/package.nix { };
+  nix-store-c = callPackage ../src/libstore-c/package.nix { };
+  nix-store-test-support = callPackage ../src/libstore-test-support/package.nix { };
+  nix-store-tests = callPackage ../src/libstore-tests/package.nix { };
+
+  nix-fetchers = callPackage ../src/libfetchers/package.nix { };
+  nix-fetchers-c = callPackage ../src/libfetchers-c/package.nix { };
+  nix-fetchers-tests = callPackage ../src/libfetchers-tests/package.nix { };
+
+  nix-expr = callPackage ../src/libexpr/package.nix { };
+  nix-expr-c = callPackage ../src/libexpr-c/package.nix { };
+  nix-expr-test-support = callPackage ../src/libexpr-test-support/package.nix { };
+  nix-expr-tests = callPackage ../src/libexpr-tests/package.nix { };
+
+  nix-flake = callPackage ../src/libflake/package.nix { };
+  nix-flake-c = callPackage ../src/libflake-c/package.nix { };
+  nix-flake-tests = callPackage ../src/libflake-tests/package.nix { };
+
+  nix-main = callPackage ../src/libmain/package.nix { };
+  nix-main-c = callPackage ../src/libmain-c/package.nix { };
+
+  nix-cmd = callPackage ../src/libcmd/package.nix { };
+
+  nix-nswrapper = callPackage ../src/nswrapper/package.nix { };
+
+  /**
+    The Nix command line interface. Note that this does not include its tests, whereas `nix-everything` does.
+  */
+  nix-cli = callPackage ../src/nix/package.nix {
+    version = fineVersion;
+  };
+
+  nix-functional-tests = callPackage ../tests/functional/package.nix {
+    version = fineVersion;
+  };
+
+  /**
+    The manual as would be published on https://nix.dev/reference/nix-manual
+  */
+  nix-manual = callPackage ../doc/manual/package.nix { version = fineVersion; };
+
+  /**
+    Manpages only (no HTML manual, no mdbook dependency)
+  */
+  nix-manual-manpages-only = callPackage ../doc/manual/package.nix {
+    version = fineVersion;
+    buildHtmlManual = false;
+  };
+
+  /**
+    Doxygen pages for C++ code
+  */
+  nix-internal-api-docs = callPackage ../src/internal-api-docs/package.nix { version = fineVersion; };
+  /**
+    Doxygen pages for the public C API
+  */
+  nix-external-api-docs = callPackage ../src/external-api-docs/package.nix { version = fineVersion; };
+
+  /**
+    JSON schema validation checks
+  */
+  nix-json-schema-checks = callPackage ../src/json-schema-checks/package.nix { };
+
+  # The clang-tidy plugin is a build-time tool loaded into clang-tidy itself,
+  # so it must be built with a clang stdenv for ABI compatibility with the
+  # clang-tidy binary from the same llvmPackages set, regardless of the
+  # scope's stdenv (which may be GCC).
+  nix-clang-tidy-plugin = callPackage ../src/clang-tidy-plugin/package.nix {
+    llvmPackages = pkgs.buildPackages.llvmPackages;
+    mkMesonDerivation = mkPackageBuilderFor pkgs.buildPackages.llvmPackages.stdenv [
+      nixDefaultsLayer
+      scope.sourceLayer
+      setVersionLayer
+      mesonLayer
+      fixupStaticLayer
+      scope.mesonComponentOverrides
+    ];
+  };
+
+  /**
+    Combined package that has the CLI, libraries, and (assuming non-cross, no overrides) it requires that all tests succeed.
+  */
+  nix-everything = callPackage ../packaging/everything.nix { } // {
+    # Note: no `passthru.overrideAllMesonComponents` etc
+    #       This would propagate into `nix.overrideAttrs f`, but then discard
+    #       `f` when `.overrideAllMesonComponents` is used.
+    #       Both "methods" should be views on the same fixpoint overriding mechanism
+    #       for that to work. For now, we intentionally don't support the broken
+    #       two-fixpoint solution.
+    /**
+      Apply an extension function (i.e. overlay-shaped) to all component derivations, and return the nix package.
+
+      Single argument: the extension function to apply (finalAttrs: prevAttrs: { ... })
+    */
+    overrideAllMesonComponents = f: (scope.overrideAllMesonComponents f).nix-everything;
+
+    /**
+      Append patches to be applied to the whole Nix source.
+      This affects all components.
+
+      Changes to the packaging expressions will be ignored.
+
+      Single argument: list of patches to apply
+
+      See also `overrideSource`
+    */
+    appendPatches = ps: (scope.appendPatches ps).nix-everything;
+
+    /**
+      Provide an alternate source. This allows the expressions to be vendored without copying the sources,
+      but it does make the build non-granular; all components will use a complete source.
+
+      Packaging expressions will be ignored.
+
+      Filesets in the packaging expressions will be ignored.
+
+      Single argument: the source to use.
+
+      See also `appendPatches`
+    */
+    overrideSource = src: (scope.overrideSource src).nix-everything;
+
+    /**
+      Override any internals of the Nix package set.
+
+      Single argument: the extension function to apply to the package set (finalScope: prevScope: { ... })
+
+      Example:
+      ```
+      overrideScope (finalScope: prevScope: { aws-crt-cpp = null; })
+      ```
+    */
+    overrideScope = f: (scope.overrideScope f).nix-everything;
+
+  };
+}

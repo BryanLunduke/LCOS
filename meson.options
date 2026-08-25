@@ -1,0 +1,50 @@
+# vim: filetype=meson
+
+option(
+  'doc-gen',
+  type : 'boolean',
+  value : false,
+  description : 'Generate documentation',
+)
+
+option(
+  'unit-tests',
+  type : 'boolean',
+  value : true,
+  description : 'Build unit tests',
+)
+
+option(
+  'fuzzers',
+  type : 'boolean',
+  value : false,
+  description : 'Build fuzz targets',
+)
+
+option(
+  'fuzzing-engine',
+  type : 'string',
+  value : '',
+  description : 'One compiler-driver argument for linking an external fuzzing engine',
+)
+
+option(
+  'functional-tests',
+  type : 'boolean',
+  value : true,
+  description : 'Build functional (E2E) tests',
+)
+
+option(
+  'benchmarks',
+  type : 'boolean',
+  value : false,
+  description : 'Build benchmarks (requires gbenchmark)',
+)
+
+option(
+  'json-schema-checks',
+  type : 'boolean',
+  value : true,
+  description : 'Check JSON schema validity of schemas and examples (requires jv)',
+)

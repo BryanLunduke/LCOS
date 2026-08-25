@@ -1,0 +1,92 @@
+#include "nix/expr/eval.hh"
+#include "nix/expr/eval-settings.hh"
+#include "nix/util/config-global.hh"
+#include "nix/cmd/command.hh"
+#include "nix/cmd/installable-value.hh"
+#include "nix/cmd/repl.hh"
+#include "nix/util/os-string.hh"
+#include "nix/util/environment-variables.hh"
+#include "self-exe.hh"
+
+namespace nix {
+
+void runNix(const std::string & program, OsStrings args)
+{
+    auto subprocessEnv = getEnvOs();
+    /* TODO: Maybe we should pass only overridden settings? */
+    subprocessEnv[OS_STR("NIX_CONFIG")] = string_to_os_string(globalConfig.toKeyValue());
+    /* FIXME: What about NIX_REMOTE? */
+    // isInteractive avoid grabling interactive commands
+    runNixBin2(program, args, /*isInteractive=*/true, subprocessEnv);
+}
+
+struct CmdRepl : RawInstallablesCommand
+{
+    CmdRepl()
+    {
+        evalSettings.pureEval = false;
+    }
+
+    /**
+     * This command is stable before the others
+     */
+    std::optional<ExperimentalFeature> experimentalFeature() override
+    {
+        return std::nullopt;
+    }
+
+    std::vector<std::string> files;
+
+    Strings getDefaultFlakeAttrPaths() override
+    {
+        return {""};
+    }
+
+    bool forceImpureByDefault() override
+    {
+        return true;
+    }
+
+    std::string description() override
+    {
+        return "start an interactive environment for evaluating Nix expressions";
+    }
+
+    std::string doc() override
+    {
+        return
+#include "repl.md"
+            ;
+    }
+
+    void applyDefaultInstallables(std::vector<std::string> & rawInstallables) override
+    {
+        if (rawInstallables.empty() && (file.has_value() || expr.has_value())) {
+            rawInstallables.push_back(".");
+        }
+    }
+
+    void run(ref<Store> store, std::vector<std::string> && rawInstallables) override
+    {
+        auto state = getEvalState();
+        auto getValues = [&]() -> AbstractNixRepl::AnnotatedValues {
+            auto installables = parseInstallables(store, rawInstallables);
+            AbstractNixRepl::AnnotatedValues values;
+            for (auto & installable_ : installables) {
+                auto & installable = InstallableValue::require(*installable_);
+                auto what = installable.what();
+                auto * val = installable.toValue(*state, file ? AutoCall::Yes : AutoCall::No).first;
+                values.push_back({val, what});
+            }
+            return values;
+        };
+        auto repl = AbstractNixRepl::create(lookupPath, state, getValues, runNix);
+        repl->autoArgs = getAutoArgs(*repl->state);
+        repl->initEnv();
+        repl->mainLoop();
+    }
+};
+
+static auto rCmdRepl = registerCommand<CmdRepl>("repl");
+
+} // namespace nix

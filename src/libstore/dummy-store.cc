@@ -1,0 +1,500 @@
+#include "nix/store/store-registration.hh"
+#include "nix/util/archive.hh"
+#include "nix/util/callback.hh"
+#include "nix/util/memory-source-accessor.hh"
+#include "nix/util/json-utils.hh"
+#include "nix/store/dummy-store-impl.hh"
+#include "nix/store/realisation.hh"
+#include "nix/store/derivation/aterm.hh"
+
+#include <boost/unordered/concurrent_flat_map.hpp>
+
+namespace nix {
+
+void DummyStoreConfig::anchor() {}
+
+void DummyStore::anchor() {}
+
+std::string DummyStoreConfig::doc()
+{
+    return
+#include "dummy-store.md"
+        ;
+}
+
+bool DummyStore::PathInfoAndContents::operator==(const PathInfoAndContents & other) const
+{
+    return info == other.info && contents->root == other.contents->root;
+}
+
+bool DummyStore::operator==(const DummyStore & other) const
+{
+    return contents == other.contents && derivations == other.derivations && buildTrace == other.buildTrace;
+}
+
+namespace {
+
+class WholeStoreViewAccessor : public SourceAccessor
+{
+    void anchor() override {};
+
+    using BaseName = std::string;
+
+    /**
+     * Map from store path basenames to corresponding accessors.
+     */
+    boost::concurrent_flat_map<BaseName, ref<MemorySourceAccessor>> subdirs;
+
+    /**
+     * Helper accessor for accessing just the CanonPath::root.
+     */
+    MemorySourceAccessor rootPathAccessor;
+
+    /**
+     * Helper empty accessor.
+     */
+    MemorySourceAccessor emptyAccessor;
+
+    auto
+    callWithAccessorForPath(CanonPath path, std::invocable<MemorySourceAccessor &, const CanonPath &> auto callback)
+    {
+        if (path.isRoot())
+            return callback(rootPathAccessor, path);
+
+        BaseName baseName(*path.begin());
+        MemorySourceAccessor * res = nullptr;
+
+        subdirs.cvisit(baseName, [&](const auto & kv) {
+            path = path.removePrefix(CanonPath{baseName});
+            res = &*kv.second;
+        });
+
+        if (!res)
+            /* The accessor is truly empty, i.e. without any file at root so
+               any subsequent operation with it will fail. */
+            res = &emptyAccessor;
+
+        return callback(*res, path);
+    }
+
+public:
+    WholeStoreViewAccessor()
+    {
+        MemorySink sink{rootPathAccessor};
+        sink.createDirectory(CanonPath::root);
+    }
+
+    void addObject(std::string_view baseName, ref<MemorySourceAccessor> accessor)
+    {
+        subdirs.emplace(baseName, std::move(accessor));
+    }
+
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        return callWithAccessorForPath(path, [&](SourceAccessor & accessor, const CanonPath & path) {
+            return accessor.readFile(path, sink, sizeCallback);
+        });
+    }
+
+    bool pathExists(const CanonPath & path) override
+    {
+        return callWithAccessorForPath(
+            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.pathExists(path); });
+    }
+
+    std::optional<Stat> maybeLstat(const CanonPath & path) override
+    {
+        return callWithAccessorForPath(
+            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.maybeLstat(path); });
+    }
+
+    DirEntries readDirectory(const CanonPath & path) override
+    {
+        /* FIXME: Special-case the root directory to read the whole store, not just an empty root. */
+        return callWithAccessorForPath(
+            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.readDirectory(path); });
+    }
+
+    std::string readLink(const CanonPath & path) override
+    {
+        return callWithAccessorForPath(
+            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.readLink(path); });
+    }
+};
+
+} // namespace
+
+ref<Store> DummyStoreConfig::openStore() const
+{
+    return openDummyStore();
+}
+
+bool DummyStoreConfig::getReadOnly() const
+{
+    return readOnly.get() || StoreConfig::getReadOnly();
+}
+
+struct DummyStoreImpl : DummyStore
+{
+private:
+    void anchor() override;
+
+public:
+    using Config = DummyStoreConfig;
+
+    /**
+     * This view conceptually just borrows the file systems objects of
+     * each store object from `contents`, and combines them together
+     * into one store-wide source accessor.
+     *
+     * This is needed just in order to implement `Store::getFSAccessor`.
+     */
+    ref<WholeStoreViewAccessor> wholeStoreView = make_ref<WholeStoreViewAccessor>();
+
+    DummyStoreImpl(ref<const Config> config)
+        : Store{*config}
+        , DummyStore{config}
+    {
+        wholeStoreView->setPathDisplay(config->storeDir);
+    }
+
+    void queryPathInfoUncached(
+        const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept override
+    {
+        if (path.isDerivation()) {
+            if (auto accessor_ = getMemoryFSAccessor(path)) {
+                ref<MemorySourceAccessor> accessor = ref{std::move(accessor_)};
+                /* compute path info on demand */
+                auto narHash =
+                    hashPath({accessor, CanonPath::root}, FileSerialisationMethod::NixArchive, HashAlgorithm::SHA256);
+                auto info = std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo{*this, narHash.hash});
+                info->narSize = narHash.numBytesDigested;
+                info->ca = ContentAddress{
+                    .method = ContentAddressMethod::Raw::Text,
+                    .hash = hashString(
+                        HashAlgorithm::SHA256,
+                        std::get<MemorySourceAccessor::File::Regular>(accessor->root->raw).contents),
+                };
+                callback(std::move(info));
+                return;
+            }
+        } else {
+            if (contents.cvisit(path, [&](const auto & kv) {
+                    callback(std::make_shared<ValidPathInfo>(StorePath{kv.first}, kv.second.info));
+                }))
+                return;
+        }
+
+        callback(nullptr);
+    }
+
+    /**
+     * Do this to avoid `queryPathInfoUncached` computing `PathInfo`
+     * that we don't need just to return a `bool`.
+     */
+    bool isValidPathUncached(const StorePath & path) override
+    {
+        return path.isDerivation() ? derivations.contains(path) : Store::isValidPathUncached(path);
+    }
+
+    /**
+     * The dummy store is incapable of *not* trusting! :)
+     */
+    std::optional<TrustedFlag> isTrustedClient() override
+    {
+        return Trusted;
+    }
+
+    std::optional<StorePath> queryPathFromHashPart(const std::string & hashPart) override
+    {
+        unsupported("queryPathFromHashPart");
+    }
+
+    void addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override
+    {
+        if (config->readOnly)
+            unsupported("addToStore");
+
+        if (repair)
+            throw Error("repairing is not supported for '%s' store", config->getHumanReadableURI());
+
+        if (checkSigs)
+            throw Error("checking signatures is not supported for '%s' store", config->getHumanReadableURI());
+
+        auto accessor = make_ref<MemorySourceAccessor>();
+        MemorySink tempSink{*accessor};
+        parseDump(tempSink, source);
+        auto path = info.path;
+
+        if (info.path.isDerivation()) {
+            warn("back compat supporting `addToStore` for inserting derivations in dummy store");
+            writeDerivation(
+                derivation::parse(*this, accessor->readFile(CanonPath::root), Derivation::nameFromPath(info.path)));
+            return;
+        }
+
+        contents.insert({
+            path,
+            PathInfoAndContents{
+                std::move(info),
+                accessor,
+            },
+        });
+        wholeStoreView->addObject(path.to_string(), accessor);
+    }
+
+    StorePath addToStoreFromDump(
+        Source & source,
+        std::string_view name,
+        FileSerialisationMethod dumpMethod = FileSerialisationMethod::NixArchive,
+        ContentAddressMethod hashMethod = FileIngestionMethod::NixArchive,
+        HashAlgorithm hashAlgo = HashAlgorithm::SHA256,
+        const StorePathSet & references = StorePathSet(),
+        RepairFlag repair = NoRepair) override
+    {
+        if (isDerivation(name))
+            throw Error("Do not insert derivation into dummy store with `addToStoreFromDump`");
+
+        if (config->readOnly)
+            unsupported("addToStoreFromDump");
+
+        if (repair)
+            throw Error("repairing is not supported for '%s' store", config->getHumanReadableURI());
+
+        auto temp = make_ref<MemorySourceAccessor>();
+
+        {
+            MemorySink tempSink{*temp};
+
+            // TODO factor this out into `restorePath`, same todo on it.
+            switch (dumpMethod) {
+            case FileSerialisationMethod::NixArchive:
+                parseDump(tempSink, source);
+                break;
+            case FileSerialisationMethod::Flat: {
+                // Replace root dir with file so next part succeeds.
+                temp->root = MemorySourceAccessor::File::Regular{};
+                tempSink.createRegularFile(CanonPath::root, [&](auto & sink) { source.drainInto(sink); });
+                break;
+            }
+            }
+        }
+
+        auto hash = hashPath({temp, CanonPath::root}, hashMethod.getFileIngestionMethod(), hashAlgo).first;
+        auto narHash = hashPath({temp, CanonPath::root}, FileIngestionMethod::NixArchive, HashAlgorithm::SHA256);
+
+        auto info = ValidPathInfo::makeFromCA(
+            *this,
+            name,
+            ContentAddressWithReferences::fromParts(
+                hashMethod,
+                std::move(hash),
+                {
+                    .others = references,
+                    // caller is not capable of creating a self-reference, because
+                    // this is content-addressed without modulus
+                    .self = false,
+                }),
+            std::move(narHash.first));
+
+        info.narSize = narHash.second.value();
+
+        auto path = info.path;
+        auto accessor = make_ref<MemorySourceAccessor>(std::move(*temp));
+        contents.insert({
+            path,
+            PathInfoAndContents{
+                std::move(info),
+                accessor,
+            },
+        });
+        wholeStoreView->addObject(path.to_string(), accessor);
+
+        return path;
+    }
+
+    StorePath writeDerivation(const Derivation & drv, RepairFlag repair = NoRepair) override
+    {
+        auto drvPath = nix::computeStorePath(*this, drv);
+
+        if (!derivations.contains(drvPath) || repair) {
+            if (config->readOnly)
+                unsupported("writeDerivation");
+            derivations.insert({drvPath, drv});
+        }
+
+        return drvPath;
+    }
+
+    Derivation readDerivation(const StorePath & drvPath) override
+    {
+        if (std::optional res = getConcurrent(derivations, drvPath))
+            return *res;
+        else
+            throw Error("derivation '%s' is not valid", printStorePath(drvPath));
+    }
+
+    /**
+     * No such thing as an "invalid derivation" with the dummy store
+     */
+    Derivation readInvalidDerivation(const StorePath & drvPath) override
+    {
+        return readDerivation(drvPath);
+    }
+
+    void registerDrvOutputUnchecked(const Realisation & output) override
+    {
+        buildTrace.insert_or_visit({output.id.drvPath, {{output.id.outputName, output}}}, [&](auto & kv) {
+            kv.second.insert_or_assign(output.id.outputName, output);
+        });
+    }
+
+    void queryRealisationUncached(
+        const DrvOutput & drvOutput, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override
+    {
+        bool visited = false;
+        buildTrace.cvisit(drvOutput.drvPath, [&](const auto & kv) {
+            if (auto it = kv.second.find(drvOutput.outputName); it != kv.second.end()) {
+                visited = true;
+                callback(std::make_shared<UnkeyedRealisation>(it->second));
+            }
+        });
+
+        if (!visited)
+            callback(nullptr);
+    }
+
+    std::shared_ptr<MemorySourceAccessor> getMemoryFSAccessor(const StorePath & path, bool requireValidPath = true)
+    {
+        std::shared_ptr<MemorySourceAccessor> res;
+        if (path.isDerivation())
+            derivations.cvisit(path, [&](const auto & kv) {
+                /* compute path info on demand */
+                auto res2 = make_ref<MemorySourceAccessor>();
+                res2->root = MemorySourceAccessor::File::Regular{
+                    .contents = unparse(kv.second, *this),
+                };
+                res = std::move(res2).get_ptr();
+            });
+        else
+            contents.cvisit(path, [&](const auto & kv) { res = kv.second.contents.get_ptr(); });
+        return res;
+    }
+
+    std::shared_ptr<SourceAccessor> getFSAccessor(const StorePath & path, bool requireValidPath = true) override
+    {
+        return getMemoryFSAccessor(path, requireValidPath);
+    }
+
+    ref<SourceAccessor> getFSAccessor(bool requireValidPath) override
+    {
+        return wholeStoreView;
+    }
+};
+
+void DummyStoreImpl::anchor() {}
+
+ref<DummyStore> DummyStore::Config::openDummyStore() const
+{
+    return make_ref<DummyStoreImpl>(ref{shared_from_this()});
+}
+
+static RegisterStoreImplementation<DummyStore::Config> regDummyStore;
+
+} // namespace nix
+
+namespace nlohmann {
+
+nix::DummyStore::PathInfoAndContents adl_serializer<nix::DummyStore::PathInfoAndContents>::from_json(const json & json)
+{
+    using namespace nix;
+    auto & obj = getObject(json);
+    return DummyStore::PathInfoAndContents{
+        .info = valueAt(obj, "info"),
+        .contents = make_ref<MemorySourceAccessor>(valueAt(obj, "contents")),
+    };
+}
+
+void adl_serializer<nix::DummyStore::PathInfoAndContents>::to_json(
+    json & json, const nix::DummyStore::PathInfoAndContents & val)
+{
+    json = {
+        {"info", val.info},
+        {"contents", *val.contents},
+    };
+}
+
+nix::ref<nix::DummyStoreConfig> adl_serializer<nix::ref<nix::DummyStore::Config>>::from_json(const json & json)
+{
+    using namespace nix;
+    auto & obj = getObject(json);
+    auto cfg = make_ref<DummyStore::Config>(DummyStore::Config::Params{});
+    cfg->storeDir_.set(getString(valueAt(obj, "store")));
+    cfg->readOnly = true;
+    return cfg;
+}
+
+void adl_serializer<nix::DummyStoreConfig>::to_json(json & json, const nix::DummyStoreConfig & val)
+{
+    json = {
+        {"store", val.storeDir},
+    };
+}
+
+nix::ref<nix::DummyStore> adl_serializer<nix::ref<nix::DummyStore>>::from_json(const json & json)
+{
+    using namespace nix;
+    auto & obj = getObject(json);
+    ref<DummyStore> res = adl_serializer<ref<DummyStoreConfig>>::from_json(valueAt(obj, "config"))->openDummyStore();
+    for (auto & [k, v] : getObject(valueAt(obj, "contents")))
+        res->contents.insert({StorePath{k}, v});
+    for (auto & [k, v] : getObject(valueAt(obj, "derivations")))
+        res->derivations.insert({StorePath{k}, v});
+    for (auto & [k0, v] : getObject(valueAt(obj, "buildTrace"))) {
+        for (auto & [k1, v2] : getObject(v)) {
+            UnkeyedRealisation realisation = v2;
+            res->buildTrace.insert_or_visit(
+                {StorePath{k0}, {{k1, realisation}}}, [&](auto & kv) { kv.second.insert_or_assign(k1, realisation); });
+        }
+    }
+    return res;
+}
+
+void adl_serializer<nix::DummyStore>::to_json(json & json, const nix::DummyStore & val)
+{
+    using namespace nix;
+    json = {
+        {"config", *val.config},
+        {"contents",
+         [&] {
+             auto obj = json::object();
+             val.contents.cvisit_all([&](const auto & kv) {
+                 auto & [k, v] = kv;
+                 obj[k.to_string()] = v;
+             });
+             return obj;
+         }()},
+        {"derivations",
+         [&] {
+             auto obj = json::object();
+             val.derivations.cvisit_all([&](const auto & kv) {
+                 auto & [k, v] = kv;
+                 obj[k.to_string()] = v;
+             });
+             return obj;
+         }()},
+        {"buildTrace",
+         [&] {
+             auto obj = json::object();
+             val.buildTrace.cvisit_all([&](const auto & kv) {
+                 auto & [k, v] = kv;
+                 auto & obj2 = obj[k.to_string()] = json::object();
+                 for (auto & [k2, v2] : kv.second)
+                     obj2[k2] = v2;
+             });
+             return obj;
+         }()},
+    };
+}
+
+} // namespace nlohmann

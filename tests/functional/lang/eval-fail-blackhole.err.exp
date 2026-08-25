@@ -1,0 +1,22 @@
+error:
+       … while evaluating the attribute 'body'
+         at /pwd/lang/eval-fail-blackhole.nix:1:1:
+            1| let {
+             | ^
+            2|   body = x;
+
+       … from the definition of 'body'
+         at /pwd/lang/eval-fail-blackhole.nix:2:3:
+            1| let {
+            2|   body = x;
+             |   ^
+            3|   x = y;
+
+       … entering the infinite recursion
+
+       error: infinite recursion encountered
+       at /pwd/lang/eval-fail-blackhole.nix:3:7:
+            2|   body = x;
+            3|   x = y;
+             |       ^
+            4|   y = x;

@@ -1,0 +1,243 @@
+{
+  lib,
+  stdenv,
+  lndir,
+  buildEnv,
+
+  maintainers,
+
+  nix-util,
+  nix-util-c,
+  nix-util-tests,
+
+  nix-store,
+  nix-store-c,
+  nix-store-tests,
+
+  nix-fetchers,
+  nix-fetchers-c,
+  nix-fetchers-tests,
+
+  nix-expr,
+  nix-expr-c,
+  nix-expr-tests,
+
+  nix-flake,
+  nix-flake-c,
+  nix-flake-tests,
+
+  nix-main,
+  nix-main-c,
+
+  nix-cmd,
+
+  nix-nswrapper,
+
+  nix-cli,
+
+  nix-functional-tests,
+
+  nix-manual,
+  nix-internal-api-docs,
+  nix-external-api-docs,
+
+  testers,
+
+  patchedSrc ? null,
+}:
+
+let
+  libs = {
+    inherit
+      nix-util
+      nix-util-c
+      nix-store
+      nix-store-c
+      nix-fetchers
+      nix-fetchers-c
+      nix-expr
+      nix-expr-c
+      nix-flake
+      nix-flake-c
+      nix-main
+      nix-main-c
+      nix-cmd
+      ;
+  };
+
+  devdoc = buildEnv {
+    name = "nix-${nix-cli.version}-devdoc";
+    paths = [
+      nix-internal-api-docs
+      nix-external-api-docs
+    ];
+  };
+
+in
+stdenv.mkDerivation (finalAttrs: {
+  pname = "nix";
+  version = nix-cli.version;
+
+  /**
+    This package uses a multi-output derivation, even though some outputs could
+    have been provided directly by the constituent component that provides it.
+
+    This is because not all tooling handles packages composed of arbitrary
+    outputs yet. This includes nix itself, https://github.com/NixOS/nix/issues/6507.
+
+    `devdoc` is also available, but not listed here, because this attribute is
+    not an output of the same derivation that provides `out`, `dev`, etc.
+  */
+  outputs = [
+    "out"
+    "dev"
+    "doc"
+    "man"
+  ];
+
+  /**
+    Unpacking is handled in this package's constituent components
+  */
+  dontUnpack = true;
+  /**
+    Building is handled in this package's constituent components
+  */
+  dontBuild = true;
+
+  /**
+    `doCheck` controls whether tests are added as build gate for the combined package.
+    This includes both the unit tests and the functional tests, but not the
+    integration tests that run in CI (the flake's `hydraJobs` and some of the `checks`).
+  */
+  doCheck = true;
+
+  /**
+    `fixupPhase` currently doesn't understand that a symlink output isn't writable.
+
+    We don't compile or link anything in this derivation, so fixups aren't needed.
+  */
+  dontFixup = true;
+
+  checkInputs = [
+    # Make sure the unit tests have passed
+    nix-util-tests.tests.run
+    nix-store-tests.tests.run
+    nix-expr-tests.tests.run
+    nix-fetchers-tests.tests.run
+    nix-flake-tests.tests.run
+
+    # Make sure the functional tests have passed
+    nix-functional-tests
+  ]
+  ++
+    lib.optionals
+      (
+        stdenv.hostPlatform.isLinux
+        && stdenv.buildPlatform.canExecute stdenv.hostPlatform
+        && nix-util-tests.tests ? run-without-new-syscalls
+      )
+      [
+        nix-util-tests.tests.run-without-new-syscalls
+      ];
+
+  nativeBuildInputs = [
+    lndir
+  ];
+
+  installPhase =
+    let
+      devPaths = lib.mapAttrsToList (_k: lib.getDev) finalAttrs.finalPackage.libs;
+    in
+    ''
+      mkdir -p $out $dev/nix-support
+
+      # Custom files
+      echo $libs >> $dev/nix-support/propagated-build-inputs
+      echo ${nix-cli} ${lib.escapeShellArgs devPaths} >> $dev/nix-support/propagated-build-inputs
+
+      # Merged outputs
+      lndir ${nix-cli} $out
+
+      for lib in ${lib.escapeShellArgs devPaths}; do
+        lndir $lib $dev
+      done
+
+      # Forwarded outputs
+      ln -sT ${nix-manual} $doc
+      ln -sT ${nix-manual.man} $man
+    ''
+    + lib.optionalString stdenv.isLinux ''
+      lndir ${nix-nswrapper} $out
+    '';
+
+  passthru = {
+    inherit (nix-cli) version;
+    src = patchedSrc;
+
+    /**
+      These are the libraries that are part of the Nix project. They are used
+      by the Nix CLI and other tools.
+
+      If you need to use these libraries in your project, we recommend to use
+      the `-c` C API libraries exclusively, if possible.
+
+      We also recommend that you build the complete package to ensure that the unit tests pass.
+      You could do this in CI, or by passing it in an unused environment variable. e.g in a `mkDerivation` call:
+
+      ```nix
+        buildInputs = [ nix.libs.nix-util-c nix.libs.nix-store-c ];
+        # Make sure the nix libs we use are ok
+        unusedInputsForTests = [ nix ];
+        disallowedReferences = nix.all;
+      ```
+    */
+    inherit libs;
+
+    /**
+      Developer documentation for `nix`, in `share/doc/nix/{internal,external}-api/`.
+
+      This is not a proper output; see `outputs` for context.
+    */
+    inherit devdoc;
+
+    /**
+      Extra tests that test this package, but do not run as part of the build.
+      See <https://nixos.org/manual/nixpkgs/stable/index.html#var-passthru-tests>
+    */
+    tests = {
+      pkg-config = testers.hasPkgConfigModules {
+        package = finalAttrs.finalPackage;
+      };
+    };
+  };
+
+  meta = {
+    mainProgram = "nix";
+    description = "The Nix package manager";
+    longDescription = nix-cli.meta.longDescription;
+    homepage = nix-cli.meta.homepage;
+    license = nix-cli.meta.license;
+    maintainers = maintainers;
+    platforms = nix-cli.meta.platforms;
+    outputsToInstall = [
+      "out"
+      "man"
+    ];
+    pkgConfigModules = [
+      "nix-cmd"
+      "nix-expr"
+      "nix-expr-c"
+      "nix-fetchers"
+      "nix-fetchers-c"
+      "nix-flake"
+      "nix-flake-c"
+      "nix-main"
+      "nix-main-c"
+      "nix-store"
+      "nix-store-c"
+      "nix-util"
+      "nix-util-c"
+    ];
+  };
+
+})

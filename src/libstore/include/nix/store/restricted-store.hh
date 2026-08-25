@@ -1,0 +1,140 @@
+#pragma once
+///@file
+
+#include "nix/store/store-api.hh"
+#include "nix/util/sync.hh"
+
+#include <future>
+
+namespace nix {
+
+struct Builder;
+class LocalStore;
+struct LocalStoreConfig;
+class Worker;
+
+/**
+ * A restricted store has a pointer to one of these, which manages the
+ * restrictions that are in place.
+ *
+ * This is a separate data type so the whitelists can be mutated before
+ * the restricted store is created: put differently, someones we don't
+ * know whether we will in fact create a restricted store, but we need
+ * to prepare the whitelists just in case.
+ *
+ * It is possible there are other ways to solve this problem. This was
+ * just the easiest place to begin, when this was extracted from
+ * `LocalDerivationGoal`.
+ */
+struct RestrictionContext
+{
+private:
+    /* VTable anchor to avoid weak linkage of the vtable - it breaks
+       dynamic_cast across shared libraries on Darwin. */
+    virtual void anchor();
+
+public:
+    /**
+     * Paths that are already allowed to begin with
+     */
+    virtual const StorePathSet & originalPaths() = 0;
+
+    struct State
+    {
+        /**
+         * Paths that were added via recursive Nix calls.
+         */
+        std::map<StorePath, std::shared_future<void>> addedPaths;
+
+        /**
+         * Realisations that were added via recursive Nix calls.
+         */
+        std::set<DrvOutput> addedDrvOutputs;
+    };
+
+    Sync<State> state_;
+
+    /**
+     * Recursive Nix calls are only allowed to build or realize paths
+     * in the original input closure or added via a recursive Nix call
+     * (so e.g. you can't do `nix-store -r /nix/store/<bla>` where
+     * `/nix/store/<bla>` is some arbitrary path in a binary cache).
+     */
+    virtual bool isAllowed(const StorePath &) = 0;
+    virtual bool isAllowed(const DrvOutput & id) = 0;
+    bool isAllowed(const DerivedPath & id);
+
+    /**
+     * Whether mounting dependencies inside the sandbox should happen,
+     * or if it should be entirely skipped.
+     */
+    virtual bool shouldModifySandbox() = 0;
+
+    /**
+     * Register a store path to an output name
+     * For builder-rpc-v0
+     */
+    virtual void submitOutput(const SingleDerivedPath & path, const OutputName & output) = 0;
+
+    /**
+     * Add 'path' to the set of paths that may be referenced by the
+     * outputs, and make it appear in the sandbox.
+     */
+    void addDependency(const StorePath & path)
+    {
+        if (isAllowed(path))
+            return;
+
+        std::promise<void> promise;
+
+        auto [future, shouldAdd] = [&]() -> std::pair<std::shared_future<void>, bool> {
+            auto state(state_.lock());
+            if (auto iter = state->addedPaths.find(path); iter != state->addedPaths.end()) {
+                return {iter->second, false};
+            }
+            auto [iter2, _] = state->addedPaths.emplace(path, promise.get_future().share());
+            return {iter2->second, true};
+        }();
+
+        /* Another daemon worker thread already started adding the dependency. Just wait for it
+           to complete. */
+        if (!shouldAdd) {
+            future.get();
+            return;
+        }
+
+        try {
+            if (shouldModifySandbox())
+                addDependencyImpl(path);
+            promise.set_value();
+        } catch (...) {
+            /* Notify all other waiters that we are done. */
+            promise.set_exception(std::current_exception());
+            throw;
+        }
+    }
+
+    virtual ~RestrictionContext() = default;
+
+protected:
+
+    /**
+     * This is the underlying implementation to be defined. The caller
+     * will ensure that this is only called on newly added dependencies,
+     * and that idempotent calls are a no-op.
+     */
+    virtual void addDependencyImpl(const StorePath & path) = 0;
+};
+
+/**
+ * Create a shared pointer to a restricted store.
+ */
+ref<Store> makeRestrictedStore(ref<LocalStoreConfig> config, ref<LocalStore> next, RestrictionContext & context);
+
+/**
+ * Create a builder that wraps an inner builder, adding restriction
+ * checks and dependency tracking for recursive Nix builds.
+ */
+ref<Builder> makeRestrictedBuilder(Worker & inner, RestrictionContext & context);
+
+} // namespace nix

@@ -1,0 +1,67 @@
+#pragma once
+/**
+ * @file Misc type definitions for both local building and remote (RPC building)
+ */
+
+#include "nix/util/hash.hh"
+#include "nix/store/path.hh"
+
+namespace nix {
+
+class Store;
+
+struct SingleDerivedPath;
+
+namespace derivation {
+template<typename Inputs, typename Out>
+struct Derivation;
+struct Output;
+} // namespace derivation
+
+using Derivation = derivation::Derivation<std::set<SingleDerivedPath>, derivation::Output>;
+
+/**
+ * Unless we are repairing, we don't both to test validity and just assume it,
+ * so the choices are `Absent` or `Valid`.
+ */
+enum struct PathStatus {
+    Corrupt,
+    Absent,
+    Valid,
+};
+
+struct InitialOutputStatus
+{
+    StorePath path;
+    PathStatus status;
+
+    /**
+     * Valid in the store, and additionally non-corrupt if we are repairing
+     */
+    bool isValid() const
+    {
+        return status == PathStatus::Valid;
+    }
+
+    /**
+     * Merely present, allowed to be corrupt
+     */
+    bool isPresent() const
+    {
+        return status == PathStatus::Corrupt || status == PathStatus::Valid;
+    }
+};
+
+struct InitialOutput
+{
+    std::optional<InitialOutputStatus> known;
+};
+
+/**
+ * Format the known outputs of a derivation for use in error messages.
+ */
+template<typename InputsType>
+std::string
+showKnownOutputs(const StoreDirConfig & store, const derivation::Derivation<InputsType, derivation::Output> & drv);
+
+} // namespace nix

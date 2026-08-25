@@ -1,0 +1,327 @@
+#include "nix/util/current-process.hh"
+#include "nix/util/environment-variables.hh"
+#include "nix/util/error.hh"
+#include "nix/util/executable-path.hh"
+#include "nix/util/file-descriptor.hh"
+#include "nix/util/file-path.hh"
+#include "nix/util/fmt.hh"
+#include "nix/util/os-string.hh"
+#include "nix/util/signals.hh"
+#include "nix/util/processes.hh"
+#include "nix/util/finally.hh"
+#include "nix/util/serialise.hh"
+#include "nix/util/file-system.hh"
+#include "nix/util/util.hh"
+
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <future>
+#include <iostream>
+#include <sstream>
+#include <thread>
+
+#include <sys/types.h>
+#include <unistd.h>
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+namespace nix {
+
+Pid::Pid() {}
+
+Pid::Pid(Pid && other) noexcept
+    : pid(std::move(other.pid))
+{
+}
+
+Pid::Pid(AutoCloseFD pid)
+    : pid(std::move(pid))
+{
+}
+
+Pid::~Pid()
+{
+    if (pid.get() != INVALID_DESCRIPTOR)
+        kill();
+}
+
+void Pid::operator=(AutoCloseFD pid)
+{
+    if (this->pid.get() != INVALID_DESCRIPTOR && this->pid.get() != pid.get())
+        kill();
+    this->pid = std::move(pid);
+}
+
+int Pid::kill(bool allowInterrupts)
+{
+    assert(pid.get() != INVALID_DESCRIPTOR);
+
+    debug("killing process %1%", pid.get());
+
+    if (!TerminateProcess(pid.get(), 1))
+        logError(windows::WinError("terminating process %1%", pid.get()).info());
+
+    return wait(allowInterrupts);
+}
+
+// Note that `allowInterrupts` is ignored for now, but there to match
+// Unix.
+int Pid::wait(bool allowInterrupts)
+{
+    assert(pid.get() != INVALID_DESCRIPTOR);
+    DWORD status = WaitForSingleObject(pid.get(), INFINITE);
+    if (status != WAIT_OBJECT_0)
+        throw windows::WinError("waiting for process %1%", pid.get());
+
+    DWORD exitCode = 0;
+    if (GetExitCodeProcess(pid.get(), &exitCode) == FALSE)
+        throw windows::WinError("getting exit code of process %1%", pid.get());
+
+    pid.close();
+    return exitCode;
+}
+
+// TODO: Merge this with Unix's runProgram since it's identical logic.
+std::string runProgram(std::filesystem::path program, bool lookupPath, const OsStrings & args, bool isInteractive)
+{
+    auto res = runProgram(
+        RunOptions{
+            .program = program,
+            .lookupPath = lookupPath,
+            .args = args,
+            .isInteractive = isInteractive,
+        });
+
+    if (!statusOk(res.first))
+        throw ExecError(res.first, "program %s %s", PathFmt(program), statusToString(res.first));
+
+    return res.second;
+}
+
+std::optional<std::filesystem::path> getProgramInterpreter(const std::filesystem::path & program)
+{
+    // These extensions are automatically handled by Windows and don't require an interpreter.
+    static constexpr const char * exts[] = {".exe", ".cmd", ".bat"};
+    for (const auto ext : exts) {
+        if (hasSuffix(program.string(), ext)) {
+            return {};
+        }
+    }
+    // TODO: Open file and read the shebang
+    throw UnimplementedError("getProgramInterpreter unimplemented");
+}
+
+// TODO: Not sure if this is needed in the unix version but it might be useful as a member func
+void setFDInheritable(AutoCloseFD & fd, bool inherit)
+{
+    if (fd.get() != INVALID_DESCRIPTOR) {
+        if (!SetHandleInformation(fd.get(), HANDLE_FLAG_INHERIT, inherit ? HANDLE_FLAG_INHERIT : 0)) {
+            throw windows::WinError("Couldn't disable inheriting of handle");
+        }
+    }
+}
+
+AutoCloseFD nullFD()
+{
+    // Create null handle to discard reads / writes
+    // https://stackoverflow.com/a/25609668
+    // https://github.com/nix-windows/nix/blob/windows-meson/src/libutil/util.cc#L2228
+    AutoCloseFD nul = CreateFileW(
+        L"NUL",
+        GENERIC_READ | GENERIC_WRITE,
+        // We don't care who reads / writes / deletes this file since it's NUL anyways
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL);
+    if (!nul.get()) {
+        throw windows::WinError("Couldn't open NUL device");
+    }
+    // Let this handle be inheritable by child processes
+    setFDInheritable(nul, true);
+    return nul;
+}
+
+// Adapted from
+// https://blogs.msdn.microsoft.com/twistylittlepassagesallalike/2011/04/23/everyone-quotes-command-line-arguments-the-wrong-way/
+OsString windowsEscape(const OsString & str, bool cmd)
+{
+    // TODO: This doesn't handle cmd.exe escaping.
+    if (cmd) {
+        throw UnimplementedError("cmd.exe escaping is not implemented");
+    }
+
+    if (str.find_first_of(L" \t\n\v\"") == str.npos && !str.empty()) {
+        // No need to escape this one, the nonempty contents don't have a special character
+        return str;
+    }
+    OsString buffer;
+    // Add the opening quote
+    buffer += L'"';
+    for (auto iter = str.begin();; ++iter) {
+        size_t backslashes = 0;
+        while (iter != str.end() && *iter == L'\\') {
+            ++iter;
+            ++backslashes;
+        }
+
+        // We only escape backslashes if:
+        // - They come immediately before the closing quote
+        // - They come immediately before a quote in the middle of the string
+        // Both of these cases break the escaping if not handled. Otherwise backslashes are fine as-is
+        if (iter == str.end()) {
+            // Need to escape each backslash
+            buffer.append(backslashes * 2, L'\\');
+            // Exit since we've reached the end of the string
+            break;
+        } else if (*iter == L'"') {
+            // Need to escape each backslash and the intermediate quote character
+            buffer.append(backslashes * 2, L'\\');
+            buffer += L"\\\"";
+        } else {
+            // Don't escape the backslashes since they won't break the delimiter
+            buffer.append(backslashes, L'\\');
+            buffer += *iter;
+        }
+    }
+    // Add the closing quote
+    return buffer + L'"';
+}
+
+Pid spawnProcess(const std::filesystem::path & realProgram, const RunOptions & options, Pipe & out)
+{
+    // Setup pipes.
+    if (options.standardOut) {
+        // Don't inherit the read end of the output pipe
+        setFDInheritable(out.readSide, false);
+    } else {
+        out.writeSide = nullFD();
+    }
+
+    AutoCloseFD in = nullFD();
+
+    STARTUPINFOW startInfo = {0};
+    startInfo.cb = sizeof(startInfo);
+    startInfo.dwFlags = STARTF_USESTDHANDLES;
+    startInfo.hStdInput = in.get();
+    startInfo.hStdOutput = out.writeSide.get();
+    startInfo.hStdError = out.writeSide.get();
+
+    auto env = getEnvOs();
+
+    if (options.environment) {
+        for (const auto & envVar : *options.environment) {
+            env[envVar.first] = envVar.second;
+        }
+    }
+
+    OsString envline;
+
+    for (const auto & envVar : env) {
+        envline += (envVar.first + L'=' + envVar.second + L'\0');
+    }
+
+    OsString cmdline = windowsEscape(realProgram.native(), false);
+    for (const auto & arg : options.args) {
+        // TODO: This isn't the right way to escape windows command
+        // See https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-commandlinetoargvw
+        cmdline += L' ';
+        cmdline += windowsEscape(arg, false);
+    }
+
+    PROCESS_INFORMATION procInfo = {0};
+    if (CreateProcessW(
+            // EXE path is provided in the cmdline
+            NULL,
+            cmdline.data(),
+            NULL,
+            NULL,
+            TRUE,
+            CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+            envline.data(),
+            options.chdir.has_value() ? options.chdir->c_str() : NULL,
+            &startInfo,
+            &procInfo)
+        == 0) {
+        throw windows::WinError("CreateProcessW failed (%1%)", os_string_to_string(cmdline));
+    }
+
+    // Convert these to use RAII
+    AutoCloseFD process = procInfo.hProcess;
+    AutoCloseFD thread = procInfo.hThread;
+
+    // Add current process and child to job object so child terminates when parent terminates
+    // TODO: This spawns one job per child process. We can probably keep this as a global, and
+    // add children a single job so we don't use so many jobs at once.
+    Descriptor job = CreateJobObjectW(NULL, NULL);
+    if (job == NULL) {
+        TerminateProcess(procInfo.hProcess, 0);
+        throw windows::WinError("Couldn't create job object for child process");
+    }
+    if (AssignProcessToJobObject(job, procInfo.hProcess) == FALSE) {
+        TerminateProcess(procInfo.hProcess, 0);
+        throw windows::WinError("Couldn't assign child process to job object");
+    }
+    if (ResumeThread(procInfo.hThread) == (DWORD) -1) {
+        TerminateProcess(procInfo.hProcess, 0);
+        throw windows::WinError("Couldn't resume child process thread");
+    }
+
+    return process;
+}
+
+void runProgram2(const RunOptions & options)
+{
+    checkInterrupt();
+
+    /* Create a pipe. */
+    Pipe out;
+    // TODO: I copied this from unix but this is handled again in spawnProcess, so might be weird to split it up like
+    // this
+    if (options.standardOut)
+        out.create();
+
+    std::filesystem::path realProgram = options.program;
+    // TODO: Implement shebang / program interpreter lookup on Windows
+    auto interpreter = getProgramInterpreter(realProgram);
+
+    auto suspension = logger->suspendIf(options.isInteractive);
+
+    Pid pid = spawnProcess(interpreter.has_value() ? *interpreter : realProgram, options, out);
+
+    // TODO: This is identical to unix, deduplicate?
+    out.writeSide.close();
+
+    if (options.standardOut)
+        drainFD(out.readSide.get(), *options.standardOut);
+
+    /* Wait for the child to finish. */
+    int status = pid.wait();
+    if (status)
+        throw ExecError(status, "program %1% %2%", PathFmt(options.program), statusToString(status));
+}
+
+std::string statusToString(int status)
+{
+    if (status != 0)
+        return fmt("with exit code %d", status);
+    else
+        return "succeeded";
+}
+
+bool statusOk(int status)
+{
+    return status == 0;
+}
+
+int execvpe(const wchar_t * file0, const wchar_t * const argv[], const wchar_t * const envp[])
+{
+    auto file = ExecutablePath::load().findPath(file0);
+    return _wexecve(file.c_str(), argv, envp);
+}
+
+} // namespace nix

@@ -1,0 +1,206 @@
+#include "nix/store/store-api.hh"
+#include "nix/store/local-fs-store.hh"
+#include "nix/util/compression.hh"
+#include "nix/store/derivations.hh"
+
+namespace nix {
+
+void LocalFSStoreConfig::anchor() {}
+
+void LocalFSStore::anchor() {}
+
+LocalFSStoreConfig::LocalFSStoreConfig(const std::filesystem::path & rootDir, const Params & params)
+    : StoreConfig(params, FilePathType::Native)
+    /* Default `?root` from `rootDir` if non set
+     * NOTE: We would like to just do rootDir.set(...), which would take care of
+     * all normalization and error checking for us. Unfortunately we cannot do
+     * that because of the complicated initialization order of other fields with
+     * the virtual class hierarchy of nix store configs, and the design of the
+     * settings system. As such, we have no choice but to redefine the field and
+     * manually repeat the same normalization logic.
+     */
+    , rootDir{makeRootDirSetting(
+          *this, !rootDir.empty() && params.count("root") == 0 ? std::optional{canonPath(rootDir)} : std::nullopt)}
+{
+}
+
+LocalFSStore::LocalFSStore(const Config & config)
+    : Store{static_cast<const Store::Config &>(*this)}
+    , config{config}
+{
+}
+
+namespace {
+
+struct LocalStoreAccessor : SourceAccessor
+{
+private:
+    void anchor() override {};
+
+public:
+    ref<SourceAccessor> accessor;
+    ref<LocalFSStore> store;
+    bool requireValidPath;
+
+    LocalStoreAccessor(ref<LocalFSStore> store, bool requireValidPath)
+        : accessor(makeFSSourceAccessor(std::filesystem::path{store->config.realStoreDir.get()}))
+        , store(store)
+        , requireValidPath(requireValidPath)
+    {
+    }
+
+    void requireStoreObject(const StorePath & storePath)
+    {
+        if (requireValidPath && !store->isValidPath(storePath))
+            throw InvalidPath("path '%1%' is not a valid store path", store->printStorePath(storePath));
+    }
+
+    static StorePath getStoreObjectPath(const CanonPath & path)
+    {
+        /* See special handling of isRoot() in maybeLstat. */
+        if (path.isRoot())
+            throw BadStorePath("path '%1%' is not a valid store path", path);
+        return StorePath(*path.begin());
+    }
+
+    static std::optional<StorePath> maybeGetStoreObjectPath(const CanonPath & path)
+    try {
+        return getStoreObjectPath(path);
+    } catch (BadStorePath &) {
+        /* FIXME: Stop using exceptions for control flow. */
+        return std::nullopt;
+    }
+
+    void requireStoreObject(const CanonPath & path)
+    {
+        requireStoreObject(getStoreObjectPath(path));
+    }
+
+    std::optional<Stat> maybeLstat(const CanonPath & path) override
+    {
+        /* Also allow `path` to point to the entire store, which is
+           needed for resolving symlinks. */
+        if (path.isRoot())
+            return Stat{.type = tDirectory};
+
+        /* Querying existence should not fail for things like
+           `/nix/store/foo.nix`. The store cannot contain such files (unless
+           some weird impurities sneak in, but that's UB from nix's PoV). */
+        auto maybeStorePath = maybeGetStoreObjectPath(path);
+        if (!maybeStorePath)
+            return std::nullopt;
+        requireStoreObject(*maybeStorePath);
+        return accessor->maybeLstat(path);
+    }
+
+    Stat lstat(const CanonPath & path) override
+    {
+        /* Also allow `path` to point to the entire store, which is
+           needed for resolving symlinks. */
+        if (path.isRoot())
+            return Stat{.type = tDirectory};
+
+        requireStoreObject(path);
+        return accessor->lstat(path);
+    }
+
+    DirEntries readDirectory(const CanonPath & path) override
+    {
+        requireStoreObject(path);
+        return accessor->readDirectory(path);
+    }
+
+    void readDirectory(
+        const CanonPath & dirPath,
+        std::function<void(SourceAccessor & subdirAccessor, const CanonPath & subdirRelPath)> callback) override
+    {
+        requireStoreObject(dirPath);
+        return accessor->readDirectory(dirPath, std::move(callback));
+    }
+
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        requireStoreObject(path);
+        return accessor->readFile(path, sink, sizeCallback);
+    }
+
+    std::string readLink(const CanonPath & path) override
+    {
+        requireStoreObject(path);
+        return accessor->readLink(path);
+    }
+
+    std::string showPath(const CanonPath & path) override
+    {
+        return accessor->showPath(path);
+    }
+
+    std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
+    {
+        return accessor->getPhysicalPath(path);
+    }
+
+    std::pair<CanonPath, std::optional<std::string>> getFingerprint(const CanonPath & path) override
+    {
+        return accessor->getFingerprint(path);
+    }
+
+    std::optional<time_t> getLastModified() override
+    {
+        return accessor->getLastModified();
+    }
+};
+
+} // namespace
+
+ref<SourceAccessor> LocalFSStore::getFSAccessor(bool requireValidPath)
+{
+    return make_ref<LocalStoreAccessor>(
+        ref<LocalFSStore>(std::dynamic_pointer_cast<LocalFSStore>(shared_from_this())), requireValidPath);
+}
+
+std::shared_ptr<SourceAccessor> LocalFSStore::getFSAccessor(const StorePath & path, bool requireValidPath)
+{
+    auto absPath = std::filesystem::path{config.realStoreDir.get()} / path.to_string();
+    if (requireValidPath) {
+        /* Only return non-null if the store object is a fully-valid
+           member of the store. */
+        if (!isValidPath(path))
+            return nullptr;
+    } else {
+        /* Return non-null as long as the some file system data exists,
+           even if the store object is not fully registered. */
+        if (!pathExists(absPath))
+            return nullptr;
+    }
+    return makeFSSourceAccessor(std::move(absPath));
+}
+
+const std::filesystem::path LocalFSStore::drvsLogDir = "drvs";
+
+std::optional<std::string> LocalFSStore::getBuildLogExact(const StorePath & path)
+{
+    auto baseName = path.to_string();
+
+    for (int j = 0; j < 2; j++) {
+
+        auto logPath = config.logDir.get()
+                       / (j == 0 ? drvsLogDir / baseName.substr(0, 2) / baseName.substr(2) : drvsLogDir / baseName);
+        auto logBz2Path = logPath;
+        logBz2Path += ".bz2";
+
+        if (pathExists(logPath))
+            return readFile(logPath);
+
+        else if (pathExists(logBz2Path)) {
+            try {
+                return decompress(CompressionAlgo::bzip2, readFile(logBz2Path));
+            } catch (Error &) {
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+} // namespace nix

@@ -1,0 +1,770 @@
+#include "nix/main/progress-bar.hh"
+#include "nix/util/terminal.hh"
+#include "nix/util/sync.hh"
+#include "nix/util/signals.hh"
+#include "nix/store/path.hh"
+#include "nix/util/file-system.hh"
+#include "nix/store/names.hh"
+#include "nix/util/util.hh"
+
+#include <map>
+#include <thread>
+#include <sstream>
+#include <iostream>
+#include <chrono>
+
+namespace nix {
+
+namespace {
+
+static std::optional<std::string_view> getS(std::span<const Logger::Field> fields, size_t n)
+{
+    if (n >= fields.size() || !std::holds_alternative<std::string>(fields[n]))
+        return std::nullopt;
+    return std::get<std::string>(fields[n]);
+}
+
+static std::optional<uint64_t> getI(std::span<const Logger::Field> fields, size_t n)
+{
+    if (n >= fields.size() || !std::holds_alternative<uint64_t>(fields[n]))
+        return std::nullopt;
+    return std::get<uint64_t>(fields[n]);
+}
+
+static std::string_view storePathToName(std::string_view path)
+{
+    auto base = baseNameOf(path);
+    auto i = base.find('-');
+    return i == std::string::npos ? base.substr(0, 0) : base.substr(i + 1);
+}
+
+static std::string_view storePathToNameWithoutDrvSuffix(std::string_view path)
+{
+    auto res = storePathToName(path);
+    if (hasSuffix(res, drvExtension))
+        res.remove_suffix(drvExtension.size());
+    return res;
+}
+
+class ProgressBar final : public Logger
+{
+private:
+    struct ActInfo
+    {
+        std::string s, lastLine, phase;
+        ActivityType type = actUnknown;
+        uint64_t done = 0;
+        uint64_t expected = 0;
+        uint64_t running = 0;
+        uint64_t failed = 0;
+        std::map<ActivityType, uint64_t> expectedByType;
+        bool visible = true;
+        ActivityId parent;
+        std::optional<std::string> name;
+        std::chrono::time_point<std::chrono::steady_clock> startTime;
+    };
+
+    struct ActivitiesByType
+    {
+        std::map<ActivityId, std::list<ActInfo>::iterator> its;
+        uint64_t done = 0;
+        uint64_t expected = 0;
+        uint64_t failed = 0;
+    };
+
+    struct State
+    {
+        std::list<ActInfo> activities;
+        std::map<ActivityId, std::list<ActInfo>::iterator> its;
+
+        std::map<ActivityType, ActivitiesByType> activitiesByType;
+
+        uint64_t filesLinked = 0, bytesLinked = 0;
+
+        uint64_t corruptedPaths = 0, untrustedPaths = 0;
+
+        bool active = true;
+        size_t suspensions = 0;
+        bool haveUpdate = true;
+
+        bool isPaused() const
+        {
+            return suspensions > 0;
+        }
+    };
+
+    /** Helps avoid unnecessary redraws, see `redraw()` */
+    Sync<std::string> lastOutput_;
+
+    Sync<State> state_;
+
+    std::thread updateThread;
+
+    std::condition_variable quitCV, updateCV;
+
+    bool printBuildLogs = false;
+    bool isTTY;
+
+    std::unique_ptr<InterruptCallback> interruptCallback, stopCallback, contCallback, winchCallback;
+
+    void hideCursorIfNeeded() const
+    {
+        if (isTTY)
+            writeToStderr("\e[?25l");
+    }
+
+    void unhideCursorIfNeeded() const
+    {
+        if (isTTY)
+            writeToStderr("\e[?25h");
+    }
+
+public:
+
+    ProgressBar(bool isTTY)
+        : isTTY(isTTY)
+        , interruptCallback(createInterruptCallback([&]() {
+            pause();
+            redraw("\rshutting down\e[K");
+        }))
+    {
+        hideCursorIfNeeded();
+        state_.lock()->active = isTTY;
+
+        /* On Ctrl-Z, unhide the cursor before the process is
+           stopped. */
+        stopCallback = createSignalCallback(SignalType::Stop, [&]() {
+            auto state(state_.lock());
+            if (state->active && !state->isPaused())
+                unhideCursorIfNeeded();
+        });
+
+        /* Redraw the progress bar when the process is resumed or the
+           terminal size changes. */
+        auto redrawCallback = [&]() {
+            auto state(state_.lock());
+            if (state->active && !state->isPaused()) {
+                /* Force a redraw, since the new output may be
+                   identical to the one cached by redraw(). */
+                invalidateRedrawCache();
+                hideCursorIfNeeded();
+                update(*state);
+            }
+        };
+        contCallback = createSignalCallback(SignalType::Cont, redrawCallback);
+        winchCallback = createSignalCallback(SignalType::Winch, redrawCallback);
+
+        updateThread = std::thread([&]() {
+            auto state(state_.lock());
+            auto nextWakeup = std::chrono::milliseconds::max();
+            while (state->active) {
+                if (!state->haveUpdate)
+                    state.wait_for(updateCV, nextWakeup);
+                nextWakeup = draw(*state);
+                state.wait_for(quitCV, std::chrono::milliseconds(50));
+            }
+        });
+    }
+
+    ~ProgressBar()
+    {
+        stop();
+    }
+
+    /* Called by destructor, can't be overridden */
+    void stop() override final
+    {
+        {
+            auto state(state_.lock());
+            if (state->active) {
+                state->active = false;
+                clearProgressDisplay();
+                unhideCursorIfNeeded();
+                updateCV.notify_one();
+                quitCV.notify_one();
+            }
+        }
+        if (updateThread.joinable())
+            updateThread.join();
+    }
+
+    void pause() override
+    {
+        auto state(state_.lock());
+        state->suspensions++;
+        if (state->suspensions > 1) {
+            // already paused
+            return;
+        }
+
+        if (state->active) {
+            clearProgressDisplay();
+            unhideCursorIfNeeded();
+        }
+    }
+
+    void resume() override
+    {
+        auto state(state_.lock());
+        if (state->suspensions == 0) {
+            log(lvlError, "nix::ProgressBar: resume() called without a matching preceding pause(). This is a bug.");
+            return;
+        } else {
+            state->suspensions--;
+        }
+        if (state->suspensions == 0) {
+            if (state->active) {
+                clearProgressDisplay();
+                hideCursorIfNeeded();
+            }
+            state->haveUpdate = true;
+            updateCV.notify_one();
+        }
+    }
+
+    bool isVerbose() override
+    {
+        return printBuildLogs;
+    }
+
+    void log(Verbosity lvl, std::string_view s) noexcept override
+    {
+        if (lvl > verbosity)
+            return;
+        auto state(state_.lock());
+        log(*state, lvl, s);
+    }
+
+    void logEI(const ErrorInfo & ei) noexcept override
+    {
+        auto state(state_.lock());
+
+        std::ostringstream oss;
+        showErrorInfo(oss, ei, loggerSettings.showTrace.get());
+
+        log(*state, ei.level, oss.view());
+    }
+
+    void log(State & state, Verbosity lvl, std::string_view s) noexcept
+    {
+        if (state.active) {
+            invalidateRedrawCache();
+            writeToStderr("\r\e[K" + filterANSIEscapes(s, !isTTY) + ANSI_NORMAL "\n");
+            draw(state);
+        } else {
+            writeToStderr(filterANSIEscapes(s, !isTTY) + "\n");
+        }
+    }
+
+    void startActivity(
+        ActivityId act,
+        Verbosity lvl,
+        ActivityType type,
+        const std::string & s,
+        std::span<const Field> fields,
+        ActivityId parent) noexcept override
+    {
+        auto state(state_.lock());
+
+        if (lvl <= verbosity && !s.empty() && type != actBuildWaiting)
+            log(*state, lvl, s + "...");
+
+        state->activities.emplace_back(
+            ActInfo{.s = s, .type = type, .parent = parent, .startTime = std::chrono::steady_clock::now()});
+        auto i = std::prev(state->activities.end());
+        state->its.emplace(act, i);
+        state->activitiesByType[type].its.emplace(act, i);
+
+        if (type == actBuild) {
+            if (auto path = getS(fields, 0)) {
+                auto name = storePathToNameWithoutDrvSuffix(*path);
+                i->s = fmt("building " ANSI_BOLD "%s" ANSI_NORMAL, name);
+                auto machineName = getS(fields, 1);
+                if (machineName && *machineName != "")
+                    i->s += fmt(" on " ANSI_BOLD "%s" ANSI_NORMAL, *machineName);
+                i->name = DrvName(name).name;
+            }
+        }
+
+        if (type == actSubstitute) {
+            auto path = getS(fields, 0);
+            auto sub = getS(fields, 1);
+            if (path && sub) {
+                auto name = storePathToName(*path);
+                i->s =
+                    fmt(hasPrefix(*sub, "local") ? "copying " ANSI_BOLD "%s" ANSI_NORMAL " from %s"
+                                                 : "fetching " ANSI_BOLD "%s" ANSI_NORMAL " from %s",
+                        name,
+                        *sub);
+            }
+        }
+
+        if (type == actPostBuildHook) {
+            if (auto path = getS(fields, 0)) {
+                auto name = storePathToNameWithoutDrvSuffix(*path);
+                i->s = fmt("post-build " ANSI_BOLD "%s" ANSI_NORMAL, name);
+                i->name = DrvName(name).name;
+            }
+        }
+
+        if (type == actQueryPathInfo) {
+            auto path = getS(fields, 0);
+            auto sub = getS(fields, 1);
+            if (path && sub)
+                i->s = fmt("querying " ANSI_BOLD "%s" ANSI_NORMAL " on %s", storePathToName(*path), *sub);
+        }
+
+        if ((type == actFileTransfer && hasAncestor(*state, actCopyPath, parent))
+            || (type == actFileTransfer && hasAncestor(*state, actQueryPathInfo, parent))
+            || (type == actCopyPath && hasAncestor(*state, actSubstitute, parent)))
+            i->visible = false;
+
+        update(*state);
+    }
+
+    /* Check whether an activity has an ancestor with the specified
+       type. */
+    bool hasAncestor(State & state, ActivityType type, ActivityId act)
+    {
+        while (act != 0) {
+            auto i = state.its.find(act);
+            if (i == state.its.end())
+                break;
+            if (i->second->type == type)
+                return true;
+            act = i->second->parent;
+        }
+        return false;
+    }
+
+    void stopActivity(ActivityId act) noexcept override
+    {
+        auto state(state_.lock());
+
+        auto i = state->its.find(act);
+        if (i != state->its.end()) {
+
+            auto & actByType = state->activitiesByType[i->second->type];
+            actByType.done += i->second->done;
+            actByType.failed += i->second->failed;
+
+            for (auto & j : i->second->expectedByType)
+                state->activitiesByType[j.first].expected -= j.second;
+
+            actByType.its.erase(act);
+            state->activities.erase(i->second);
+            state->its.erase(i);
+        }
+
+        update(*state);
+    }
+
+    void result(ActivityId act, ResultType type, std::span<const Field> fields) noexcept override
+    {
+        auto state(state_.lock());
+
+        if (type == resFileLinked) {
+            state->filesLinked++;
+            state->bytesLinked += getI(fields, 0).value_or(0);
+            update(*state);
+        }
+
+        else if (type == resBuildLogLine || type == resPostBuildLogLine) {
+            auto line = getS(fields, 0);
+            if (!line)
+                return;
+            auto lastLine = chomp(*line);
+            auto i = state->its.find(act);
+            assert(i != state->its.end());
+            ActInfo info = *i->second;
+            if (printBuildLogs) {
+                auto suffix = "> ";
+                if (type == resPostBuildLogLine) {
+                    suffix = " (post)> ";
+                }
+                log(*state, lvlInfo, ANSI_FAINT + info.name.value_or("unnamed") + suffix + ANSI_NORMAL + lastLine);
+            } else {
+                state->activities.erase(i->second);
+                info.lastLine = lastLine;
+                state->activities.emplace_back(info);
+                i->second = std::prev(state->activities.end());
+                update(*state);
+            }
+        }
+
+        else if (type == resUntrustedPath) {
+            state->untrustedPaths++;
+            update(*state);
+        }
+
+        else if (type == resCorruptedPath) {
+            state->corruptedPaths++;
+            update(*state);
+        }
+
+        else if (type == resSetPhase) {
+            auto phase = getS(fields, 0);
+            if (!phase)
+                return;
+            auto i = state->its.find(act);
+            assert(i != state->its.end());
+            i->second->phase = *phase;
+            update(*state);
+        }
+
+        else if (type == resProgress) {
+            auto done = getI(fields, 0);
+            auto expected = getI(fields, 1);
+            auto running = getI(fields, 2);
+            auto failed = getI(fields, 3);
+            if (!done || !expected || !running || !failed)
+                return;
+            auto i = state->its.find(act);
+            assert(i != state->its.end());
+            ActInfo & actInfo = *i->second;
+            actInfo.done = *done;
+            actInfo.expected = *expected;
+            actInfo.running = *running;
+            actInfo.failed = *failed;
+            update(*state);
+        }
+
+        else if (type == resSetExpected) {
+            auto expectedType = getI(fields, 0);
+            auto expected = getI(fields, 1);
+            if (!expectedType || !expected)
+                return;
+            auto i = state->its.find(act);
+            assert(i != state->its.end());
+            ActInfo & actInfo = *i->second;
+            auto type = (ActivityType) *expectedType;
+            auto & j = actInfo.expectedByType[type];
+            state->activitiesByType[type].expected -= j;
+            j = *expected;
+            state->activitiesByType[type].expected += j;
+            update(*state);
+        }
+
+        else if (type == resFetchStatus) {
+            auto lastLine = getS(fields, 0);
+            if (!lastLine)
+                return;
+            auto i = state->its.find(act);
+            assert(i != state->its.end());
+            ActInfo & actInfo = *i->second;
+            actInfo.lastLine = *lastLine;
+            update(*state);
+        }
+    }
+
+    void update(State & state) noexcept
+    {
+        state.haveUpdate = true;
+        updateCV.notify_one();
+    }
+
+    /**
+     * Redraw, if the output has changed.
+     *
+     * Excessive redrawing is noticeable on slow terminals, and it interferes
+     * with text selection in some terminals, including libvte-based terminal
+     * emulators.
+     */
+    void redraw(std::string newOutput) noexcept
+    {
+        auto lastOutput(lastOutput_.lock());
+        if (newOutput != *lastOutput) {
+            writeToStderr(newOutput);
+            *lastOutput = std::move(newOutput);
+        }
+    }
+
+    void invalidateRedrawCache()
+    {
+        *lastOutput_.lock() = "";
+    }
+
+    void clearProgressDisplay()
+    {
+        invalidateRedrawCache();
+        writeToStderr("\r\e[K");
+    }
+
+    std::chrono::milliseconds draw(State & state) noexcept
+    {
+        auto nextWakeup = std::chrono::milliseconds::max();
+
+        state.haveUpdate = false;
+        if (state.isPaused() || !state.active)
+            return nextWakeup;
+
+        std::string line;
+
+        std::string status = getStatus(state);
+        if (!status.empty()) {
+            line += '[';
+            line += status;
+            line += "]";
+        }
+
+        auto now = std::chrono::steady_clock::now();
+
+        if (!state.activities.empty()) {
+            if (!status.empty())
+                line += " ";
+            auto i = state.activities.rbegin();
+
+            while (i != state.activities.rend()) {
+                if (i->visible && (!i->s.empty() || !i->lastLine.empty())) {
+                    /* Don't show activities until some time has
+                       passed, to avoid displaying very short
+                       activities. */
+                    auto delay = std::chrono::milliseconds(10);
+                    if (i->startTime + delay < now)
+                        break;
+                    else
+                        nextWakeup = std::min(
+                            nextWakeup,
+                            std::chrono::duration_cast<std::chrono::milliseconds>(delay - (now - i->startTime)));
+                }
+                ++i;
+            }
+
+            if (i != state.activities.rend()) {
+                line += i->s;
+                if (!i->phase.empty()) {
+                    line += " (";
+                    line += i->phase;
+                    line += ")";
+                }
+                if (!i->lastLine.empty()) {
+                    if (!i->s.empty())
+                        line += ": ";
+                    line += i->lastLine;
+                }
+            }
+        }
+
+        auto width = getWindowSize().second;
+        if (width <= 0)
+            width = std::numeric_limits<decltype(width)>::max();
+
+        redraw("\r" + filterANSIEscapes(line, false, width) + ANSI_NORMAL + "\e[K");
+
+        return nextWakeup;
+    }
+
+    std::string getStatus(State & state) noexcept
+    {
+        std::string res;
+
+        auto renderActivity =
+            [&] [[nodiscard]] (
+                ActivityType type, const std::string & itemFmt, const std::string & numberFmt = "%d", double unit = 1) {
+                auto & act = state.activitiesByType[type];
+                uint64_t done = act.done, expected = act.done, running = 0, failed = act.failed;
+                for (auto & j : act.its) {
+                    done += j.second->done;
+                    expected += j.second->expected;
+                    running += j.second->running;
+                    failed += j.second->failed;
+                }
+
+                expected = std::max(expected, act.expected);
+
+                std::string s;
+
+                if (running || done || expected || failed) {
+                    if (running)
+                        if (expected != 0)
+                            s =
+                                fmt(ANSI_BLUE + numberFmt + ANSI_NORMAL "/" ANSI_GREEN + numberFmt + ANSI_NORMAL "/"
+                                        + numberFmt,
+                                    running / unit,
+                                    done / unit,
+                                    expected / unit);
+                        else
+                            s =
+                                fmt(ANSI_BLUE + numberFmt + ANSI_NORMAL "/" ANSI_GREEN + numberFmt + ANSI_NORMAL,
+                                    running / unit,
+                                    done / unit);
+                    else if (expected != done)
+                        if (expected != 0)
+                            s = fmt(ANSI_GREEN + numberFmt + ANSI_NORMAL "/" + numberFmt, done / unit, expected / unit);
+                        else
+                            s = fmt(ANSI_GREEN + numberFmt + ANSI_NORMAL, done / unit);
+                    else
+                        s = fmt(done ? ANSI_GREEN + numberFmt + ANSI_NORMAL : numberFmt, done / unit);
+                    s = fmt(itemFmt, s);
+
+                    if (failed)
+                        s += fmt(" (" ANSI_RED "%d failed" ANSI_NORMAL ")", failed / unit);
+                }
+
+                return s;
+            };
+
+        auto renderSizeActivity = [&] [[nodiscard]] (ActivityType type, const std::string & itemFmt = "%s") {
+            auto & act = state.activitiesByType[type];
+            uint64_t done = act.done, expected = act.done, running = 0, failed = act.failed;
+            for (auto & j : act.its) {
+                done += j.second->done;
+                expected += j.second->expected;
+                running += j.second->running;
+                failed += j.second->failed;
+            }
+
+            expected = std::max(expected, act.expected);
+
+            std::optional<SizeUnit> commonUnit;
+            std::string s;
+
+            if (running || done || expected || failed) {
+                if (running)
+                    if (expected != 0) {
+                        commonUnit = getCommonSizeUnit({(int64_t) running, (int64_t) done, (int64_t) expected});
+                        s =
+                            fmt(ANSI_BLUE "%s" ANSI_NORMAL "/" ANSI_GREEN "%s" ANSI_NORMAL "/%s",
+                                commonUnit ? renderSizeWithoutUnit(running, *commonUnit) : renderSize(running),
+                                commonUnit ? renderSizeWithoutUnit(done, *commonUnit) : renderSize(done),
+                                commonUnit ? renderSizeWithoutUnit(expected, *commonUnit) : renderSize(expected));
+                    } else {
+                        commonUnit = getCommonSizeUnit({(int64_t) running, (int64_t) done});
+                        s =
+                            fmt(ANSI_BLUE "%s" ANSI_NORMAL "/" ANSI_GREEN "%s" ANSI_NORMAL,
+                                commonUnit ? renderSizeWithoutUnit(running, *commonUnit) : renderSize(running),
+                                commonUnit ? renderSizeWithoutUnit(done, *commonUnit) : renderSize(done));
+                    }
+                else if (expected != done)
+                    if (expected != 0) {
+                        commonUnit = getCommonSizeUnit({(int64_t) done, (int64_t) expected});
+                        s =
+                            fmt(ANSI_GREEN "%s" ANSI_NORMAL "/%s",
+                                commonUnit ? renderSizeWithoutUnit(done, *commonUnit) : renderSize(done),
+                                commonUnit ? renderSizeWithoutUnit(expected, *commonUnit) : renderSize(expected));
+                    } else {
+                        commonUnit = getSizeUnit(done);
+                        s = fmt(ANSI_GREEN "%s" ANSI_NORMAL, renderSizeWithoutUnit(done, *commonUnit));
+                    }
+                else {
+                    commonUnit = getSizeUnit(done);
+                    s = fmt(done ? ANSI_GREEN "%s" ANSI_NORMAL : "%s", renderSizeWithoutUnit(done, *commonUnit));
+                }
+
+                if (commonUnit)
+                    s = fmt("%s %siB", s, getSizeUnitSuffix(*commonUnit));
+
+                s = fmt(itemFmt, s);
+
+                if (failed)
+                    s += fmt(" (" ANSI_RED "%s failed" ANSI_NORMAL ")", renderSize(failed));
+            }
+
+            return s;
+        };
+
+        auto maybeAppendToResult = [&](std::string_view s) {
+            if (s.empty())
+                return;
+            if (!res.empty())
+                res += ", ";
+            res += s;
+        };
+
+        auto showActivity =
+            [&](ActivityType type, const std::string & itemFmt, const std::string & numberFmt = "%d", double unit = 1) {
+                maybeAppendToResult(renderActivity(type, itemFmt, numberFmt, unit));
+            };
+
+        showActivity(actBuilds, "%s built");
+
+        auto s1 = renderActivity(actCopyPaths, "%s copied");
+        auto s2 = renderSizeActivity(actCopyPath);
+
+        if (!s1.empty() || !s2.empty()) {
+            if (!res.empty())
+                res += ", ";
+            if (s1.empty())
+                res += "0 copied";
+            else
+                res += s1;
+            if (!s2.empty()) {
+                res += " (";
+                res += s2;
+                res += ')';
+            }
+        }
+
+        maybeAppendToResult(renderSizeActivity(actFileTransfer, "%s DL"));
+
+        {
+            auto s = renderActivity(actOptimiseStore, "%s paths optimised");
+            if (s != "") {
+                s += fmt(", %s / %d inodes freed", renderSize(state.bytesLinked), state.filesLinked);
+                if (!res.empty())
+                    res += ", ";
+                res += s;
+            }
+        }
+
+        // FIXME: don't show "done" paths in green.
+        showActivity(actVerifyPaths, "%s paths verified");
+
+        if (state.corruptedPaths) {
+            if (!res.empty())
+                res += ", ";
+            res += fmt(ANSI_RED "%d corrupted" ANSI_NORMAL, state.corruptedPaths);
+        }
+
+        if (state.untrustedPaths) {
+            if (!res.empty())
+                res += ", ";
+            res += fmt(ANSI_RED "%d untrusted" ANSI_NORMAL, state.untrustedPaths);
+        }
+
+        return res;
+    }
+
+    void writeToStdout(std::string_view s) override
+    {
+        auto state(state_.lock());
+        if (state->active) {
+            invalidateRedrawCache();
+            std::cerr << "\r\e[K";
+            Logger::writeToStdout(s);
+            draw(*state);
+        } else {
+            Logger::writeToStdout(s);
+        }
+    }
+
+    std::optional<char> ask(std::string_view msg) override
+    {
+        auto state(state_.lock());
+        if (!state->active)
+            return {};
+        invalidateRedrawCache();
+        std::cerr << fmt("\r\e[K%s ", msg);
+        unhideCursorIfNeeded();
+        auto s = trim(readLine(getStandardInput(), true));
+        hideCursorIfNeeded();
+        if (s.size() != 1)
+            return {};
+        draw(*state);
+        return s[0];
+    }
+
+    void setPrintBuildLogs(bool printBuildLogs) override
+    {
+        this->printBuildLogs = printBuildLogs;
+    }
+};
+
+} // namespace
+
+std::unique_ptr<Logger> makeProgressBar()
+{
+    return std::make_unique<ProgressBar>(isTTY());
+}
+
+} // namespace nix

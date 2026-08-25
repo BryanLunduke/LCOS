@@ -1,0 +1,121 @@
+#include "nix/fetchers/filtering-source-accessor.hh"
+#include "nix/util/sync.hh"
+
+#include <boost/unordered/concurrent_flat_set.hpp>
+
+namespace nix {
+
+std::optional<std::filesystem::path> FilteringSourceAccessor::getPhysicalPath(const CanonPath & path)
+{
+    checkAccess(path);
+    return next->getPhysicalPath(prefix / path);
+}
+
+void FilteringSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
+{
+    checkAccess(path);
+    return next->readFile(prefix / path, sink, sizeCallback);
+}
+
+bool FilteringSourceAccessor::pathExists(const CanonPath & path)
+{
+    return isAllowed(path) && next->pathExists(prefix / path);
+}
+
+std::optional<SourceAccessor::Stat> FilteringSourceAccessor::maybeLstat(const CanonPath & path)
+{
+    return isAllowed(path) ? next->maybeLstat(prefix / path) : std::nullopt;
+}
+
+SourceAccessor::Stat FilteringSourceAccessor::lstat(const CanonPath & path)
+{
+    checkAccess(path);
+    return next->lstat(prefix / path);
+}
+
+SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPath & path)
+{
+    checkAccess(path);
+    DirEntries entries;
+    for (auto & entry : next->readDirectory(prefix / path)) {
+        if (isAllowed(path / entry.first))
+            entries.insert(std::move(entry));
+    }
+    return entries;
+}
+
+std::string FilteringSourceAccessor::readLink(const CanonPath & path)
+{
+    checkAccess(path);
+    return next->readLink(prefix / path);
+}
+
+std::string FilteringSourceAccessor::showPath(const CanonPath & path)
+{
+    return displayPrefix + next->showPath(prefix / path) + displaySuffix;
+}
+
+std::pair<CanonPath, std::optional<std::string>> FilteringSourceAccessor::getFingerprint(const CanonPath & path)
+{
+    if (fingerprint)
+        return {path, fingerprint};
+    return next->getFingerprint(prefix / path);
+}
+
+void FilteringSourceAccessor::checkAccess(const CanonPath & path)
+{
+    if (!isAllowed(path))
+        throw makeNotAllowedError(path);
+}
+
+struct AllowListSourceAccessorImpl : AllowListSourceAccessor
+{
+private:
+    void anchor() override {};
+public:
+    SharedSync<std::set<CanonPath>> allowedPrefixes;
+    boost::concurrent_flat_set<CanonPath> allowedPaths;
+
+    AllowListSourceAccessorImpl(
+        ref<SourceAccessor> next,
+        const std::set<CanonPath> & allowedPrefixes,
+        const std::unordered_set<CanonPath> & allowedPaths,
+        MakeNotAllowedError && makeNotAllowedError)
+        : AllowListSourceAccessor(SourcePath(next), std::move(makeNotAllowedError))
+        , allowedPrefixes(allowedPrefixes.begin(), allowedPrefixes.end())
+        , allowedPaths(allowedPaths.begin(), allowedPaths.end())
+    {
+    }
+
+    bool isAllowed(const CanonPath & path) override
+    {
+        /* Read lock is held for the duration of the full expression if the || doesn't short-circuit. */
+        return allowedPaths.contains(path) || path.isAllowed(*allowedPrefixes.readLock());
+    }
+
+    void allowPrefix(CanonPath prefix) override
+    {
+        allowedPrefixes.lock()->insert(std::move(prefix));
+    }
+};
+
+ref<AllowListSourceAccessor> AllowListSourceAccessor::create(
+    ref<SourceAccessor> next,
+    const std::set<CanonPath> & allowedPrefixes,
+    const std::unordered_set<CanonPath> & allowedPaths,
+    MakeNotAllowedError && makeNotAllowedError)
+{
+    return make_ref<AllowListSourceAccessorImpl>(next, allowedPrefixes, allowedPaths, std::move(makeNotAllowedError));
+}
+
+bool CachingFilteringSourceAccessor::isAllowed(const CanonPath & path)
+{
+    auto i = cache.find(path);
+    if (i != cache.end())
+        return i->second;
+    auto res = isAllowedUncached(path);
+    cache.emplace(path, res);
+    return res;
+}
+
+} // namespace nix

@@ -1,0 +1,23 @@
+# vim: filetype=meson
+
+# A relative path means it gets appended to prefix.
+option(
+  'profile-dir',
+  type : 'string',
+  value : 'etc/profile.d',
+  description : 'the path to install shell profile files',
+)
+
+option(
+  'mimalloc',
+  type : 'feature',
+  value : 'auto',
+  description : 'Link against mimalloc to override the default memory allocator',
+)
+
+option(
+  'plugin-c-api',
+  type : 'boolean',
+  value : false,
+  description : 'Embed the public C API into nix so plugins can resolve those symbols from the executable',
+)

@@ -1,0 +1,8 @@
+# vim: filetype=meson
+
+option(
+  'plugin-c-api',
+  type : 'boolean',
+  value : false,
+  yield : true,
+)

@@ -1,0 +1,165 @@
+#pragma once
+///@file
+
+#include "nix/util/url.hh"
+#include "nix/store/binary-cache-store.hh"
+#include "nix/store/filetransfer.hh"
+#include "nix/util/sync.hh"
+
+#include <chrono>
+
+namespace nix {
+
+struct HttpBinaryCacheStoreConfig : std::enable_shared_from_this<HttpBinaryCacheStoreConfig>,
+                                    virtual Store::Config,
+                                    BinaryCacheStoreConfig
+{
+private:
+    void anchor() override;
+
+public:
+    HttpBinaryCacheStoreConfig(const Params & params)
+        : StoreConfig(params, FilePathType::Unix)
+        , BinaryCacheStoreConfig(params)
+    {
+    }
+
+    HttpBinaryCacheStoreConfig(ParsedURL cacheUri, const Store::Config::Params & params);
+
+    ParsedURL cacheUri;
+
+    Setting<std::optional<CompressionAlgo>> narinfoCompression{
+        this, std::nullopt, "narinfo-compression", "Compression method for `.narinfo` files."};
+
+    Setting<std::optional<CompressionAlgo>> lsCompression{
+        this, std::nullopt, "ls-compression", "Compression method for `.ls` files."};
+
+    Setting<std::optional<CompressionAlgo>> logCompression{
+        this,
+        std::nullopt,
+        "log-compression",
+        R"(
+          Compression method for `log/*` files. It is recommended to
+          use a compression method supported by most web browsers
+          (e.g. `brotli`).
+        )"};
+
+    Setting<std::optional<AbsolutePath>> tlsCert{
+        this, std::nullopt, "tls-certificate", "Path to an optional TLS client certificate in PEM format."};
+
+    Setting<std::optional<AbsolutePath>> tlsKey{
+        this, std::nullopt, "tls-private-key", "Path to an optional TLS client certificate private key in PEM format."};
+
+    Setting<uint32_t> retryDelayMs{
+        this,
+        0,
+        "retry-delay",
+        "Override [`filetransfer-retry-delay`](@docroot@/command-ref/conf-file.md#conf-filetransfer-retry-delay) for requests to this store (milliseconds)."};
+
+    Setting<uint32_t> retryDelayRateLimitedMs{
+        this,
+        0,
+        "retry-delay-rate-limited",
+        "Override [`filetransfer-retry-delay-rate-limited`](@docroot@/command-ref/conf-file.md#conf-filetransfer-retry-delay-rate-limited) for requests to this store (milliseconds)."};
+
+    Setting<uint32_t> retryMaxDelayMs{
+        this,
+        0,
+        "retry-max-delay",
+        "Override [`filetransfer-retry-max-delay`](@docroot@/command-ref/conf-file.md#conf-filetransfer-retry-max-delay) for requests to this store (milliseconds)."};
+
+    Setting<uint32_t> retryAttempts{
+        this,
+        0,
+        "retry-attempts",
+        "Override [`filetransfer-retry-attempts`](@docroot@/command-ref/conf-file.md#conf-filetransfer-retry-attempts) for requests to this store."};
+
+    static const std::string name()
+    {
+        return "HTTP Binary Cache Store";
+    }
+
+    static StringSet uriSchemes();
+
+    static std::string doc();
+
+    ref<Store> openStore(ref<FileTransfer> fileTransfer) const;
+
+    ref<Store> openStore() const override;
+
+    StoreReference getReference() const override;
+};
+
+class HttpBinaryCacheStore : public virtual BinaryCacheStore
+{
+    void anchor() override;
+
+    struct State
+    {
+        bool enabled = true;
+        std::chrono::steady_clock::time_point disabledUntil;
+    };
+
+    Sync<State> _state;
+
+protected:
+
+    ref<FileTransfer> fileTransfer;
+
+public:
+
+    using Config = HttpBinaryCacheStoreConfig;
+
+    ref<Config> config;
+
+    HttpBinaryCacheStore(ref<Config> config, ref<FileTransfer> fileTransfer = getFileTransfer());
+
+    void init() override;
+
+    StorePaths topoSortPaths(const StorePathSet & paths) override;
+
+protected:
+
+    std::optional<CompressionAlgo> getCompressionMethod(const std::string & path);
+
+    void maybeDisable();
+
+    void checkEnabled();
+
+    bool fileExists(const std::string & path) override;
+
+    void upsertFile(
+        const std::string & path, RestartableSource & source, const std::string & mimeType, uint64_t sizeHint) override;
+
+    FileTransferRequest makeRequest(std::string_view path);
+
+    /**
+     * Uploads data to the binary cache.
+     *
+     * This is a lower-level method that handles the actual upload after
+     * compression has been applied. It does not handle compression or
+     * error wrapping - those are the caller's responsibility.
+     *
+     * @param path The path in the binary cache to upload to
+     * @param source The data source (should already be compressed if needed)
+     * @param sizeHint Size hint for the data
+     * @param mimeType The MIME type of the content
+     * @param headers Additional headers to include in the HTTP request.
+     */
+    void upload(
+        std::string_view path,
+        RestartableSource & source,
+        uint64_t sizeHint,
+        std::string_view mimeType,
+        std::optional<Headers> headers);
+
+    void getFile(const std::string & path, Sink & sink) override;
+
+    void getFile(const std::string & path, Callback<std::optional<std::string>> callback) noexcept override;
+
+    std::optional<std::string> getNixCacheInfo() override;
+
+    std::optional<TrustedFlag> isTrustedClient() override;
+};
+
+} // namespace nix

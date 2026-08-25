@@ -1,0 +1,147 @@
+#pragma once
+///@file
+
+#include "nix/store/store-api.hh"
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
+
+namespace nix {
+
+typedef boost::unordered_flat_map<
+    StorePath,
+    boost::unordered_flat_set<std::string, StringViewHash, std::equal_to<>>,
+    std::hash<StorePath>>
+    Roots;
+
+/**
+ * Garbage collector operation:
+ *
+ * - `gcReturnLive`: return the set of paths reachable from
+ *   (i.e. in the closure of) the roots.
+ *
+ * - `gcReturnDead`: return the set of paths not reachable from
+ *   the roots.
+ *
+ * - `gcDeleteDead`: actually delete the latter set.
+ *
+ * - `gcDeleteSpecific`: delete the paths listed in
+ *    `pathsToDelete`, insofar as they are not reachable.
+ */
+enum class GCAction {
+    gcReturnLive,
+    gcReturnDead,
+    gcDeleteDead,
+    gcDeleteSpecific,
+};
+
+struct GCOptions
+{
+    using GCAction = nix::GCAction;
+    using enum GCAction;
+
+    struct WholeStore
+    {};
+
+    struct SpecificPaths
+    {
+        StorePathSet paths;
+
+        /**
+         * Allow dead referrers of candidate paths to also be deleted.
+         */
+        bool deleteReferrers = false;
+    };
+
+    GCAction action{gcDeleteDead};
+
+    /**
+     * If `ignoreLiveness` is set, then reachability from the roots is
+     * ignored (dangerous!).  However, the paths must still be
+     * unreferenced *within* the store (i.e., there can be no other
+     * store paths that depend on them).
+     */
+    bool ignoreLiveness{false};
+
+    /**
+     * The paths from which to delete.
+     */
+    using GCPaths = std::variant<WholeStore, SpecificPaths>;
+    GCPaths pathsToDelete;
+
+    /**
+     * Stop after at least `maxFreed` bytes have been freed.
+     */
+    uint64_t maxFreed{std::numeric_limits<uint64_t>::max()};
+};
+
+struct GCResults
+{
+    /**
+     * Depending on the action, the GC roots, or the paths that would
+     * be or have been deleted.
+     */
+    StringSet paths;
+
+    /**
+     * For `gcDeleteDead` and `gcDeleteSpecific`, the number of bytes that were freed.
+     */
+    uint64_t bytesFreed = 0;
+};
+
+/**
+ * Mix-in class for \ref Store "stores" which expose a notion of garbage
+ * collection.
+ *
+ * Garbage collection will allow deleting paths which are not
+ * transitively "rooted".
+ *
+ * The notion of GC roots actually not part of this class.
+ *
+ *  - The base `Store` class has `Store::addTempRoot()` because for a store
+ *    that doesn't support garbage collection at all, a temporary GC root is
+ *    safely implementable as no-op.
+ *
+ *    @todo actually this is not so good because stores are *views*.
+ *    Some views have only a no-op temp roots even though others to the
+ *    same store allow triggering GC. For instance one can't add a root
+ *    over ssh, but that doesn't prevent someone from gc-ing that store
+ *    accessed via SSH locally).
+ *
+ *  - The derived `LocalFSStore` class has `LocalFSStore::addPermRoot`,
+ *    which is not part of this class because it relies on the notion of
+ *    an ambient file system. There are stores (`ssh-ng://`, for one),
+ *    that *do* support garbage collection but *don't* expose any file
+ *    system, and `LocalFSStore::addPermRoot` thus does not make sense
+ *    for them.
+ */
+struct GcStore : public virtual Store
+{
+private:
+    void anchor() override;
+
+public:
+    inline static std::string operationName = "Garbage collection";
+
+    /**
+     * Find the roots of the garbage collector.  Each root is a pair
+     * `(link, storepath)` where `link` is the path of the symlink
+     * outside of the Nix store that point to `storePath`. If
+     * `censor` is true, privacy-sensitive information about roots
+     * found in `/proc` is censored.
+     */
+    virtual Roots findRoots(bool censor) = 0;
+
+    /**
+     * Perform a garbage collection.
+     */
+    virtual void collectGarbage(const GCOptions & options, GCResults & results) = 0;
+
+    /**
+     * Delete build trace entries (realisations) from the store's database.
+     *
+     * The entries are specified by their key (the build trace is a map).
+     */
+    virtual void deleteBuildTraces(const std::set<DrvOutput> & keys) = 0;
+};
+
+} // namespace nix

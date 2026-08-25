@@ -1,0 +1,79 @@
+# Doxyfile 1.9.5
+
+PROJECT_NAME           = "Nix"
+PROJECT_NUMBER         = @PROJECT_NUMBER@
+PROJECT_BRIEF          = "Nix, the purely functional package manager; unstable internal interfaces"
+PROJECT_LOGO           = @src@/internal-api-docs/logo.png
+PROJECT_ICON           = @src@/internal-api-docs/logo.png
+
+OUTPUT_DIRECTORY       = @OUTPUT_DIRECTORY@
+GENERATE_LATEX         = NO
+STRIP_FROM_PATH        = @src@
+
+INPUT                  =      \
+  @src@/../CONTRIBUTING.md    \
+  @src@/libcmd                \
+  @src@/libexpr               \
+  @src@/libexpr-test-support  \
+  @src@/libfetchers           \
+  @src@/libflake              \
+  @src@/libmain               \
+  @src@/libstore              \
+  @src@/libstore-test-support \
+  @src@/libutil               \
+  @src@/libutil-test-support  \
+  @src@/nix
+
+EXCLUDE                =      \
+  @src@/libcmd/pch/           \
+  @src@/libexpr/pch/          \
+  @src@/libexpr-tests/pch/    \
+  @src@/libfetchers/pch/      \
+  @src@/libstore/pch/         \
+  @src@/libstore-tests/pch/   \
+  @src@/libutil/pch/          \
+  @src@/libutil-tests/pch/    \
+  @src@/nix/pch/              \
+  @src@/nswrapper/pch/
+
+RECURSIVE = YES
+
+EXCLUDE_SYMBOLS = nix::json_avoids_null
+
+FILE_PATTERNS          = *.cc *.hh *.c *.h
+MACRO_EXPANSION        = YES
+PREDEFINED             = DOXYGEN_SKIP __linux__ __APPLE__ __FreeBSD__
+EXPAND_ONLY_PREDEF     = YES
+EXPAND_AS_DEFINED      =                    \
+  DECLARE_COMMON_SERIALISER                 \
+  DECLARE_WORKER_SERIALISER                 \
+  DECLARE_SERVE_SERIALISER                  \
+  LENGTH_PREFIXED_PROTO_HELPER              \
+  LENGTH_PREFIXED_PROTO_HELPER_X            \
+  WORKER_USE_LENGTH_PREFIX_SERIALISER       \
+  WORKER_USE_LENGTH_PREFIX_SERIALISER_COMMA \
+  SERVE_USE_LENGTH_PREFIX_SERIALISER        \
+  SERVE_USE_LENGTH_PREFIX_SERIALISER_COMMA  \
+  COMMON_USE_LENGTH_PREFIX_SERIALISER       \
+  JSON_IMPL                                 \
+  JSON_IMPL_WITH_XP_FEATURES                \
+  JSON_IMPL_WITH_XP_FEATURES_INNER          \
+  MakeBinOp                                 \
+  MakeBinOpMembers                          \
+  MakeError                                 \
+  COMMON_METHODS                            \
+  NIX_VALUE_STORAGE_FOR_EACH_FIELD          \
+  NIX_VALUE_PAYLOAD_TYPE                    \
+  NIX_VALUE_STORAGE_DEFINE_FIELD            \
+  NIX_VALUE_STORAGE_GET_IMPL                \
+  NIX_VALUE_STORAGE_SET_IMPL                \
+  ARG                                       \
+  COMMA_                                    \
+  MAKE_WRAPPER_CONSTRUCTOR                  \
+  GENERATE_CMP                              \
+  GENERATE_CMP_EXT                          \
+
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_INCOMPLETE_DOC = NO
+QUIET                  = YES
+WARNINGS               = @WARNINGS@

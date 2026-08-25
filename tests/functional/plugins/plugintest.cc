@@ -1,0 +1,29 @@
+#include "nix/util/config-global.hh"
+#include "nix/expr/primops.hh"
+
+namespace nix {
+
+struct MySettings : Config
+{
+    Setting<bool> settingSet{this, false, "setting-set", "Whether the plugin-defined setting was set"};
+};
+
+MySettings mySettings;
+
+static GlobalConfig::Register rs(&mySettings);
+
+static void prim_anotherNull(EvalState & state, CallSite callSite, Value * const * args, Value & v)
+{
+    if (mySettings.settingSet)
+        v.mkNull();
+    else
+        v.mkBool(false);
+}
+
+static RegisterPrimOp rp({
+    .name = "anotherNull",
+    .arity = 0,
+    .impl = prim_anotherNull,
+});
+
+} // namespace nix

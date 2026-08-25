@@ -1,0 +1,27 @@
+"$schema": "http://json-schema.org/draft-04/schema"
+"$id": "https://nix.dev/manual/nix/latest/protocols/json/schema/hash-v1.json"
+title: Hash
+description: |
+  A cryptographic hash value used throughout Nix for content addressing and integrity verification.
+
+  This schema describes the JSON representation of Nix's `Hash` type as an [SRI](https://developer.mozilla.org/en-US/docs/Web/Security/Subresource_Integrity) string.
+type: string
+pattern: "^(blake3|md5|sha1|sha256|sha512)-[A-Za-z0-9+/]+=*$"
+examples:
+- "sha256-ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="
+- "sha512-IEqPxt2oLwoM7XvrjgikFlfBbvRosiioJ5vjMacDwzWW/RXBOxsH+aodO+pXeJygMa2Fx6cd1wNU7GMSOMo0RQ=="
+
+"$defs":
+  algorithm:
+    type: string
+    enum:
+    - blake3
+    - md5
+    - sha1
+    - sha256
+    - sha512
+    title: Hash algorithm
+    description: |
+      The hash algorithm used to compute the hash value.
+
+      `blake3` is currently experimental and requires the [`blake-hashing`](@docroot@/development/experimental-features.md#xp-feature-blake3-hashes) experimental feature.

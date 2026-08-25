@@ -1,0 +1,29 @@
+#include "nix/cmd/command.hh"
+
+namespace nix {
+
+struct CmdStore : NixMultiCommand
+{
+    CmdStore()
+        : NixMultiCommand("store", RegisterCommand::getCommandsFor({"store"}))
+    {
+        aliases = {
+            {"ping", {AliasStatus::Deprecated, {"info"}}},
+            {"optimize", {AliasStatus::LinguisticVariation, {"optimise"}}},
+        };
+    }
+
+    std::string description() override
+    {
+        return "manipulate a Nix store";
+    }
+
+    Category category() override
+    {
+        return catUtility;
+    }
+};
+
+static auto rCmdStore = registerCommand<CmdStore>("store");
+
+} // namespace nix

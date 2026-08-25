@@ -1,0 +1,179 @@
+#pragma once
+///@file
+
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <typeinfo>
+
+#include "nix/util/demangle.hh"
+
+namespace nix {
+
+/**
+ * Exception thrown by ref::cast() when dynamic_pointer_cast fails.
+ * Inherits from std::bad_cast for semantic correctness, but carries a message with type info.
+ */
+class bad_ref_cast : public std::bad_cast
+{
+    std::string msg;
+
+public:
+    bad_ref_cast(std::string msg)
+        : msg(std::move(msg))
+    {
+    }
+
+    bad_ref_cast(bad_ref_cast &&) = default;
+    bad_ref_cast(const bad_ref_cast &) = default;
+    bad_ref_cast & operator=(bad_ref_cast &&) = default;
+    bad_ref_cast & operator=(const bad_ref_cast &) = default;
+    ~bad_ref_cast() override;
+
+    const char * what() const noexcept override
+    {
+        return msg.c_str();
+    }
+};
+
+/**
+ * Concept for implicit ref covariance: From* must be implicitly convertible to To*.
+ *
+ * This allows implicit upcasts (Derived -> Base) but rejects downcasts.
+ */
+// Design note: This named concept is technically redundant but provides a readable hint
+// in error messages. Alternative: static_assert can have custom messages, but doesn't
+// participate in SFINAE, so std::is_convertible_v<ref<Base>, ref<Derived>> would
+// incorrectly return true (the conversion would exist but fail at instantiation
+// rather than being excluded).
+template<typename From, typename To>
+concept RefImplicitlyUpcastableTo = std::is_convertible_v<From *, To *>;
+
+/**
+ * A simple non-nullable reference-counted pointer. Actually a wrapper
+ * around std::shared_ptr that prevents null constructions.
+ */
+template<typename T>
+class ref
+{
+private:
+
+    std::shared_ptr<T> p;
+
+    void assertNonNull()
+    {
+        if (!p)
+            throw std::invalid_argument("null pointer cast to ref");
+    }
+
+public:
+
+    using element_type = T;
+
+    explicit ref(const std::shared_ptr<T> & p)
+        : p(p)
+    {
+        assertNonNull();
+    }
+
+    explicit ref(std::shared_ptr<T> && p)
+        : p(std::move(p))
+    {
+        assertNonNull();
+    }
+
+    explicit ref(T * p)
+        : p(p)
+    {
+        assertNonNull();
+    }
+
+    T * get() const
+    {
+        return p.get();
+    }
+
+    T * operator->() const
+    {
+        return get();
+    }
+
+    T & operator*() const
+    {
+        return *p;
+    }
+
+    std::shared_ptr<T> get_ptr() const &
+    {
+        return p;
+    }
+
+    std::shared_ptr<T> get_ptr() &&
+    {
+        return std::move(p);
+    }
+
+    /**
+     * Convenience to avoid explicit `get_ptr()` call in some cases.
+     */
+    operator std::shared_ptr<T>(this auto && self)
+    {
+        return std::forward<decltype(self)>(self).get_ptr();
+    }
+
+    template<typename T2>
+    ref<T2> cast() const
+    {
+        auto casted = std::dynamic_pointer_cast<T2>(p);
+        if (!casted)
+            throw bad_ref_cast(
+                "ref<" + demangle(typeid(T).name()) + "> cannot be cast to ref<" + demangle(typeid(T2).name()) + ">");
+        return ref<T2>(std::move(casted));
+    }
+
+    template<typename T2>
+    std::shared_ptr<T2> dynamic_pointer_cast() const
+    {
+        return std::dynamic_pointer_cast<T2>(p);
+    }
+
+    /**
+     * Implicit conversion to ref of base type (covariance).
+     * Downcasts are rejected; use .cast() (throws bad_ref_cast) or .dynamic_pointer_cast() (returns nullptr) instead.
+     */
+    template<typename T2>
+        requires RefImplicitlyUpcastableTo<T, T2>
+    operator ref<T2>() const
+    {
+        return ref<T2>(p);
+    }
+
+    bool operator==(const ref<T> & other) const
+    {
+        return p == other.p;
+    }
+
+    bool operator!=(const ref<T> & other) const
+    {
+        return p != other.p;
+    }
+
+    auto operator<=>(const ref<T> & other) const
+    {
+        return p <=> other.p;
+    }
+
+private:
+
+    template<typename T2, typename... Args>
+    friend ref<T2> make_ref(Args &&... args);
+};
+
+template<typename T, typename... Args>
+inline ref<T> make_ref(Args &&... args)
+{
+    auto p = std::make_shared<T>(std::forward<Args>(args)...);
+    return ref<T>(p);
+}
+
+} // namespace nix

@@ -1,0 +1,19 @@
+{
+  "builtOutputs": {
+    "bar": {
+      "outPath": "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar",
+      "signatures": []
+    },
+    "foo": {
+      "outPath": "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-foo",
+      "signatures": []
+    }
+  },
+  "cpuSystem": 604000000,
+  "cpuUser": 500000000,
+  "startTime": 30,
+  "status": "Built",
+  "stopTime": 50,
+  "success": true,
+  "timesBuilt": 3
+}

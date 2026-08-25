@@ -1,0 +1,395 @@
+#pragma once
+///@file
+
+#include <algorithm>
+#include <chrono>
+#include <compare>
+
+#include "nix/store/common-protocol.hh"
+#include "nix/store/gc-store.hh"
+
+namespace nix {
+
+#define WORKER_MAGIC_1 0x6e697863
+#define WORKER_MAGIC_2 0x6478696f
+
+/* Note: you generally shouldn't change the protocol version. Define a
+   new `WorkerProto::Feature` instead. */
+#define PROTOCOL_VERSION (1 << 8 | 39)
+#define MINIMUM_PROTOCOL_VERSION (1 << 8 | 18)
+#define GET_PROTOCOL_MAJOR(x) ((x) & 0xff00)
+#define GET_PROTOCOL_MINOR(x) ((x) & 0x00ff)
+#define STDERR_NEXT 0x6f6c6d67
+#define STDERR_READ 0x64617461  // data needed from source
+#define STDERR_WRITE 0x64617416 // data for sink
+#define STDERR_LAST 0x616c7473
+#define STDERR_ERROR 0x63787470
+#define STDERR_START_ACTIVITY 0x53545254
+#define STDERR_STOP_ACTIVITY 0x53544f50
+#define STDERR_RESULT 0x52534c54
+
+struct StoreDirConfig;
+struct Source;
+
+// items being serialised
+struct DerivedPath;
+struct BuildResult;
+struct KeyedBuildResult;
+struct ValidPathInfo;
+struct UnkeyedValidPathInfo;
+struct DrvOutput;
+struct UnkeyedRealisation;
+struct Realisation;
+enum BuildMode : uint8_t;
+enum TrustedFlag : bool;
+enum class GCAction;
+
+/**
+ * The "worker protocol", used by unix:// and ssh-ng:// stores.
+ *
+ * This `struct` is basically just a `namespace`; We use a type rather
+ * than a namespace just so we can use it as a template argument.
+ */
+struct WorkerProto
+{
+    /**
+     * Enumeration of all the request types for the protocol.
+     */
+    enum struct Op : uint64_t;
+
+    /**
+     * Version type for the protocol.
+     *
+     * This bundles the protocol version number with the negotiated
+     * feature set. The version number has a total ordering, but the
+     * full `Version` (number + features) only has a partial ordering,
+     * so there is no `operator<=>` on `Version` itself --- callers
+     * must compare `.number` explicitly.
+     */
+    struct Version
+    {
+        struct Number
+        {
+            unsigned int major;
+            uint8_t minor;
+
+            constexpr auto operator<=>(const Number &) const = default;
+
+            /**
+             * Convert to wire format for protocol compatibility.
+             * Format: (major << 8) | minor
+             */
+            constexpr unsigned int toWire() const
+            {
+                return (major << 8) | minor;
+            }
+
+            /**
+             * Convert from wire format.
+             */
+            static constexpr Number fromWire(unsigned int wire)
+            {
+                return {
+                    .major = (wire & 0xff00) >> 8,
+                    .minor = static_cast<uint8_t>(wire & 0x00ff),
+                };
+            };
+        } number;
+
+        using Feature = std::string;
+        using FeatureSet = std::set<Feature, std::less<>>;
+
+        FeatureSet features = {};
+
+        bool operator==(const Version &) const = default;
+
+        /**
+         * Partial ordering: v1 <= v2 iff v1.number <= v2.number AND
+         * v1.features is a subset of v2.features. Two versions with
+         * incomparable feature sets are unordered.
+         */
+        std::partial_ordering operator<=>(const Version & other) const;
+    };
+
+    /**
+     * @note you generally shouldn't change the protocol version number. Define a new
+     * `WorkerProto::Version::Feature` instead.
+     */
+    static const Version latest;
+
+    static const Version minimum;
+
+    /**
+     * Static version for the `builder-rpc-v0` feature.
+     * Should never change, as any modification would be derivation-visible.
+     */
+    static const Version builderRpcV0;
+
+    /**
+     * Feature for transmitting `UnkeyedRealisation` and `DrvOutput`
+     * using drvPath (store path) instead of the old hash-based JSON format.
+     */
+    static constexpr std::string_view featureRealisationWithPath = "realisation-with-path-not-hash";
+
+    /**
+     * Feature for garbage collecting a specific set of paths and deleting referrers.
+     */
+    static constexpr std::string_view featureDeleteDeadSpecificReferrers = "delete-dead-specific-referrers";
+
+    /**
+     * Feature for disabling SetOptions, which is a no-op in recursive-nix
+     */
+    static constexpr std::string_view featureDisableSetOptions = "disable-set-options";
+
+    /**
+     * Feature for enabling the `AddToStoreScanning` operation
+     */
+    static constexpr std::string_view featureAddToStoreScanning = "add-to-store-scanning";
+
+    /**
+     * Feature for enabling the `SubmitOutput` operation
+     */
+    static constexpr std::string_view featureSubmitOutput = "submit-output";
+
+    /**
+     * A unidirectional read connection, to be used by the read half of the
+     * canonical serializers below.
+     */
+    struct ReadConn
+    {
+        Source & from;
+        const Version & version;
+    };
+
+    /**
+     * A unidirectional write connection, to be used by the write half of the
+     * canonical serializers below.
+     */
+    struct WriteConn
+    {
+        Sink & to;
+        const Version & version;
+    };
+
+    /**
+     * Stripped down serialization logic suitable for sharing with Hydra.
+     *
+     * @todo remove once Hydra uses Store abstraction consistently.
+     */
+    struct BasicConnection;
+    struct BasicClientConnection;
+    struct BasicServerConnection;
+
+    /**
+     * Extra information provided as part of protocol negotiation.
+     */
+    struct ClientHandshakeInfo;
+
+    /**
+     * Data type for canonical pairs of serialisers for the worker protocol.
+     *
+     * See https://en.cppreference.com/w/cpp/language/adl for the broader
+     * concept of what is going on here.
+     */
+    template<typename T>
+    struct Serialise;
+    // This is the definition of `Serialise` we *want* to put here, but
+    // do not do so.
+    //
+    // The problem is that if we do so, C++ will think we have
+    // seralisers for *all* types. We don't, of course, but that won't
+    // cause an error until link time. That makes for long debug cycles
+    // when there is a missing serialiser.
+    //
+    // By not defining it globally, and instead letting individual
+    // serialisers specialise the type, we get back the compile-time
+    // errors we would like. When no serialiser exists, C++ sees an
+    // abstract "incomplete" type with no definition, and any attempt to
+    // use `to` or `from` static methods is a compile-time error because
+    // they don't exist on an incomplete type.
+    //
+    // This makes for a quicker debug cycle, as desired.
+#if 0
+    {
+        static T read(const StoreDirConfig & store, ReadConn conn);
+        static void write(const StoreDirConfig & store, WriteConn conn, const T & t);
+    };
+#endif
+
+    /**
+     * Wrapper function around `WorkerProto::Serialise<T>::write` that allows us to
+     * infer the type instead of having to write it down explicitly.
+     */
+    template<typename T>
+    static void write(const StoreDirConfig & store, WriteConn conn, const T & t)
+    {
+        WorkerProto::Serialise<T>::write(store, conn, t);
+    }
+};
+
+enum struct WorkerProto::Op : uint64_t {
+    IsValidPath = 1,
+    // HasSubstitutes = 3, // removed
+    // QueryPathHash = 4, // removed
+    // QueryReferences = 5, // removed
+    QueryReferrers = 6,
+    AddToStore = 7,
+    AddTextToStore = 8, // obsolete since 1.25, Nix 3.0. Use WorkerProto::Op::AddToStore
+    BuildPaths = 9,
+    EnsurePath = 10,
+    AddTempRoot = 11,
+    AddIndirectRoot = 12,
+    SyncWithGC = 13,
+    FindRoots = 14,
+    // ExportPath = 16, // removed
+    QueryDeriver = 18, // obsolete
+    SetOptions = 19,
+    CollectGarbage = 20,
+    QuerySubstitutablePathInfo = 21,
+    QueryDerivationOutputs = 22, // obsolete
+    QueryAllValidPaths = 23,
+    // QueryFailedPaths = 24, // removed
+    // ClearFailedPaths = 25, // removed
+    QueryPathInfo = 26,
+    // ImportPaths = 27, // removed
+    QueryDerivationOutputNames = 28, // obsolete
+    QueryPathFromHashPart = 29,
+    QuerySubstitutablePathInfos = 30,
+    QueryValidPaths = 31,
+    QuerySubstitutablePaths = 32,
+    QueryValidDerivers = 33,
+    OptimiseStore = 34,
+    VerifyStore = 35,
+    BuildDerivation = 36,
+    AddSignatures = 37,
+    NarFromPath = 38,
+    AddToStoreNar = 39,
+    QueryMissing = 40,
+    QueryDerivationOutputMap = 41,
+    RegisterDrvOutput = 42,
+    QueryRealisation = 43,
+    AddMultipleToStore = 44,
+    AddBuildLog = 45,
+    BuildPathsWithResults = 46,
+    AddPermRoot = 47,
+    // QueryActiveBuilds = 48, // reserved for https://github.com/NixOS/nix/pull/15979
+    // AddTempRoots = 49, // reserved for https://github.com/NixOS/nix/pull/16113
+    // QueryPathInfos = 50, // reserved for https://github.com/DeterminateSystems/nix-src/pull/539
+    SubmitOutput = 1000, // Only used within derivations with feature
+    AddToStoreScanning = 1001,
+};
+
+struct WorkerProto::ClientHandshakeInfo
+{
+    /**
+     * The version of the Nix daemon that is processing our requests.
+     *
+     * Do note, it may or may not communicating with another daemon,
+     * rather than being an "end" `LocalStore` or similar.
+     */
+    std::optional<std::string> daemonNixVersion;
+
+    /**
+     * Whether the remote side trusts us or not.
+     *
+     * 3 values: "yes", "no", or `std::nullopt` for "unknown".
+     *
+     * Note that the "remote side" might not be just the end daemon, but
+     * also an intermediary forwarder that can make its own trusting
+     * decisions. This would be the intersection of all their trust
+     * decisions, since it takes only one link in the chain to start
+     * denying operations.
+     */
+    std::optional<TrustedFlag> remoteTrustsUs;
+
+    bool operator==(const ClientHandshakeInfo &) const = default;
+};
+
+/**
+ * Convenience for sending operation codes.
+ *
+ * @todo Switch to using `WorkerProto::Serialise` instead probably. But
+ * this was not done at this time so there would be less churn.
+ */
+inline Sink & operator<<(Sink & sink, WorkerProto::Op op)
+{
+    return sink << static_cast<uint64_t>(op);
+}
+
+/**
+ * Convenience for debugging.
+ *
+ * @todo Perhaps render known opcodes more nicely.
+ */
+inline std::ostream & operator<<(std::ostream & s, WorkerProto::Op op)
+{
+    return s << static_cast<uint64_t>(op);
+}
+
+/**
+ * Declare a canonical serialiser pair for the worker protocol.
+ *
+ * We specialise the struct merely to indicate that we are implementing
+ * the function for the given type.
+ *
+ * Some sort of `template<...>` must be used with the caller for this to
+ * be legal specialization syntax. See below for what that looks like in
+ * practice.
+ */
+#define DECLARE_WORKER_SERIALISER(T)                                                               \
+    struct WorkerProto::Serialise<T>                                                               \
+    {                                                                                              \
+        static T read(const StoreDirConfig & store, WorkerProto::ReadConn conn);                   \
+        static void write(const StoreDirConfig & store, WorkerProto::WriteConn conn, const T & t); \
+    };
+
+template<>
+DECLARE_WORKER_SERIALISER(DerivedPath);
+template<>
+DECLARE_WORKER_SERIALISER(SingleDerivedPath);
+template<>
+DECLARE_WORKER_SERIALISER(BuildResult);
+template<>
+DECLARE_WORKER_SERIALISER(KeyedBuildResult);
+template<>
+DECLARE_WORKER_SERIALISER(ValidPathInfo);
+template<>
+DECLARE_WORKER_SERIALISER(UnkeyedValidPathInfo);
+template<>
+DECLARE_WORKER_SERIALISER(DrvOutput);
+template<>
+DECLARE_WORKER_SERIALISER(UnkeyedRealisation);
+template<>
+DECLARE_WORKER_SERIALISER(Realisation);
+template<>
+DECLARE_WORKER_SERIALISER(std::optional<UnkeyedRealisation>);
+template<>
+DECLARE_WORKER_SERIALISER(BuildMode);
+template<>
+DECLARE_WORKER_SERIALISER(GCAction);
+template<>
+DECLARE_WORKER_SERIALISER(std::optional<TrustedFlag>);
+template<>
+DECLARE_WORKER_SERIALISER(std::optional<std::chrono::microseconds>);
+template<>
+DECLARE_WORKER_SERIALISER(WorkerProto::ClientHandshakeInfo);
+
+template<>
+DECLARE_WORKER_SERIALISER(GCOptions::SpecificPaths);
+
+template<>
+DECLARE_WORKER_SERIALISER(GCOptions::GCPaths);
+
+template<typename T>
+DECLARE_WORKER_SERIALISER(std::vector<T>);
+#define COMMA_ ,
+template<typename T, typename Compare>
+DECLARE_WORKER_SERIALISER(std::set<T COMMA_ Compare>);
+template<typename... Ts>
+DECLARE_WORKER_SERIALISER(std::tuple<Ts...>);
+
+template<typename K, typename V, typename Compare>
+DECLARE_WORKER_SERIALISER(std::map<K COMMA_ V COMMA_ Compare>);
+#undef COMMA_
+
+} // namespace nix

@@ -1,0 +1,82 @@
+name: Upload Release
+on:
+  workflow_dispatch:
+    inputs:
+      eval_id:
+        description: "Hydra evaluation ID (from the maintenance-X.Y-release jobset)"
+        required: true
+        type: number
+      is_latest:
+        description: "Mark as latest release"
+        required: false
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    environment: releases
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/install-nix-action
+        with:
+          dogfood: false # Use stable version
+          use_cache: false # Don't want any cache injection shenanigans
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Set NIX_PATH from flake input
+        run: |
+          NIXPKGS_PATH=$(nix build --inputs-from .# nixpkgs#path --print-out-paths --no-link)
+          # Shebangs with perl have issues. Pin nixpkgs this way. nix shell should maybe
+          # get the same uberhack that nix-shell has to support it.
+          echo "NIX_PATH=nixpkgs=$NIXPKGS_PATH" >> "$GITHUB_ENV"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: "arn:aws:iam::080433136561:role/nix-release"
+          role-session-name: nix-release-oidc-${{ github.run_id }}
+          aws-region: eu-west-1
+      - name: Disable containerd image store
+        run: |
+          # Docker 28+ defaults to the containerd image store, which
+          # pushes layers uncompressed instead of gzip. OCI clients
+          # that only support gzip (e.g. go-containerregistry) fail
+          # with "gzip: invalid header". Disabling the containerd
+          # snapshotter restores the classic storage driver, which
+          # preserves gzip-compressed layers through the
+          # `docker load` / `docker push` pipeline.
+          echo '{"features":{"containerd-snapshotter":false}}' | sudo tee /etc/docker/daemon.json > /dev/null
+          sudo systemctl restart docker
+      - name: Login to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload release
+        run: |
+          ./maintainers/upload-release.pl \
+            ${{ inputs.eval_id }} \
+            --skip-git
+        env:
+          IS_LATEST: ${{ inputs.is_latest && '1' || '' }}
+      - name: Push to GHCR
+        run: |
+          DOCKER_OWNER="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[A-Z]' '[a-z]')/nix"
+          ./maintainers/upload-release.pl \
+            ${{ inputs.eval_id }} \
+            --skip-git \
+            --skip-s3 \
+            --docker-owner "$DOCKER_OWNER"
+        env:
+          IS_LATEST: ${{ inputs.is_latest && '1' || '' }}

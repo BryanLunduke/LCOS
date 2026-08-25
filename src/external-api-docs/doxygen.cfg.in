@@ -1,0 +1,33 @@
+# Doxyfile 1.9.5
+
+PROJECT_NAME           = "Nix"
+PROJECT_NUMBER         = @PROJECT_NUMBER@
+PROJECT_BRIEF          = "Nix, the purely functional package manager: C API (experimental)"
+PROJECT_LOGO           = @src@/src/external-api-docs/logo.png
+PROJECT_ICON           = @src@/src/external-api-docs/logo.png
+
+OUTPUT_DIRECTORY       = @OUTPUT_DIRECTORY@
+GENERATE_LATEX         = NO
+STRIP_FROM_PATH        = @src@/src
+
+INPUT                  =  \
+  @src@/src/libutil-c     \
+  @src@/src/libexpr-c     \
+  @src@/src/libflake-c    \
+  @src@/src/libstore-c    \
+  @src@/src/libfetchers-c \
+  @src@/src/libmain-c     \
+  @src@/src/external-api-docs/README.md
+
+FILE_PATTERNS          = nix_api_*.h *.md
+
+EXCLUDE_PATTERNS       = *_internal.h
+GENERATE_TREEVIEW      = YES
+OPTIMIZE_OUTPUT_FOR_C  = YES
+
+USE_MDFILE_AS_MAINPAGE = @src@/src/external-api-docs/README.md
+
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_INCOMPLETE_DOC = NO
+QUIET                  = YES
+WARNINGS               = @WARNINGS@
