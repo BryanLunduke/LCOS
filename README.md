@@ -8,7 +8,7 @@ The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
 
 - No Age or ID Verification.
 - No Online Accounts Needed.
-- No AI.
+- No AI Features.
 - No Weird Politics.
 - No Systemd.
 - No Forced Rust Clones.
@@ -25,6 +25,10 @@ LCOS is not a community project.  The King has total control, both technological
 LCOS tries to avoid LCOS-only code changes whenever possible, prefering to ship "vanilla" versions of upstream projects.  When changes or fixes are required for LCOS, in upstream projects, the preference is to hire developers of that upstream project to implement those changes in upstream itself.  That way everyone can benefit from the work being done while, simultaneously, supporting the work of engineers who make all of this possible.
 
 As such, source code deviations, from upstream projects, is kept to an absolute minimum in LCOS.  All source code, for all packages (including for the specific versions in use), are detailed and available.
+
+## No AI Features Built In
+
+LCOS is a classic desktop operating system with no requirements for online accounts, no ID verification, and no AI features by default.  If a user of LCOS wants to install AI tools (or any other tools), LCOS will not stand in their way.  A person should be able to install whatever software they like on their own computer.  LCOS has no policy for (or against) the usage of AI in the development of LCOS.
 
 ## Early Development
 
