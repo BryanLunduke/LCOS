@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Micropolis
+Type=Application
+Terminal=false
+Categories=Game;Simulation;
+Icon=micropolis
+Exec=/usr/games/micropolis

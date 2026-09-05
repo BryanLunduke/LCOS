@@ -1,0 +1,9 @@
+#
+# Default helpers.rc for Xfce's Preferred Applications
+#
+# Copyright (c) 2005-2006 Benedikt Meurer <benny@xfce.org>
+#
+
+WebBrowser=brave
+TerminalEmulator=cool-retro-term
+FileManager=thunar

@@ -1,0 +1,156 @@
+/************
+ * Nautilus *
+ ************/
+
+.nautilus-desktop.nautilus-canvas-item {
+	color: @theme_base_color;
+	text-shadow: 1px 1px alpha (@theme_fg_color, 0.8);
+}
+
+.nautilus-desktop.nautilus-canvas-item:active,
+.nautilus-desktop.nautilus-canvas-item:hover,
+.nautilus-desktop.nautilus-canvas-item:selected {
+	text-shadow: none;
+}
+
+.nautilus-desktop .entry {
+	background-image: none;
+	border-image: none;
+}
+
+/*******************
+ * gnome-documents *
+ *******************/
+
+.documents-scrolledwin.frame {
+	border-width: 1px 0 0 0;
+	border-radius: 0;
+}
+
+.documents-main-view.view {
+	background-color: @theme_base_color;
+}
+
+iconview.documents-main-view.check {
+	background-repeat: no-repeat;
+	background-position: center;
+	background-color: @theme_base_color;
+}
+
+.documents-selection-mode.toolbar {
+	border-width: 0;
+}
+
+.documents-selection-mode.toolbar .dim-label {
+	color: @theme_fg_color;
+}
+
+.documents-icon-bg {
+	background-color: @switch_trough_active_gradient_a;
+	border-radius: 3px;
+	color: @theme_base_color;
+}
+
+.documents-collection-icon {
+	background-color: @theme_bg_color;
+	border-radius: 3px;
+}
+
+/***************
+ * gnome-panel *
+ ***************/
+
+.gnome-panel-menu-bar,
+PanelApplet > GtkMenuBar.menubar,
+PanelToplevel,
+PanelWidget,
+PanelApplet {
+	background-color: @os_chrome_bg_color;
+	background-image: none;
+	color: @os_chrome_fg_color;
+}
+
+.gnome-panel-menu-bar,
+PanelApplet > GtkMenuBar.menubar,
+PanelApplet > GtkMenuBar.menubar.menuitem,
+PanelMenuBar.menubar,
+PanelMenuBar.menubar.menuitem {
+	-PanelMenuBar-icon-visible: true;
+}
+
+PanelAppletFrame {
+	background-color: @applet_frame_bg_color;
+	background-image: none;
+	color: @os_chrome_fg_color;
+}
+
+PanelApplet .button,
+PanelApplet .button:active,
+PanelApplet .button:hover,
+PanelApplet .button:hover:active {
+	border-image: url("img/border-gnome-panel-button.svg") 3 3 4 3 / 3px 3px 4px 3px repeat;
+}
+
+PanelApplet .menu .menuitem *:active {
+	color: @theme_text_color;
+}
+
+PanelApplet .menu .menuitem *:selected {
+	color: @theme_selected_fg_color;
+}
+
+PanelWidget > .button
+{
+	padding: 0;
+}
+
+WnckPager {
+	background-color: @pager_bg_color;
+}
+
+NaTrayApplet {
+	-NaTrayApplet-icon-padding: 7;
+	-NaTrayApplet-icon-size: 22;
+}
+
+GsmFailWhaleDialog {
+	background-color: @os_chrome_bg_color;
+	background-image: none;
+	color: @os_chrome_fg_color;
+}
+
+/******************
+ * gnome-terminal *
+ ******************/
+
+TerminalScreen {
+	background-color: @theme_base_color;
+	color: @theme_fg_color;
+}
+
+/*********
+ * Unity *
+ *********/
+
+UnityPanelWidget,
+.unity-panel {
+	background-image: none;
+	background-color: @theme_bg_color;
+	color: @theme_fg_color;
+	border-width: 0;
+}
+
+.unity-panel menubar menuitem:hover {
+	background-color: @menu_bg_color;
+	border-style: solid;
+	border-width: 1px 1px 0px;
+	border-color: @menubar_menuitem_hover_border_color;
+	border-radius: 3px 3px 0 0;
+	background-image: -gtk-gradient (linear,
+	                  left top,
+	                  left bottom,
+	                  from (@menubar_menuitem_hover_gradient_a),
+	                  color-stop (0.50, @menubar_menuitem_hover_gradient_b),
+	                  color-stop (0.50, @menubar_menuitem_hover_gradient_c),
+	                  to (@menubar_menuitem_hover_gradient_d));
+}

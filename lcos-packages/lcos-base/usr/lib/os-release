@@ -1,0 +1,10 @@
+PRETTY_NAME="LCOS 0.3"
+NAME="LCOS"
+VERSION_ID="0.3"
+VERSION="0.3 (excalibur)"
+VERSION_CODENAME=excalibur
+ID=lcos
+ID_LIKE="devuan debian"
+HOME_URL="https://lunduke.com"
+SUPPORT_URL="https://lunduke.com"
+BUG_REPORT_URL="https://lunduke.com"

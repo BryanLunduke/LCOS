@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Zork III
+Type=Application
+Terminal=false
+Categories=Game;AdventureGame;
+Icon=applications-games
+Exec=cool-retro-term -e frotz /usr/share/games/zork/zork3.z3

@@ -1,0 +1,63 @@
+# Workaround for the evolution ETable (bug #527532)
+widget_class "*.<ETable>.<ECanvas>" style "treeview_header"
+# Workaround for the evolution ETree
+widget_class "*.<ETree>.<ECanvas>" style "treeview_header"
+
+# Special case the nautilus-extra-view-widget
+# ToDo: A more generic approach for all applications that have a widget like this.
+widget "*.nautilus-extra-view-widget" style : highest "nautilus_location"
+
+# Work around for http://bugzilla.gnome.org/show_bug.cgi?id=382646
+# Note that this work around assumes that the combobox is _not_ in appears-as-list mode.
+widget_class "*.<GtkComboBox>.<GtkCellView>" style "text_is_fg_color_workaround"
+# This is the part of the workaround that fixes the menus
+widget "*.gtk-combobox-popup-menu.*" style "menuitem_text_is_fg_color_workaround"
+
+# Work around the usage of GtkLabel inside GtkListItems to display text.
+# This breaks because the label is shown on a background that is based on the base color.
+widget_class "*<GtkListItem>*" style "fg_is_text_color_workaround"
+# GtkCList also uses the fg color to draw text on top of the base colors.
+widget_class "*<GtkCList>" style "fg_is_text_color_workaround"
+# Nautilus when renaming files, and maybe other places.
+widget_class "*<EelEditableLabel>" style "fg_is_text_color_workaround"
+
+# See the documentation of the style.
+widget_class "EShellWindow.GtkVBox.BonoboDock.BonoboDockBand.BonoboDockItem*" style "evo_new_button_workaround"
+
+##########################################################################
+# Chromium.
+##########################################################################
+
+style "chromium_toolbar_button" {
+	engine "clearlooks" {
+		colorize_scrollbar = TRUE
+		reliefstyle = 1
+		menubarstyle = 2
+		toolbarstyle = 1
+		animation = FALSE
+		radius = 3.0
+		style = GUMMY
+
+		# Set a hint to disable backward compatibility fallbacks.
+		hint = "use-hints"
+	}
+}
+
+style "chrome-hacks"
+{
+	ChromeGtkFrame::frame-color = "#86abd9"
+	ChromeGtkFrame::frame-gradient-color = "#8cb0dc"
+	ChromeGtkFrame::frame-gradient-size = 16
+	ChromeGtkFrame::inactive-frame-color = "#dedcda"
+	ChromeGtkFrame::inactive-frame-gradient-color = "#e3e2e0"
+	ChromeGtkFrame::incognito-frame-color = "#4b6e99"
+	ChromeGtkFrame::incognito-frame-gradient-color = shade (1.02, "#4b6e99")
+	ChromeGtkFrame::incognito-inactive-frame-color = "#d5d3d1"
+	ChromeGtkFrame::incognito-inactive-frame-gradient-color = shade (1.02, "#d5d3d1")
+	ChromeGtkFrame::scrollbar-trough-color = shade (0.9, "#edeceb")
+	ChromeGtkFrame::scrollbar-slider-prelight-color = shade (1.05, "#86abd9")
+	ChromeGtkFrame::scrollbar-slider-normal-color = "#86abd9"
+}
+
+class "ChromeGtkFrame" style "chrome-hacks"
+widget_class "*Chrom*Button*" style "chromium_toolbar_button"

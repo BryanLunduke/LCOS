@@ -1,0 +1,16 @@
+Package: lcos-branding
+Version: 0.3-1
+Section: x11
+Priority: optional
+Architecture: all
+Installed-Size: 13132
+Maintainer: LCOS <lcos@lunduke.com>
+Homepage: https://lunduke.com
+Provides: lcos-branding
+Replaces: lcos-branding (<< 0.3)
+Conflicts: lcos-branding (<< 0.3)
+Description: LCOS 0.3 artwork (0.2-locked wallpapers, splash, logos)
+ Current 0.2-locked LCOS artwork: stock wallpaper (jpg/png), 4K wood
+ backdrop, GRUB splash (default / 1024x768 / 4K), and logos.
+ Also ships the extra legacy desktop-base lcos-bw-720.jpg.
+ Replaces old lcos-branding 1.0-2 / 0.2.0 (bw-720 + lcos32 only).

@@ -1,0 +1,17 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: lcos-themes
+Source: LCOS 0.3 overlay (https://lunduke.com)
+
+Files: *
+Copyright: 2026 Lunduke / LCOS
+License: LCOS-overlay
+ LCOS overlay packaging. Artwork and config are 0.2-locked LCOS assets
+ unless noted. Packages are unsigned until the editor signs the archive.
+
+Files: usr/share/themes/Lunduke-Steel/*
+ usr/share/themes/Lunduke-Parchment/*
+Copyright: Clearlooks / Clearlooks-Phenix authors; recolor 2026 Lunduke / LCOS
+License: GPL-2+
+ Recolors of vendored Clearlooks (xfwm4) and Clearlooks-Phenix (GTK2/3).
+ Same widget geometry; color tokens only.
+

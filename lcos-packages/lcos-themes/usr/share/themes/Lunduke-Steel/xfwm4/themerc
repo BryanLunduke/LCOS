@@ -1,0 +1,14 @@
+# Lunduke-Steel XFWM4 — Clearlooks recolor (same geometry)
+
+show_app_icon=true
+active_text_color=#1E2226
+inactive_text_color=#6E747C
+title_shadow_active=frame
+title_shadow_inactive=false
+button_layout=O|HMC
+button_offset=2
+button_spacing=2
+full_width_title=true
+maximized_offset=0
+title_vertical_offset_active=1
+title_vertical_offset_inactive=1

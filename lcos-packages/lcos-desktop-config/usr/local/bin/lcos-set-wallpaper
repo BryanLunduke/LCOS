@@ -1,0 +1,153 @@
+#!/bin/sh
+# Linger after login and stamp whatever outputs xfdesktop actually creates.
+# Do not rely on monitor names. Must never fail the graphical session.
+WALL=/usr/share/backgrounds/lcos/lcos-desktop-stock.jpg
+SKEL=/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml
+LINGER=90
+
+exit0() { exit 0; }
+trap exit0 EXIT INT TERM HUP
+
+command -v xfconf-query >/dev/null 2>&1 || exit 0
+
+[ -n "${DISPLAY}" ] || DISPLAY=:0
+export DISPLAY
+
+adopt_dbus() {
+	if [ -n "${DBUS_SESSION_BUS_ADDRESS}" ]; then
+		return 0
+	fi
+	_pid=$(pgrep -n -x xfdesktop 2>/dev/null) || return 1
+	[ -n "$_pid" ] && [ -r "/proc/${_pid}/environ" ] || return 1
+	_addr=$(tr '\0' '\n' < "/proc/${_pid}/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -n 1)
+	if [ -n "$_addr" ]; then
+		DBUS_SESSION_BUS_ADDRESS=$_addr
+		export DBUS_SESSION_BUS_ADDRESS
+		return 0
+	fi
+	return 1
+}
+
+seed_user_xml() {
+	for home in "${HOME}" /home/lcos; do
+		[ -n "$home" ] && [ -d "$home" ] || continue
+		dest="$home/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
+		if [ ! -s "$dest" ] || ! grep -q 'lcos-desktop-stock' "$dest" 2>/dev/null; then
+			[ -f "$SKEL" ] || continue
+			mkdir -p "$(dirname "$dest")"
+			cp -f "$SKEL" "$dest"
+			chown --reference="$home" "$dest" 2>/dev/null || true
+		fi
+	done
+}
+
+set_prop() {
+	_p=$1
+	_t=$2
+	_v=$3
+	if xfconf-query -c xfce4-desktop -p "$_p" >/dev/null 2>&1; then
+		xfconf-query -c xfce4-desktop -p "$_p" -s "$_v" >/dev/null 2>&1 || true
+	else
+		xfconf-query -c xfce4-desktop -n -t "$_t" -p "$_p" -s "$_v" >/dev/null 2>&1 || true
+	fi
+}
+
+set_color1() {
+	_p=$1
+	xfconf-query -c xfce4-desktop -p "$_p" \
+		-n -t uint -t uint -t uint -t uint \
+		-s 3341 -s 6939 -s 12336 -s 65535 >/dev/null 2>&1 || \
+	xfconf-query -c xfce4-desktop -p "$_p" \
+		-t uint -t uint -t uint -t uint \
+		-s 3341 -s 6939 -s 12336 -s 65535 >/dev/null 2>&1 || true
+}
+
+apply_wallpaper() {
+	adopt_dbus || true
+	props=$(xfconf-query -c xfce4-desktop -l 2>/dev/null) || props=""
+
+	printf '%s\n' "$props" | while IFS= read -r prop; do
+		[ -n "$prop" ] || continue
+		case "$prop" in
+		/backdrop/screen*/last-image|/backdrop/screen*/workspace*/last-image)
+			set_prop "$prop" string "$WALL"
+			set_prop "$(printf '%s' "$prop" | sed 's|/last-image$|/image-style|')" int 1
+			set_prop "$(printf '%s' "$prop" | sed 's|/last-image$|/image-show|')" bool true
+			set_prop "$(printf '%s' "$prop" | sed 's|/last-image$|/color-style|')" int 0
+			set_color1 "$(printf '%s' "$prop" | sed 's|/last-image$|/color1|')"
+			;;
+		/backdrop/screen*/image-path|/backdrop/screen*/workspace*/image-path)
+			set_prop "$prop" string "$WALL"
+			;;
+		esac
+	done
+
+	props=$(xfconf-query -c xfce4-desktop -l 2>/dev/null) || props=""
+	bases=$(printf '%s\n' "$props" | sed -n 's|^\(/backdrop/screen[0-9][0-9]*/[^/][^/]*\).*|\1|p' | sort -u)
+	printf '%s\n' "$bases" | while IFS= read -r base; do
+		[ -n "$base" ] || continue
+		set_prop "$base/last-image" string "$WALL"
+		set_prop "$base/image-path" string "$WALL"
+		set_prop "$base/image-style" int 1
+		set_prop "$base/image-show" bool true
+		set_prop "$base/color-style" int 0
+		set_color1 "$base/color1"
+		set_prop "$base/workspace0/last-image" string "$WALL"
+		set_prop "$base/workspace0/image-path" string "$WALL"
+		set_prop "$base/workspace0/image-style" int 1
+		set_prop "$base/workspace0/image-show" bool true
+		set_prop "$base/workspace0/color-style" int 0
+		set_color1 "$base/workspace0/color1"
+		set_prop "$base/workspace1/last-image" string "$WALL"
+		set_prop "$base/workspace1/image-style" int 1
+		set_color1 "$base/workspace1/color1"
+	done
+
+	if command -v xfdesktop >/dev/null 2>&1; then
+		xfdesktop --reload >/dev/null 2>&1 || true
+	fi
+}
+
+all_last_images_ok() {
+	props=$(xfconf-query -c xfce4-desktop -l 2>/dev/null) || return 1
+	found=0
+	printf '%s\n' "$props" | while IFS= read -r prop; do
+		case "$prop" in
+		/backdrop/screen*/last-image|/backdrop/screen*/workspace*/last-image)
+			val=$(xfconf-query -c xfce4-desktop -p "$prop" 2>/dev/null) || val=""
+			[ "$val" = "$WALL" ] || exit 1
+			;;
+		esac
+	done || return 1
+	printf '%s\n' "$props" | grep -q '/backdrop/screen.*/last-image' || return 1
+	return 0
+}
+
+i=0
+while [ "$i" -lt 120 ]; do
+	if pgrep -x xfdesktop >/dev/null 2>&1; then
+		adopt_dbus && break
+	fi
+	i=$((i + 1))
+	sleep 1
+done
+adopt_dbus || true
+seed_user_xml
+
+elapsed=0
+while [ "$elapsed" -lt "$LINGER" ]; do
+	apply_wallpaper
+	if all_last_images_ok; then
+		# keep going a little so a late Virtual-1 still gets stamped
+		if [ "$elapsed" -ge 20 ]; then
+			apply_wallpaper
+			exit 0
+		fi
+	fi
+	sleep 2
+	elapsed=$((elapsed + 2))
+done
+
+seed_user_xml
+apply_wallpaper
+exit 0

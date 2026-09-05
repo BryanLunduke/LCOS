@@ -1,0 +1,27 @@
+[Desktop Entry]
+Exec=abiword %U
+Icon=abiword
+Terminal=false
+Type=Application
+Categories=Office;WordProcessor;GNOME;GTK;X-Red-Hat-Base;
+StartupNotify=true
+X-Desktop-File-Install-Version=0.9
+MimeType=application/x-abiword;text/x-abiword;text/x-xml-abiword;text/plain;application/msword;application/rtf;application/vnd.plain;application/xhtml+xml;text/html;application/x-crossmark;application/docbook+xml;application/x-t602;application/vnd.oasis.opendocument.text;application/vnd.oasis.opendocument.text-template;application/vnd.oasis.opendocument.text-web;application/vnd.sun.xml.writer;application/vnd.stardivision.writer;text/vnd.wap.wml;application/wordperfect6;application/wordperfect5.1;application/vnd.wordperfect;application/x-abicollab;application/vnd.palm;application/x-applix-word;application/x-kword;application/x-mif;application/x-mswrite;application/x-palm-database;text/abiword;text/richtext;text/rtf;
+Name=AbiWord
+GenericName=Word Processor
+Comment=Compose, edit, and view documents
+Comment[de]=AbiWord Textverarbeitung
+GenericName[es]=Procesador de textos
+Comment[es]=Procesador de textos Abiword
+GenericName[fr]=Traitement de texte
+Comment[fr]=Traitement de texte de Gnome Office
+Comment[nb]=AbiWord Tekstbehandling
+Comment[nl]=AbiWord tekstverwerker
+Comment[nn]=AbiWord Tekstbehandling
+Comment[no]=AbiWord Tekstbehandler
+Comment[pl]=Edytor tekstu AbiWord
+Comment[pt]=AbiWord Processador de Texto
+GenericName[ru]=Текстовый редактор
+Comment[ru]=Обработка форматированных текстовых документов
+Comment[ja]=AbiWord ワードプロセッサ
+

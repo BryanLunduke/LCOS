@@ -1,0 +1,18 @@
+Package: lcos-desktop-config
+Version: 0.3-1
+Section: x11
+Priority: optional
+Architecture: all
+Installed-Size: 344
+Maintainer: LCOS <lcos@lunduke.com>
+Homepage: https://lunduke.com
+Depends: lcos-branding (>= 0.3), lcos-theme-clearlooks (>= 0.3)
+Replaces: libgarcon-common, xfce4-panel, xfce4-helpers, xfce4-settings
+Recommends: elementary-xfce-icon-theme, gtk2-engines
+Description: LCOS XFCE defaults (xdg, skel, wallpaper, menus)
+ System and skel XFCE look: xfconf XML, panel default.xml, helpers.rc,
+ applications menu, wallpaper autostart + linger script, Bob Micropolis
+ launcher, Hidden stock helper .desktop overrides, Science directory hide,
+ and Cool Retro Term as the XFCE terminal helper.
+ .
+ Live-only installer bits are not included.

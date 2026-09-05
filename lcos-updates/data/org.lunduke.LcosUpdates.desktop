@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Check for updates…
+Comment=Download and install updates from Devuan and LCOS
+Exec=lcos-updates
+Icon=system-software-update
+Terminal=false
+Hidden=false
+Categories=GTK;System;Settings;PackageManager;
+StartupWMClass=lcos-updates
+StartupNotify=true

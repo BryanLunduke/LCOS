@@ -1,0 +1,14 @@
+2f977684848deb6861d1d85cbbcc53a5d0c993f950f428ac45e6420355c15156  xlibre-x11-common_25.1.9-1+lcos1_all.deb
+e0d8ddda1cda7493aff3ef736176238b747469890cb9b8dd98929c6e420f274c  xlibre_25.1.9-1+lcos1_amd64.deb
+476bb5fcc91db89958811388c7c0992fb0b49b8110b19b4eecad14e5b5f2ad0a  xserver-xlibre-common_25.1.9-1+lcos1_all.deb
+e34b86d703cf851988f799f9bd125ad98a48a5ff28bdfe459010806cbb2f3821  xserver-xlibre-core_25.1.9-1+lcos1_amd64.deb
+f9f97b32ea398c363f9f844b4a91cca1b958207535b7ecbcf49277c0c709b77d  xserver-xlibre-input-all_25.1.9-1+lcos1_amd64.deb
+117afb33c0bbc2ac538beed60db7cea17b2b8425a08fcc1d6f41ce45f87ea2ec  xserver-xlibre-input-libinput_25.0.1-1+lcos1_amd64.deb
+ee84ab83cb0a757325f3cbb45d6696b5cfc4e088dedc465eb77305f01e108fbb  xserver-xlibre-video-all_25.1.9-1+lcos1_amd64.deb
+3e03da6ec399fadcf588f55f61504b3fc13124cbd770b153811b8afbd2bd5c67  xserver-xlibre-video-amdgpu_25.1.2-1+lcos1_amd64.deb
+d6dbccaea6995a0fb88fa3c0f4efd4aef92bbf4d384672ef40195c88831f421a  xserver-xlibre-video-ati_25.0.1-1+lcos1_amd64.deb
+d3e287036d8ec34495e8b261e72b7781d99a5331937c73c466d8db66a2b66389  xserver-xlibre-video-fbdev_25.0.0-1+lcos1_amd64.deb
+b9d8acb02f60f8c9dcd74d6adcf7d27558b5e29ba53cbbb8e7eab8473ebd027d  xserver-xlibre-video-nouveau_25.0.1-1+lcos1_amd64.deb
+6edf0cfd6c242759592e23b8bd74594fd320e12aa31c2f5f45fb09823a1c08e9  xserver-xlibre-video-vesa_25.0.0-1+lcos1_amd64.deb
+a5a920a8ad076458e06e5d5b7304e64856477e4a0d2fa75f1830c0d129ca6011  xserver-xlibre-video-vmware_25.0.0-2+lcos1_amd64.deb
+a460c0c5ace3e037ebf3edff1717c1fbcfdaaeb198edb37ad3403fb2c7217760  xserver-xlibre_25.1.9-1+lcos1_amd64.deb

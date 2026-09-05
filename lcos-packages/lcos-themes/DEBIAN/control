@@ -1,0 +1,13 @@
+Package: lcos-themes
+Version: 0.3-1
+Section: x11
+Priority: optional
+Architecture: all
+Installed-Size: 1420
+Maintainer: LCOS <lcos@lunduke.com>
+Homepage: https://lunduke.com
+Recommends: gtk2-engines
+Description: Lunduke Themes
+ Lunduke-Steel (0.3 default) and Lunduke-Parchment Clearlooks recolors
+ (GTK2 clearlooks engine, Phenix GTK3, xfwm4 pixmaps). Same widget
+ geometry as stock Clearlooks / Clearlooks-Phenix; recolor only.

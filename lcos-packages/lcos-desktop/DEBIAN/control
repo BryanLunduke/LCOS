@@ -1,0 +1,14 @@
+Package: lcos-desktop
+Version: 0.3-1
+Section: metapackages
+Priority: optional
+Architecture: all
+Installed-Size: 24
+Maintainer: LCOS <lcos@lunduke.com>
+Homepage: https://lunduke.com
+Depends: lcos-base (>= 0.3), lcos-desktop-config (>= 0.3), lcos-theme-clearlooks (>= 0.3), lcos-themes (>= 0.3), lcos-icon-theme (>= 0.3)
+Recommends: xfce4, lightdm, lightdm-gtk-greeter, elementary-xfce-icon-theme, gtk2-engines, lcos-zork, micropolis, lunduke-paint
+Description: LCOS 0.3 XFCE desktop edition metapackage
+ Pulls LCOS identity, XFCE look, Clearlooks, and Lunduke Themes. Recommends the
+ XFCE/LightDM stack plus Zork and Micropolis. Does not depend on
+ Calamares or live-config installer bits.

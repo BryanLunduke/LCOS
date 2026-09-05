@@ -1,0 +1,16 @@
+Package: lcos-base
+Version: 0.3-1
+Section: admin
+Priority: optional
+Architecture: all
+Installed-Size: 72
+Maintainer: LCOS <lcos@lunduke.com>
+Homepage: https://lunduke.com
+Depends: lcos-archive-keyring (>= 0.3), lcos-branding (>= 0.3)
+Replaces: base-files
+Description: LCOS 0.3 identity, GRUB splash drop-in, overlay membership
+ os-release / issue for LCOS 0.3 (excalibur), lcos-write-os-release,
+ and /etc/default/grub.d/lcos.cfg (BACKGROUND lcos-splash-1024x768.png,
+ GFXMODE=1024x768, GFXPAYLOAD keep).
+ .
+ Depends on the overlay keyring and branding artwork.
