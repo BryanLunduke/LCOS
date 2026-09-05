@@ -38,6 +38,14 @@ LCOS is in early development.  Expect bugs.
 
 [The Lunduke Journal Forum](https://forum.lunduke.com/) is the exclusive place to ask questions, provide suggestions, report issues, or talk with other LCOS users.  To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Lunduke Journal subscribers](https://lunduke.com/).
 
+## Vendored Upstream Source
+
+The repository now includes a full copy of the uutils coreutils codebase in:
+
+`vendor/uutils-coreutils`
+
+Upstream project: https://github.com/uutils/coreutils
+
 ## Screenshots
 
 ![](screenshots/lcos-02-Games.png)

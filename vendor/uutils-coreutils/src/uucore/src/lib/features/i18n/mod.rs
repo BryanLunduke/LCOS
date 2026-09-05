@@ -1,0 +1,92 @@
+// This file is part of the uutils coreutils package.
+//
+// For the full copyright and license information, please view the LICENSE
+// file that was distributed with this source code.
+
+use std::sync::OnceLock;
+
+use icu_locale::{Locale, locale};
+
+#[cfg(feature = "i18n-charmap")]
+pub mod charmap;
+#[cfg(feature = "i18n-collator")]
+pub mod collator;
+#[cfg(feature = "i18n-datetime")]
+pub mod datetime;
+#[cfg(feature = "i18n-decimal")]
+pub mod decimal;
+
+/// The encoding specified by the locale, if specified
+/// Currently only supports ASCII and UTF-8 for the sake of simplicity.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum UEncoding {
+    Ascii,
+    Utf8,
+}
+
+// Use "und" (undefined) as the marker for C/POSIX locale
+// This ensures real locales like "en-US" won't match
+const DEFAULT_LOCALE: Locale = locale!("und");
+
+/// Look at 3 environment variables in the following order
+///
+/// 1. LC_ALL
+/// 2. `locale_name`
+/// 3. LANG
+///
+/// Or fallback on Posix locale, with ASCII encoding.
+pub fn get_locale_from_env(locale_name: &str) -> (Locale, UEncoding) {
+    let locale_var = ["LC_ALL", locale_name, "LANG"]
+        .iter()
+        .find_map(|&key| std::env::var(key).ok());
+
+    if let Some(locale_var_str) = locale_var {
+        let mut split = locale_var_str.split(&['.', '@']);
+
+        if let Some(simple) = split.next() {
+            // Naively convert the locale name to BCP47 tag format.
+            //
+            // See https://en.wikipedia.org/wiki/IETF_language_tag
+            let bcp47 = simple.replace('_', "-");
+            let locale = Locale::try_from_str(&bcp47).unwrap_or(DEFAULT_LOCALE);
+
+            // Determine encoding from the locale suffix (e.g. en_US.UTF-8, C.UTF-8).
+            let encoding = split
+                .next()
+                .filter(|enc| {
+                    let lower = enc.to_lowercase();
+                    lower == "utf-8" || lower == "utf8"
+                })
+                .map_or(UEncoding::Ascii, |_| UEncoding::Utf8);
+            return (locale, encoding);
+        }
+    }
+    // Default POSIX locale representing LC_ALL=C
+    (DEFAULT_LOCALE, UEncoding::Ascii)
+}
+
+/// Get the collating locale from the environment
+pub fn get_collating_locale() -> &'static (Locale, UEncoding) {
+    static COLLATING_LOCALE: OnceLock<(Locale, UEncoding)> = OnceLock::new();
+
+    COLLATING_LOCALE.get_or_init(|| get_locale_from_env("LC_COLLATE"))
+}
+
+/// Get the numeric locale from the environment
+pub fn get_numeric_locale() -> &'static (Locale, UEncoding) {
+    static NUMERIC_LOCALE: OnceLock<(Locale, UEncoding)> = OnceLock::new();
+
+    NUMERIC_LOCALE.get_or_init(|| get_locale_from_env("LC_NUMERIC"))
+}
+
+/// Return the encoding deduced from the locale environment variable.
+pub fn get_locale_encoding() -> UEncoding {
+    get_collating_locale().1
+}
+
+/// Return the character-type encoding (`LC_CTYPE`) deduced from the environment.
+pub fn get_ctype_encoding() -> UEncoding {
+    static CTYPE_ENCODING: OnceLock<UEncoding> = OnceLock::new();
+
+    *CTYPE_ENCODING.get_or_init(|| get_locale_from_env("LC_CTYPE").1)
+}
