@@ -1,0 +1,4 @@
+Err:1 http://deb.devuan.org/merged excalibur InRelease
+  Temporary failure resolving 'deb.devuan.org'
+E: Failed to fetch http://deb.devuan.org/merged/dists/excalibur/InRelease  Temporary failure resolving 'deb.devuan.org'
+E: Some index files failed to download. They have been ignored, or old ones used instead.

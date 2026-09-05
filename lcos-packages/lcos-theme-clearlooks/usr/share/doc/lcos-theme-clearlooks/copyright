@@ -1,0 +1,20 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: lcos-theme-clearlooks
+Source: LCOS 0.3 overlay (https://lunduke.com)
+
+Files: *
+Copyright: 2026 Lunduke / LCOS
+License: LCOS-overlay
+ LCOS overlay packaging. Artwork and config are 0.2-locked LCOS assets
+ unless noted. Packages are unsigned until the editor signs the archive.
+
+Files: usr/share/themes/Clearlooks/*
+Copyright: Clearlooks theme authors
+License: GPL-2+
+ Vendored from the LCOS 0.2-locked live tree (Clearlooks xfwm4).
+
+Files: usr/share/themes/Clearlooks-Phenix/*
+Copyright: Clearlooks-Phenix authors
+License: GPL-3+
+ Vendored from the LCOS 0.2-locked live tree.
+

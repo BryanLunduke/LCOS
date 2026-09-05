@@ -1,0 +1,4 @@
+/etc/default/grub.d/lcos.cfg
+/etc/issue
+/etc/issue.net
+/etc/os-release

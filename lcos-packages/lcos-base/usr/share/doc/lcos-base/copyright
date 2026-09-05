@@ -1,0 +1,10 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: lcos-base
+Source: LCOS 0.3 overlay (https://lunduke.com)
+
+Files: *
+Copyright: 2026 Lunduke / LCOS
+License: LCOS-overlay
+ LCOS overlay packaging. Artwork and config are 0.2-locked LCOS assets
+ unless noted. Packages are unsigned until the editor signs the archive.
+

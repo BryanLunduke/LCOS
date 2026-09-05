@@ -1,0 +1,11 @@
+Source: lcos-updates
+Section: admin
+Priority: optional
+Maintainer: LCOS <lcos@lunduke.com>
+Homepage: https://lunduke.com
+Standards-Version: 4.6.2
+
+Package: lcos-updates
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: dummy control for dpkg-shlibdeps

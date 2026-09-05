@@ -1,0 +1,5 @@
+8e7787b06321db584d2ae73d18f09286  etc/apt/sources.list.d/lcos-overlay.list
+2d5841a84defd458802ddc3baa3f0fdb  usr/share/doc/lcos-archive-keyring/copyright
+a08a15a70972bf789007c0dd116036f6  usr/share/keyrings/README.lcos-keyring
+ab47328dde611d4a38b7482b170d70a5  usr/share/keyrings/lcos-archive-keyring.asc
+50429e4c5437c8b0fd8a7cbb6e6d1cb3  usr/share/keyrings/lcos-archive-keyring.gpg

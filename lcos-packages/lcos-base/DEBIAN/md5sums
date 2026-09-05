@@ -1,0 +1,7 @@
+f7d9298bb2430c056c11b4e12846ca60  etc/default/grub.d/lcos.cfg
+57366e51e34dddce9fb2f3b2b40992ca  etc/issue
+7c5325ce7468efa8e4b5d465f8e64833  etc/issue.net
+53d60aa4abbd09436072d48e33bbddf2  etc/os-release
+53d60aa4abbd09436072d48e33bbddf2  usr/lib/os-release
+9a60bd1041839a2a4b42c87de3f014c8  usr/local/sbin/lcos-write-os-release
+4dee931c1bb9bf32399e85ec45eaf315  usr/share/doc/lcos-base/copyright

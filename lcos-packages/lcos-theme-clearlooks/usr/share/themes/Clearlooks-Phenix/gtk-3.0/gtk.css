@@ -1,0 +1,436 @@
+/***********************************************************************
+ * This section can be modified to create color variants of the theme. *
+ ***********************************************************************/
+
+/****************
+ * color scheme *
+ ****************/
+
+@define-color theme_base_color #ffffff;
+
+@define-color theme_bg_color #edeceb;
+@define-color theme_fg_color #000000;
+
+@define-color theme_selected_bg_color #86abd9;
+@define-color theme_selected_fg_color #ffffff;
+
+@define-color theme_tooltip_bg_color #f5f5b5;
+@define-color theme_tooltip_fg_color #000000;
+
+@define-color theme_text_color #1a1a1a;
+
+@define-color link_color #0000ee;
+@define-color visited_link_color #551a8b;
+
+/*****************
+ * error/warning *
+ *****************/
+
+@define-color error_color #cc0000;
+
+@define-color warning_bg_color #faad3d;
+
+/***************
+ * core colors *
+ ***************/
+
+/* Core colors are only used in the current file, as bases for other
+   color declarations. */
+
+@define-color core_color_a #a4c2e8; /* Core color for blue widgets in Clearlooks-Phenix. */
+@define-color core_color_b #edeceb; /* Core color for gray widgets in Clearlooks-Phenix. */
+
+/********************************************
+ * End of configuration for color variants. *
+ ********************************************/
+
+/***********
+ * general *
+ ***********/
+
+@define-color insensitive_bg_color @theme_bg_color;
+@define-color insensitive_fg_color shade(@core_color_b, 0.70);
+@define-color insensitive_text_shadow_color @theme_base_color;
+
+@define-color internal_element_color @theme_text_color;
+@define-color internal_element_hover_color @theme_text_color;
+@define-color internal_element_insensitive_color @insensitive_fg_color;
+
+/* border */
+
+@define-color border_color shade(@core_color_b, 0.67);
+@define-color focus_border_color mix(#acacac, shade(@core_color_a, 0.75), 0.54);
+@define-color insensitive_border_color shade(@core_color_b, 0.79);
+
+/**********
+ * button *
+ **********/
+
+@define-color button_gradient_a shade(@core_color_b, 1.07);
+@define-color button_gradient_b shade(@core_color_b, 1.06);
+@define-color button_gradient_c shade(@core_color_b, 1.04);
+@define-color button_gradient_d shade(@core_color_b, 0.98);
+
+/* hover */
+
+@define-color button_hover_gradient_a @theme_base_color;
+@define-color button_hover_gradient_b shade(@core_color_b, 1.05);
+@define-color button_hover_gradient_c @core_color_b;
+
+/* active */
+
+@define-color button_active_text_color @theme_fg_color;
+
+@define-color button_active_gradient_a shade(@core_color_b, 0.85);
+@define-color button_active_gradient_b shade(@core_color_b, 0.90);
+@define-color button_active_gradient_c shade(@core_color_b, 0.91);
+@define-color button_active_gradient_d shade(@core_color_b, 0.86);
+@define-color button_active_gradient_e shade(@core_color_b, 0.84);
+@define-color button_active_gradient_f shade(@core_color_b, 0.80);
+
+/* insensitive */
+
+@define-color button_insensitive_inner_border_color shade(@core_color_b, 1.05);
+
+@define-color button_insensitive_gradient_a shade(@core_color_b, 1.04);
+@define-color button_insensitive_gradient_b shade(@core_color_b, 1.01);
+@define-color button_insensitive_gradient_c shade(@core_color_b, 0.99);
+@define-color button_insensitive_gradient_d shade(@core_color_b, 0.96);
+
+/* active insensitive */
+
+@define-color button_active_insensitive_gradient_a shade(@core_color_b, 0.98);
+@define-color button_active_insensitive_gradient_b shade(@core_color_b, 1.02);
+@define-color button_active_insensitive_gradient_c shade(@core_color_b, 1.03);
+@define-color button_active_insensitive_gradient_d shade(@core_color_b, 1.01);
+@define-color button_active_insensitive_gradient_e shade(@core_color_b, 0.99);
+@define-color button_active_insensitive_gradient_f shade(@core_color_b, 0.96);
+
+/* primary toolbar focus */
+
+@define-color pt_button_focus_gradient_a mix(#fafafa, shade(@core_color_a, 1.09), 0.3);
+@define-color pt_button_focus_gradient_b mix(#ededed, shade(@core_color_a, 1.05), 0.3);
+@define-color pt_button_focus_gradient_c mix(#e8e8e8, shade(@core_color_a, 1.01), 0.25);
+@define-color pt_button_focus_gradient_d mix(#e8e8e8, shade(@core_color_a, 0.96), 0.3);
+
+/* primary toolbar focus hover */
+
+@define-color pt_button_focus_hover_gradient_a mix(#fcfcfc, shade(@core_color_a, 1.09), 0.15);
+@define-color pt_button_focus_hover_gradient_b mix(#fcfcfc, shade(@core_color_a, 1.05), 0.15);
+@define-color pt_button_focus_hover_gradient_c mix(#fcfcfc, shade(@core_color_a, 1.01), 0.2);
+@define-color pt_button_focus_hover_gradient_d mix(#e8e8e8, shade(@core_color_a, 0.96), 0.2);
+
+/*****************
+ * color chooser *
+ *****************/
+
+@define-color color_swatch_border_color @border_color;
+@define-color color_swatch_hover_border_color @menubar_menuitem_hover_border_color;
+
+@define-color color_active_badge_light_border_color @theme_fg_color;
+@define-color color_active_badge_light_color @color_active_badge_light_border_color;
+
+@define-color color_active_badge_dark_border_color @theme_base_color;
+@define-color color_active_badge_dark_color @color_active_badge_light_border_color;
+
+/*****************
+ * column-header *
+ *****************/
+
+@define-color column_header_border_top_color @theme_base_color;
+@define-color column_header_border_right_color shade(@core_color_b, 0.82);
+@define-color column_header_border_bottom_color shade(@core_color_b, 0.70);
+@define-color column_header_border_left_color @column_header_border_top_color;
+
+@define-color column_header_button_gradient_a shade(@core_color_b, 1.05);
+@define-color column_header_button_gradient_b shade(@core_color_b, 1.02);
+@define-color column_header_button_gradient_c @core_color_b;
+@define-color column_header_button_gradient_d shade(@core_color_b, 0.96);
+
+/*********
+ * entry *
+ *********/
+
+@define-color entry_text_color @theme_text_color;
+
+@define-color entry_inner_border_color shade(@core_color_b, 0.96);
+@define-color entry_bg_color @theme_base_color;
+
+/* insensitive */
+
+@define-color entry_insensitive_inner_border_color shade(@core_color_b, 0.97);
+@define-color entry_insensitive_bg_color @insensitive_bg_color;
+
+/************
+ * expander *
+ ************/
+
+@define-color expander_row_selected_border_color mix(#acacac, shade(@core_color_a, 0.75), 0.54);
+
+/*****************
+ * fallback mode *
+ *****************/
+
+@define-color os_chrome_bg_color @theme_bg_color;
+@define-color os_chrome_fg_color @theme_fg_color;
+
+/* gnome-panel */
+
+@define-color applet_frame_bg_color shade(@core_color_b, 0.89);
+@define-color pager_bg_color shade(@core_color_b, 0.97);
+
+/*******************************
+ * info/question/error/warning *
+ *******************************/
+
+@define-color info_bg_color @theme_tooltip_bg_color;
+@define-color info_fg_color @theme_fg_color;
+
+@define-color question_bg_color mix(#727272, shade(@core_color_a, 0.90), 0.95);
+@define-color question_fg_color @theme_base_color;
+
+@define-color error_bg_color mix(#ababab, shade(@error_color, 0.77), 0.78);
+@define-color error_fg_color @theme_base_color;
+
+@define-color warning_fg_color @theme_fg_color;
+
+/********
+ * menu *
+ ********/
+
+@define-color menu_bg_color @theme_base_color;
+@define-color menu_fg_color @theme_fg_color;
+
+/* Example: submenu arrow. */
+@define-color menu_controls_color @theme_fg_color;
+
+@define-color menu_border_color shade(@core_color_b, 0.72);
+@define-color menu_separator_color @menu_border_color;
+
+/***********
+ * menubar *
+ ***********/
+
+@define-color menubar_gradient_a shade(@core_color_b, 0.99);
+@define-color menubar_gradient_b shade(@core_color_b, 0.98);
+@define-color menubar_gradient_c shade(@core_color_b, 0.96);
+
+/* hover */
+
+@define-color menubar_menuitem_hover_color @theme_selected_fg_color;
+@define-color menubar_menuitem_hover_border_color shade(@core_color_a, 0.58);
+
+@define-color menubar_menuitem_hover_gradient_a @core_color_a;
+@define-color menubar_menuitem_hover_gradient_b shade(@core_color_a, 0.95);
+@define-color menubar_menuitem_hover_gradient_c shade(@core_color_a, 0.93);
+@define-color menubar_menuitem_hover_gradient_d shade(@core_color_a, 0.88);
+
+/************
+ * notebook *
+ ************/
+
+@define-color notebook_bg_color shade(@core_color_b, 1.02);
+
+@define-color notebook_tab_inner_border_color shade(@core_color_b, 1.04);
+
+@define-color notebook_tab_gradient_a shade(@core_color_b, 0.97);
+@define-color notebook_tab_gradient_b shade(@core_color_b, 0.92);
+@define-color notebook_tab_gradient_c shade(@core_color_b, 0.90);
+@define-color notebook_tab_gradient_d shade(@core_color_b, 0.86);
+
+/* active tab */
+
+@define-color notebook_active_tab_border @menubar_menuitem_hover_border_color;
+
+@define-color notebook_active_tab_strip_gradient_a shade(@core_color_a, 1.05);
+@define-color notebook_active_tab_strip_gradient_b shade(@core_color_a, 0.94);
+@define-color notebook_active_tab_strip_border_bottom_color mix(#727272, shade(@core_color_a, 0.84), 0.65);
+@define-color notebook_active_tab_gradient_a shade(@core_color_b, 1.07);
+@define-color notebook_active_tab_gradient_b @notebook_bg_color;
+
+/*******
+ * osd *
+ *******/
+
+@define-color osd_bg_color @theme_tooltip_bg_color;
+@define-color osd_fg_color @theme_tooltip_fg_color;
+@define-color osd_border_color @theme_tooltip_border_color;
+
+/***************
+ * progressbar *
+ ***************/
+
+@define-color progressbar_border_color mix(#6a6a6a, shade(@core_color_a, 0.75), 0.80);
+@define-color progressbar_pattern_color @progressbar_border_color;
+
+@define-color progressbar_bg_color @core_color_a;
+
+@define-color progressbar_gradient_a @progressbar_bg_color;
+@define-color progressbar_gradient_b @menubar_menuitem_hover_gradient_b;
+@define-color progressbar_gradient_c @menubar_menuitem_hover_gradient_c;
+@define-color progressbar_gradient_d @menubar_menuitem_hover_gradient_d;
+
+/*********
+ * scale *
+ *********/
+
+@define-color scale_mark_color @border_color;
+@define-color scale_progressbar_bg_color @scale_trough_highlight_gradient_b;
+
+@define-color scale_trough_border_color shade(@core_color_b, 0.56);
+@define-color scale_trough_bg_color shade(@core_color_b, 0.90);
+
+/* trough highlight */
+
+@define-color scale_trough_highlight_border_color mix(#2b2b2b, shade(@core_color_a, 0.75), 0.80);
+@define-color scale_trough_highlight_bg_color shade(@core_color_a, 0.92);
+
+/* trough insensitive */
+
+@define-color scale_trough_insensitive_border_color @insensitive_border_color;
+@define-color scale_trough_insensitive_bg_color shade(@core_color_b, 0.97);
+
+/* trough highlight insensitive */
+
+@define-color scale_trough_highlight_insensitive_border_color mix(#6a6a6a, shade(@core_color_a, 0.88), 0.90);
+@define-color scale_trough_highlight_insensitive_bg_color shade(@core_color_a, 1.20);
+
+/*************
+ * scrollbar *
+ *************/
+
+/* junction */
+
+@define-color scrollbars_junction_bg_color @theme_bg_color;
+
+/* trough */
+
+@define-color scrollbar_trough_border_color shade(@core_color_b, 0.67);
+
+@define-color scrollbar_trough_gradient_a shade(@core_color_b, 0.86);
+@define-color scrollbar_trough_gradient_b shade(@core_color_b, 0.90);
+
+/* slider */
+
+@define-color scrollbar_slider_bg_color shade(@core_color_a, 0.99);
+
+@define-color scrollbar_slider_gradient_a @scrollbar_slider_bg_color;
+@define-color scrollbar_slider_gradient_b shade(@core_color_a, 0.96);
+@define-color scrollbar_slider_gradient_c shade(@core_color_a, 0.92);
+@define-color scrollbar_slider_gradient_d shade(@core_color_a, 0.88);
+
+@define-color scrollbar_slider_border_color mix(#000000, shade(@core_color_a, 0.72), 0.95);
+
+@define-color scrollbar_slider_inner_border_color shade(@core_color_a, 1.04);
+
+/* slider hover */
+
+@define-color scrollbar_slider_hover_bg_color shade(@core_color_a, 1.03);
+
+@define-color scrollbar_slider_hover_gradient_a @scrollbar_slider_hover_bg_color;
+@define-color scrollbar_slider_hover_gradient_b shade(@core_color_a, 0.99);
+@define-color scrollbar_slider_hover_gradient_c shade(@core_color_a, 0.96);
+@define-color scrollbar_slider_hover_gradient_d shade(@core_color_a, 0.91);
+
+/* button */
+
+@define-color scrollbar_button_color @theme_fg_color;
+@define-color scrollbar_button_insensitive_color @internal_element_insensitive_color;
+@define-color scrollbar_button_border_color shade(@core_color_b, 0.56);
+
+@define-color scrollbar_button_gradient_a shade(@core_color_b, 1.07);
+@define-color scrollbar_button_gradient_b shade(@core_color_b, 1.02);
+@define-color scrollbar_button_gradient_c shade(@core_color_b, 0.99);
+@define-color scrollbar_button_gradient_d shade(@core_color_b, 0.95);
+
+/* button hover */
+
+@define-color scrollbar_button_hover_gradient_a shade(@core_color_b, 1.07);
+@define-color scrollbar_button_hover_gradient_b shade(@core_color_b, 1.05);
+@define-color scrollbar_button_hover_gradient_c shade(@core_color_b, 1.02);
+@define-color scrollbar_button_hover_gradient_d shade(@core_color_b, 0.97);
+
+/* button active */
+
+@define-color scrollbar_button_active_gradient_a shade(@core_color_b, 0.95);
+@define-color scrollbar_button_active_gradient_b shade(@core_color_b, 0.92);
+@define-color scrollbar_button_active_gradient_c shade(@core_color_b, 0.89);
+@define-color scrollbar_button_active_gradient_d shade(@core_color_b, 0.85);
+
+/***********
+ * sidebar *
+ ***********/
+
+@define-color sidebar_bg_color @theme_base_color;
+@define-color gtkassistant_sidebar_border_color @border_color;
+
+/**************
+ * spinbutton *
+ **************/
+
+@define-color spinbutton_border_color @border_color;
+
+/**********
+ * switch *
+ **********/
+
+@define-color switch_color shade(@core_color_b, 0.45);
+
+@define-color switch_slider_border_color @progressbar_border_color;
+
+@define-color switch_slider_bg_color @scrollbar_slider_bg_color;
+
+@define-color switch_slider_gradient_a @switch_slider_bg_color;
+@define-color switch_slider_gradient_b @scrollbar_slider_gradient_b;
+@define-color switch_slider_gradient_c @scrollbar_slider_gradient_c;
+@define-color switch_slider_gradient_d @scrollbar_slider_gradient_d;
+
+/* active */
+
+@define-color switch_trough_active_color @theme_base_color;
+
+@define-color switch_trough_active_gradient_a @menubar_menuitem_hover_border_color;
+@define-color switch_trough_active_gradient_b shade(@core_color_a, 1.12);
+
+/* insensitive */
+
+@define-color switch_slider_insensitive_bg_color @button_insensitive_gradient_a;
+
+@define-color switch_slider_insensitive_gradient_a @switch_slider_insensitive_bg_color;
+@define-color switch_slider_insensitive_gradient_b @button_insensitive_gradient_b;
+@define-color switch_slider_insensitive_gradient_c @button_insensitive_gradient_c;
+@define-color switch_slider_insensitive_gradient_d @button_insensitive_gradient_d;
+
+/***********
+ * toolbar *
+ ***********/
+
+@define-color toolbar_border_top_color shade(@core_color_b, 0.82);
+@define-color toolbar_inner_border_color @theme_base_color;
+@define-color toolbar_border_bottom_color @toolbar_border_top_color;
+
+@define-color toolbar_gradient_a shade(@core_color_b, 1.04);
+@define-color toolbar_gradient_b shade(@core_color_b, 1.01);
+@define-color toolbar_gradient_c @core_color_b;
+@define-color toolbar_gradient_d shade(@core_color_b, 0.97);
+
+/***********
+ * tooltip *
+ ***********/
+
+@define-color theme_tooltip_border_color shade(@theme_tooltip_bg_color, 0.60);
+
+/**********
+ * trough *
+ **********/
+
+@define-color trough_gradient_a shade(@core_color_b, 0.81);
+@define-color trough_gradient_b shade(@core_color_b, 0.90);
+
+/***********
+ * imports *
+ ***********/
+
+@import url("gtk-widgets-img.css");
+@import url("gtk-widgets.css");
+@import url("applications.css");

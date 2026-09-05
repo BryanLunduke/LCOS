@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Set LCOS wallpaper
+Exec=/usr/local/bin/lcos-set-wallpaper
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=XFCE;
+Terminal=false

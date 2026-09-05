@@ -1,0 +1,4 @@
+# LCOS 0.3 thin signed overlay (https://lcos.lunduke.com/ → GitHub Pages).
+# Editor owns DNS + signing key. Do NOT add xlibre-deb.github.io here.
+# Suite/component names are placeholders until the repo has packages.
+deb [signed-by=/usr/share/keyrings/lcos-archive-keyring.gpg] https://lcos.lunduke.com/apt excalibur main

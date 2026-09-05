@@ -1,0 +1,7 @@
+LCOS archive signing public key. Installed 2026-08-25 from the editor.
+
+  LCOS Archive Signing Key <lcos@lunduke.com>
+  Fingerprint: 5A01 D4BD CDD1 E153 1D45  6A75 60D6 E7F6 CBD6 D572
+  Files: lcos-archive-keyring.gpg (apt signed-by) and lcos-archive-keyring.asc
+
+Public key only. Do not generate a key on this box. Do not replace without the editor.

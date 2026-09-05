@@ -1,0 +1,6 @@
+[Default Applications]
+image/png=org.lunduke.LundukePaint.desktop
+image/jpeg=org.lunduke.LundukePaint.desktop
+image/bmp=org.lunduke.LundukePaint.desktop
+image/gif=org.lunduke.LundukePaint.desktop
+image/openraster=org.lunduke.LundukePaint.desktop

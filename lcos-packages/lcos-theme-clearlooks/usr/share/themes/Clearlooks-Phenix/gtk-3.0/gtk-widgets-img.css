@@ -1,0 +1,706 @@
+/**********
+ * Assets *
+ **********/
+
+/*************
+ * GtkSwitch *
+ *************/
+
+switch slider {
+	background-image: linear-gradient(to bottom,
+	                      alpha (@switch_slider_gradient_a, 0.5),
+	                      alpha (@switch_slider_gradient_b, 0.5) 50%,
+	                      alpha (@switch_slider_gradient_c, 0.5) 50%,
+	                      alpha (@switch_slider_gradient_d, 0.5)),
+	                  -gtk-scaled(url("img/slider-horz-grip.png"),
+	                      url("img/slider-horz-grip@2.png"));
+	background-repeat: no-repeat;
+	background-position: center center;
+}
+
+switch:disabled slider {
+	background-image: linear-gradient(to bottom,
+	                      alpha (@switch_slider_insensitive_gradient_a, 0.8),
+	                      alpha (@switch_slider_insensitive_gradient_b, 0.8) 50%,
+	                      alpha (@switch_slider_insensitive_gradient_c, 0.8) 50%,
+	                      alpha (@switch_slider_insensitive_gradient_d, 0.8)),
+	                  -gtk-scaled(url("img/slider-horz-grip.png"),
+	                      url("img/slider-horz-grip@2.png"));
+}
+
+/***************
+ * Resize grip *
+ ***************/
+
+.grip {
+	background-image: -gtk-scaled(url("img/resize-grip.png"), url("img/resize-grip@2.png"));
+}
+
+/*************
+ * Scrollbar *
+ *************/
+
+scrollbar slider {
+	background-repeat: no-repeat;
+	background-position: center center;
+}
+
+scrollbar.vertical slider {
+	background-image: linear-gradient(to right,
+	                      alpha (@scrollbar_slider_inner_border_color, 0.5),
+	                      alpha (@scrollbar_slider_gradient_a, 0.5) 1px,
+	                      alpha (@scrollbar_slider_gradient_b, 0.5) 50%,
+	                      alpha (@scrollbar_slider_gradient_c, 0.5) 50%,
+	                      alpha (@scrollbar_slider_gradient_d, 0.5) 95%,
+	                      alpha (@scrollbar_slider_inner_border_color, 0.5)),
+	                  -gtk-scaled(url("img/slider-vert-grip.png"),
+	                      url("img/slider-vert-grip@2.png"));
+}
+
+scrollbar.horizontal slider {
+	background-image: linear-gradient(to bottom,
+	                      alpha (@scrollbar_slider_inner_border_color, 0.5),
+	                      alpha (@scrollbar_slider_gradient_a, 0.5) 1px,
+	                      alpha (@scrollbar_slider_gradient_b, 0.5) 50%,
+	                      alpha (@scrollbar_slider_gradient_c, 0.5) 50%,
+	                      alpha (@scrollbar_slider_gradient_d, 0.5) 95%,
+	                      alpha (@scrollbar_slider_inner_border_color, 0.5)),
+	                  -gtk-scaled(url("img/slider-horz-grip.png"),
+	                      url("img/slider-horz-grip@2.png"));
+}
+
+scrollbar.vertical slider:hover {
+	background-image: linear-gradient(to right,
+	                      alpha (@scrollbar_slider_inner_border_color, 0.5),
+	                      alpha (@scrollbar_slider_hover_gradient_a, 0.5) 1px,
+	                      alpha (@scrollbar_slider_hover_gradient_b, 0.5) 50%,
+	                      alpha (@scrollbar_slider_hover_gradient_c, 0.5) 50%,
+	                      alpha (@scrollbar_slider_hover_gradient_d, 0.5) 95%,
+	                      alpha (@scrollbar_slider_inner_border_color, 0.5)),
+	                  -gtk-scaled(url("img/slider-vert-grip.png"),
+	                      url("img/slider-vert-grip@2.png"));
+}
+
+scrollbar.horizontal slider:hover {
+	background-image: linear-gradient(to bottom,
+	                      alpha (@scrollbar_slider_inner_border_color, 0.5),
+	                      alpha (@scrollbar_slider_hover_gradient_a, 0.5) 1px,
+	                      alpha (@scrollbar_slider_hover_gradient_b, 0.5) 50%,
+	                      alpha (@scrollbar_slider_hover_gradient_c, 0.5) 50%,
+	                      alpha (@scrollbar_slider_hover_gradient_d, 0.5) 95%,
+	                      alpha (@scrollbar_slider_inner_border_color, 0.5)),
+	                  -gtk-scaled(url("img/slider-horz-grip.png"),
+	                      url("img/slider-horz-grip@2.png"));
+}
+
+/*************************
+ * Check and Radio items *
+ *************************/
+
+check,
+check row:selected,
+check row:selected:focus {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-unchecked.png"),
+		url("img/checkbox-unchecked@2.png"));
+}
+
+check:hover,
+check row:selected:hover,
+check row:selected:focus:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-unchecked-hover.png"),
+		url("img/checkbox-unchecked-hover@2.png"));
+}
+
+check:disabled,
+check row:selected:disabled,
+check row:selected:focus:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-unchecked-insensitive.png"),
+		url("img/checkbox-unchecked-insensitive@2.png"));
+}
+
+check:checked,
+check row:selected:checked,
+check row:selected:focus:checked,
+check:active,
+check row:selected:active,
+check row:selected:focus:active {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-checked.png"),
+		url("img/checkbox-checked@2.png"));
+}
+
+check:checked:hover,
+check row:selected:checked:hover,
+check row:selected:focus:checked:hover,
+check:active:hover,
+check row:selected:active:hover,
+check row:selected:focus:active:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-checked-hover.png"),
+		url("img/checkbox-checked-hover@2.png"));
+}
+
+check:checked:disabled,
+check row:selected:checked:disabled,
+check row:selected:focus:checked:disabled,
+check:active:disabled,
+check row:selected:active:disabled,
+check row:selected:focus:active:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-checked-insensitive.png"),
+		url("img/checkbox-checked-insensitive@2.png"));
+}
+
+check:indeterminate,
+check row:selected:indeterminate,
+check row:selected:focus:indeterminate {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-mixed.png"),
+		url("img/checkbox-mixed@2.png"));
+}
+
+check:indeterminate:hover,
+check row:selected:indeterminate:hover,
+check row:selected:focus:indeterminate:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-mixed-hover.png"),
+		url("img/checkbox-mixed-hover@2.png"));
+}
+
+check:indeterminate:disabled,
+check row:selected:indeterminate:disabled,
+check row:selected:focus:indeterminate:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/checkbox-mixed-insensitive.png"),
+		url("img/checkbox-mixed-insensitive@2.png"));
+}
+
+radio,
+radio row:selected,
+radio row:selected:focus {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-unchecked.png"),
+		url("img/radio-unchecked@2.png"));
+}
+
+radio:hover,
+radio row:selected:hover,
+radio row:selected:focus:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-unchecked-hover.png"),
+		url("img/radio-unchecked-hover@2.png"));
+}
+
+radio:disabled,
+radio row:selected:disabled,
+radio row:selected:focus:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-unchecked-insensitive.png"),
+		url("img/radio-unchecked-insensitive@2.png"));
+}
+
+radio:checked,
+radio row:selected:checked,
+radio row:selected:focus:checked,
+radio:active,
+radio row:selected:active,
+radio row:selected:focus:active {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-checked.png"),
+		url("img/radio-checked@2.png"));
+}
+
+radio:checked:hover,
+radio row:selected:checked:hover,
+radio row:selected:focus:checked:hover,
+radio:active:hover,
+radio row:selected:active:hover,
+radio row:selected:focus:active:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-checked-hover.png"),
+		url("img/radio-checked-hover@2.png"));
+}
+
+radio:checked:disabled,
+radio row:selected:checked:disabled,
+radio row:selected:focus:checked:disabled,
+radio:active:disabled,
+radio row:selected:active:disabled,
+radio row:selected:focus:active:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-checked-insensitive.png"),
+		url("img/radio-checked-insensitive@2.png"));
+}
+
+radio:indeterminate,
+radio row:selected:indeterminate,
+radio row:selected:focus:indeterminate {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-mixed.png"),
+		url("img/radio-mixed@2.png"));
+}
+
+radio:indeterminate:hover,
+radio row:selected:indeterminate:hover,
+radio row:selected:focus:indeterminate:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-mixed-hover.png"),
+		url("img/radio-mixed-hover@2.png"));
+}
+
+radio:indeterminate:disabled,
+radio row:selected:indeterminate:disabled,
+radio row:selected:focus:indeterminate:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/radio-mixed-insensitive.png"),
+		url("img/radio-mixed-insensitive@2.png"));
+}
+
+/*********************
+ * GtkScale's slider *
+ *********************/
+ 
+scale slider,
+scale.horizontal slider {
+	background-image: -gtk-scaled(url("img/scale-slider-horz.png"),
+		url("img/scale-slider-horz@2.png"));
+}
+
+scale slider:hover,
+scale.horizontal slider:hover {
+	background-image: -gtk-scaled(url("img/scale-slider-horz-hover.png"),
+		url("img/scale-slider-horz-hover@2.png"));
+}
+
+scale:disabled slider,
+scale slider:disabled,
+scale.horizontal slider:disabled {
+	background-image: -gtk-scaled(url("img/scale-slider-horz-insensitive.png"),
+		url("img/scale-slider-horz-insensitive@2.png"));
+}
+
+scale.vertical slider {
+	background-image: -gtk-scaled(url("img/scale-slider-vert.png"),
+		url("img/scale-slider-vert@2.png"));
+}
+
+scale.vertical slider:hover {
+	background-image: -gtk-scaled(url("img/scale-slider-vert-hover.png"),
+		url("img/scale-slider-vert-hover@2.png"));
+}
+
+scale.vertical:disabled slider,
+scale.vertical slider:disabled {
+	background-image: -gtk-scaled(url("img/scale-slider-vert-insensitive.png"),
+		url("img/scale-slider-vert-insensitive@2.png"));
+}
+
+scale.horizontal.scale-has-marks-above slider {
+	background-image: -gtk-scaled(url("img/scale-slider-horz.png"),
+		url("img/scale-slider-horz@2.png"));
+}
+
+scale.horizontal.scale-has-marks-above slider:hover {
+	background-image: -gtk-scaled(url("img/scale-slider-horz-hover.png"),
+		url("img/scale-slider-horz-hover@2.png"));
+}
+
+scale.horizontal.scale-has-marks-above slider:disabled {
+	background-image: -gtk-scaled(url("img/scale-slider-horz-insensitive.png"),
+		url("img/scale-slider-horz-insensitive@2.png"));
+}
+
+scale.vertical.scale-has-marks-above slider {
+	background-image: -gtk-scaled(url("img/scale-slider-vert.png"),
+		url("img/scale-slider-vert@2.png"));
+}
+
+scale.vertical.scale-has-marks-above slider:hover {
+	background-image: -gtk-scaled(url("img/scale-slider-vert-hover.png"),
+		url("img/scale-slider-vert-hover@2.png"));
+}
+
+scale.vertical.scale-has-marks-above slider:disabled {
+	background-image: -gtk-scaled(url("img/scale-slider-vert-insensitive.png"),
+		url("img/scale-slider-vert-insensitive@2.png"));
+}
+
+scale.horizontal.scale-has-marks-below slider {
+	background-image: -gtk-scaled(url("img/scale-slider-horz.png"),
+		url("img/scale-slider-horz@2.png"));
+}
+
+scale.horizontal.scale-has-marks-below slider:hover {
+	background-image: -gtk-scaled(url("img/scale-slider-horz-hover.png"),
+		url("img/scale-slider-horz-hover@2.png"));
+}
+
+scale.horizontal.scale-has-marks-below slider:disabled {
+	background-image: -gtk-scaled(url("img/scale-slider-horz-insensitive.png"),
+		url("img/scale-slider-horz-insensitive@2.png"));
+}
+
+scale.vertical.scale-has-marks-below slider {
+	background-image: -gtk-scaled(url("img/scale-slider-vert.png"),
+		url("img/scale-slider-vert@2.png"));
+}
+
+scale.vertical.scale-has-marks-below slider:hover {
+	background-image: -gtk-scaled(url("img/scale-slider-vert-hover.png"),
+		url("img/scale-slider-vert-hover@2.png"));
+}
+
+scale.vertical.scale-has-marks-below slider:disabled {
+	background-image: -gtk-scaled(url("img/scale-slider-vert-insensitive.png"),
+		url("img/scale-slider-vert-insensitive@2.png"));
+}
+
+/*********
+ * Menus *
+ *********/
+
+menu menuitem check {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox.png"),
+		url("img/menuitem-checkbox@2.png"));
+}
+
+menu menuitem check:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox-hover.png"),
+		url("img/menuitem-checkbox-hover@2.png"));
+}
+
+menu menuitem check:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox-insensitive.png"),
+		url("img/menuitem-checkbox-insensitive@2.png"));
+}
+
+menu menuitem check:checked,
+menu menuitem check:active {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox-checked.png"),
+		url("img/menuitem-checkbox-checked@2.png"));
+}
+
+menu menuitem check:checked:hover,
+menu menuitem check:active:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox-checked-hover.png"),
+		url("img/menuitem-checkbox-checked-hover@2.png"));
+}
+
+menu menuitem check:checked:disabled,
+menu menuitem check:active:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox-checked-insensitive.png"),
+		url("img/menuitem-checkbox-checked-insensitive@2.png"));
+}
+
+menu menuitem check:indeterminate,
+menu menuitem radio:indeterminate {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox-mixed.png"),
+		url("img/menuitem-checkbox-mixed@2.png"));
+}
+
+menu menuitem check:indeterminate:hover,
+menu menuitem radio:indeterminate:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox-mixed-hover.png"),
+		url("img/menuitem-checkbox-mixed-hover@2.png"));
+}
+
+menu menuitem check:indeterminate:disabled,
+menu menuitem radio:indeterminate:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-checkbox-mixed-insensitive.png"),
+		url("img/menuitem-checkbox-mixed-insensitive@2.png"));
+}
+
+menu menuitem radio {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-radio.png"),
+		url("img/menuitem-radio@2.png"));
+}
+
+menu menuitem radio:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-radio-hover.png"),
+		url("img/menuitem-radio-hover@2.png"));
+}
+
+menu menuitem radio:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-radio-insensitive.png"),
+		url("img/menuitem-radio-insensitive@2.png"));
+}
+
+menu menuitem radio:checked,
+menu menuitem radio:active {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-radio-checked.png"),
+		url("img/menuitem-radio-checked@2.png"));
+}
+
+menu menuitem radio:checked:hover,
+menu menuitem radio:active:hover {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-radio-checked-hover.png"),
+		url("img/menuitem-radio-checked-hover@2.png"));
+}
+
+menu menuitem radio:checked:disabled,
+menu menuitem radio:active:disabled {
+	-gtk-icon-source: -gtk-scaled(url("img/menuitem-radio-checked-insensitive.png"),
+		url("img/menuitem-radio-checked-insensitive@2.png"));
+}
+
+/*********
+ * Panes *
+ *********/
+
+paned.horizontal > separator {
+	background-repeat: no-repeat;
+	background-position: center center;
+	background-image: -gtk-scaled(url("img/pane-separator-grip-horz.png"),
+		url("img/pane-separator-grip-horz@2.png"));
+}
+
+paned.vertical > separator {
+	background-repeat: no-repeat;
+	background-position: center center;
+	background-image: -gtk-scaled(url("img/pane-separator-grip-vert.png"),
+		url("img/pane-separator-grip-vert@2.png"));
+}
+
+/***********
+ * Borders *
+ ***********/
+
+/* generic element borders */
+entry,
+combobox entry,
+combobox entry button,
+button:active,
+trough,
+trough highlight,
+switch,
+/* generic button borders */
+button,
+button.flat:active,
+button.flat:hover,
+.menu-button:active,
+.titlebar button.titlebutton:hover,
+toolbar.primary-toolbar button:checked,
+toolbar.primary-toolbar button.raised,
+toolbar.primary-toolbar .linked button.raised,
+toolbar.primary-toolbar .linked button.raised:hover,
+toolbar.primary-toolbar .linked button.raised:focus,
+toolbar.primary-toolbar .linked button.raised:focus:hover,
+toolbar.primary-toolbar .linked button.raised:focus:hover:active,
+toolbar.primary-toolbar .raised.linked button,
+toolbar.primary-toolbar .raised.linked button:hover,
+toolbar.primary-toolbar .raised.linked button:focus,
+toolbar.primary-toolbar .raised.linked button:focus:hover,
+toolbar.primary-toolbar .raised.linked button:focus:hover:active,
+toolbar.primary-toolbar .raised.raised button:disabled,
+toolbar.primary-toolbar combobox button,
+/* primary toolbar - generic element borders */
+toolbar.primary-toolbar entry,
+toolbar.primary-toolbar combobox entry,
+toolbar.primary-toolbar combobox button,
+toolbar.primary-toolbar button:active,
+toolbar.primary-toolbar button.raised:active,
+toolbar.primary-toolbar .raised button:active,
+toolbar.primary-toolbar button.raised:disabled,
+toolbar.primary-toolbar .raised button:disabled,
+toolbar.primary-toolbar switch,
+toolbar.primary-toolbar switch:disabled,
+toolbar.primary-toolbar combobox button:active,
+toolbar.primary-toolbar combobox button:disabled,
+/* primary toolbar - hover button borders */
+toolbar.primary-toolbar button:hover {
+	border-image: url("img/border.svg") 3 3 4 3 / 3px 3px 4px 3px repeat;
+	border-radius: 3px;
+	border-width: 1px 1px 2px 1px;
+	border-style: solid;
+	border-color: transparent;
+}
+
+toolbar.primary-toolbar entry,
+toolbar.primary-toolbar combobox entry {
+	border-width: 1px 2px 2px;
+}
+
+toolbar.primary-toolbar entry:focus,
+toolbar.primary-toolbar combobox entry:focus {
+	border-width: 1px 2px 2px;
+}
+
+/* Linked single button */
+.linked entry:only-child,
+.linked button:only-child,
+.linked button:active:only-child,
+.linked button:active:hover:only-child,
+.linked button:focus:only-child,
+.linked button:focus:active:only-child,
+.linked button:disabled:only-child,
+/* Middle button (vertical) */
+.linked.vertical entry,
+.linked.vertical button,
+.linked.vertical button:active,
+.linked.vertical button:active:hover,
+.linked.vertical button:focus,
+.linked.vertical button:focus:active,
+.linked.vertical button:disabled,
+/* Top button (vertical) */
+.linked.vertical entry:first-child,
+.linked.vertical button:first-child,
+.linked.vertical button:active:first-child,
+.linked.vertical button:active:hover:first-child,
+.linked.vertical button:focus:first-child,
+.linked.vertical button:focus:active:first-child,
+.linked.vertical button:disabled:first-child,
+/* Bottom button (vertical) */
+.linked.vertical entry:last-child,
+.linked.vertical button:last-child,
+.linked.vertical button:active:last-child,
+.linked.vertical button:active:hover:last-child,
+.linked.vertical button:focus:last-child,
+.linked.vertical button:focus:active:last-child,
+.linked.vertical button:disabled:last-child,
+/* Linked single button (vertical) */
+.linked.vertical entry:only-child,
+.linked.vertical button:only-child,
+.linked.vertical button:active:only-child,
+.linked.vertical button:active:hover:only-child,
+.linked.vertical button:focus:only-child,
+.linked.vertical button:focus:active:only-child,
+.linked.vertical button:disabled:only-child,
+/* Linked buttons on primary toolbars */
+/* Middle button */
+toolbar.primary-toolbar button.raised.linked,
+toolbar.primary-toolbar button.raised.linked:active,
+toolbar.primary-toolbar button.raised.linked:focus,
+toolbar.primary-toolbar button.raised.linked:focus:active,
+toolbar.primary-toolbar button.raised.linked:disabled,
+toolbar.primary-toolbar .raised.linked button,
+toolbar.primary-toolbar .raised.linked button:active,
+toolbar.primary-toolbar .raised.linked button:focus,
+toolbar.primary-toolbar .raised.linked button:focus:active,
+toolbar.primary-toolbar .raised.linked button:disabled,
+toolbar.inline-toolbar button,
+toolbar.inline-toolbar button:active,
+toolbar.inline-toolbar button:focus,
+toolbar.inline-toolbar button:focus:active,
+toolbar.inline-toolbar button:disabled,
+toolbar.inline-toolbar toolbutton button,
+toolbar.inline-toolbar toolbutton button:active,
+toolbar.inline-toolbar toolbutton button:focus,
+toolbar.inline-toolbar toolbutton button:focus:active,
+toolbar.inline-toolbar toolbutton button:disabled,
+/* Leftmost button */
+toolbar.primary-toolbar button.raised.linked:first-child,
+toolbar.primary-toolbar button.raised.linked:active:first-child,
+toolbar.primary-toolbar button.raised.linked:focus:first-child,
+toolbar.primary-toolbar button.raised.linked:focus:active:first-child,
+toolbar.primary-toolbar button.raised.linked:disabled:first-child,
+toolbar.primary-toolbar .raised.linked button:first-child,
+toolbar.primary-toolbar .raised.linked button:active:first-child,
+toolbar.primary-toolbar .raised.linked button:focus:first-child,
+toolbar.primary-toolbar .raised.linked button:focus:active:first-child,
+toolbar.primary-toolbar .raised.linked button:disabled:first-child,
+toolbar.inline-toolbar button:first-child,
+toolbar.inline-toolbar button:active:first-child,
+toolbar.inline-toolbar button:focus:first-child,
+toolbar.inline-toolbar button:focus:active:first-child,
+toolbar.inline-toolbar button:disabled:first-child,
+toolbar.inline-toolbar toolbutton button :first-child,
+toolbar.inline-toolbar toolbutton button :first-child:active,
+toolbar.inline-toolbar toolbutton button :first-child:focus,
+toolbar.inline-toolbar toolbutton button :first-child:focus:active,
+toolbar.inline-toolbar toolbutton button :first-child:disabled,
+/* Rightmost button */
+toolbar.primary-toolbar button.raised.linked:last-child,
+toolbar.primary-toolbar button.raised.linked:active:last-child,
+toolbar.primary-toolbar button.raised.linked:focus:last-child,
+toolbar.primary-toolbar button.raised.linked:focus:active:last-child,
+toolbar.primary-toolbar button.raised.linked:disabled:last-child,
+toolbar.primary-toolbar .raised.linked button:last-child,
+toolbar.primary-toolbar .raised.linked button:active:last-child,
+toolbar.primary-toolbar .raised.linked button:focus:last-child,
+toolbar.primary-toolbar .raised.linked button:focus:active:last-child,
+toolbar.primary-toolbar .raised.linked button:disabled:last-child,
+toolbar.inline-toolbar button:last-child,
+toolbar.inline-toolbar button:active:last-child,
+toolbar.inline-toolbar button:focus:last-child,
+toolbar.inline-toolbar button:focus:active:last-child,
+toolbar.inline-toolbar button:disabled:last-child,
+toolbar.inline-toolbar toolbutton button :last-child,
+toolbar.inline-toolbar toolbutton button :last-child:active,
+toolbar.inline-toolbar toolbutton button :last-child:focus,
+toolbar.inline-toolbar toolbutton button :last-child:focus:active,
+toolbar.inline-toolbar toolbutton button :last-child:disabled,
+/* Single button */
+toolbar.inline-toolbar button:only-child,
+toolbar.inline-toolbar button:active:only-child,
+toolbar.inline-toolbar button:focus:only-child,
+toolbar.inline-toolbar button:focus:active:only-child,
+toolbar.inline-toolbar button:disabled:only-child,
+toolbar.inline-toolbar toolbutton button :only-child,
+toolbar.inline-toolbar toolbutton button :only-child:active,
+toolbar.inline-toolbar toolbutton button :only-child:focus,
+toolbar.inline-toolbar toolbutton button :only-child:focus:active,
+toolbar.inline-toolbar toolbutton button :only-child:disabled {
+	border-image: url("img/border-inline-button.svg") 3 3 4 3 / 3px 3px 4px 3px repeat;
+	border-radius: 3px;
+	border-width: 1px 1px 2px 1px;
+	border-style: solid;
+	border-color: transparent;
+}
+
+/* generic insensitive element borders */
+switch:disabled,
+combobox entry:disabled,
+combobox button:disabled,
+entry:disabled,
+button:disabled,
+trough row {
+	border-image: url("img/border-insensitive.svg") 3 3 4 3 / 3px 3px 4px 3px repeat;
+	border-radius: 3px;
+	border-width: 1px 1px 2px 1px;
+	border-style: solid;
+	border-color: transparent;
+}
+
+menuitem button.flat,
+button.flat,
+button.flat:disabled,
+list row button,
+list row button:hover {
+    border-image: none;
+    background-image: none;
+}
+
+/* focused element borders */
+entry:focus,
+combobox entry:focus,
+button.flat:focus:active,
+button:focus:active,
+button.default:active,
+/* focused button borders */
+button.flat:focus,
+button.default,
+toolbar.primary-toolbar entry:focus,
+toolbar.primary-toolbar button:active:focus,
+toolbar.primary-toolbar button:focus:hover,
+toolbar.primary-toolbar combobox entry:focus,
+toolbar.primary-toolbar combobox button:focus,
+toolbar.primary-toolbar button.raised:focus:active,
+toolbar.primary-toolbar .raised button:focus:active,
+toolbar.primary-toolbar button.raised.default:active,
+toolbar.primary-toolbar .raised button.default:active,
+toolbar.primary-toolbar combobox button:active:focus,
+toolbar.primary-toolbar button.raised:focus,
+toolbar.primary-toolbar button.raised.default,
+toolbar.primary-toolbar .raised button:focus,
+toolbar.primary-toolbar .raised button.default,
+toolbar.primary-toolbar combobox button:focus {
+	border-image: url("img/border-focused.svg") 3 3 4 3 / 3px 3px 4px 3px repeat;
+	border-radius: 3px;
+	border-width: 1px 1px 2px 1px;
+	border-style: solid;
+	border-color: transparent;
+}
+
+/* focused primary toolbar button borders */
+toolbar.primary-toolbar button:focus {
+	border-image: url("img/border-focused-ptb.svg") 3 3 4 3 / 3px 3px 4px 3px repeat;
+	border-radius: 3px;
+	border-width: 1px 1px 2px 1px;
+	border-style: solid;
+	border-color: transparent;
+}
+
+/* focused switch trough borders */
+switch:active {
+	border-image: url("img/border-focused-switch.svg") 3 3 4 3 / 3px 3px 4px 3px stretch;
+	border-radius: 3px;
+	border-width: 1px 1px 2px 1px;
+	border-style: solid;
+	border-color: transparent;
+}
+
