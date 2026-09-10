@@ -165,7 +165,11 @@ rubberband {
 }
 
 statusbar {
-	margin: -7px -10px -6px -10px;
+        margin: -1px -10px 0px -10px;
+}
+
+statusbar box, statusbar label {
+        padding-right: 1px;
 }
 
 statusbar label,
