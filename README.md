@@ -2,7 +2,9 @@
 
 A Linux system built by Lunduke, for Lunduke.
 
-![](screenshots/lcos-02-ideals.png)
+![](screenshots/lcos-05-Notes.png)
+
+The latest release can be found [on the Releases page](https://github.com/BryanLunduke/LCOS/releases).
 
 The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
 
@@ -14,34 +16,50 @@ The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
 - No Forced Rust Clones.
 - Modern Tech.  90s UI.
 
-LCOS is built on top of Devuan (a high quality fork of Debian, which removes Systemd), and includes carefully selected software to adhere to those core ideals (including the stripped-down Brave Origin as the default web browser).
+LCOS is built on top of Devuan (a high quality fork of Debian, which removes Systemd), and includes carefully selected and developed software to adhere to those core ideals (including the stripped-down Brave Origin as the default web browser).
 
 ## The Lunduke Computer Operating System is a Monarchy.
 
-LCOS is not a community project.  The King has total control, both technologically and organizationally.  This prevents Political Activists from seizing control, as has happened with so many other Open Source projects and organizations.
+LCOS is not a community project.  The King has total control, both technologically and organizationally.
+
+This has a few key benefits:
+
+- Prevents Political Activists from seizing control, as has happened with so many other Open Source projects and organizations.
+- Keeps the project focused on core goals, without getting sidetracked by committees.
 
 ## Upstream First
 
-LCOS tries to avoid LCOS-only code changes whenever possible, prefering to ship "vanilla" versions of upstream projects.  When changes or fixes are required for LCOS, in upstream projects, the preference is to hire developers of that upstream project to implement those changes in upstream itself.  That way everyone can benefit from the work being done while, simultaneously, supporting the work of engineers who make all of this possible.
+LCOS tries to avoid LCOS-only code changes whenever possible, preferring to ship "vanilla" versions of upstream projects.  When changes or fixes are required for LCOS, in upstream projects, the preference is to hire developers of that upstream project to implement those changes in upstream itself.  That way everyone can benefit from the work being done while, simultaneously, supporting the work of engineers who make all of this possible.
 
 As such, source code deviations, from upstream projects, is kept to an absolute minimum in LCOS.
+
+That said, new code (and entire new packages) are developed when there is a clear benefit in doing so.
 
 All source code, for all packages (including for the specific versions in use), are listed in PackageSourceList.md file for each release.
 
 ## No AI Features Built In
 
-LCOS is a classic desktop operating system with no requirements for online accounts, no ID verification, and no AI features by default.  If a user of LCOS wants to install AI tools (or any other tools), LCOS will not stand in their way.  A person should be able to install whatever software they like on their own computer.  LCOS has no policy for (or against) the usage of AI in the development of LCOS.
+LCOS is a classic desktop operating system with no requirements for online accounts, no ID verification, and no AI features by default.
 
-## Early Development
+If a user of LCOS wants to install AI tools (or any other tools), LCOS will not stand in their way.  A person should be able to install whatever software they like on their own computer.
 
-LCOS is in early development.  Expect bugs.
+LCOS has no policy for (or against) the usage of AI in the development of LCOS.  Being as LCOS already uses the Linux Kernel, and the Linux Kernel is heavily developed by AI nowadays, it would be silly (and more than a little hypocritical) to ban AI usage in the development of LCOS.
+
+## LCOS is in Beta
+
+LCOS is in the Beta stage of development.
+
+This means that, while LCOS is considered "Feature Complete" for the 1.0 release, it is likely to still contain (potentially significant) bugs.
 
 [The Lunduke Journal Forum](https://forum.lunduke.com/) is the exclusive place to ask questions, provide suggestions, report issues, or talk with other LCOS users.  To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Lunduke Journal subscribers](https://lunduke.com/).
 
 ## Screenshots
 
-![](screenshots/lcos-02-Games.png)
+![](screenshots/lcos-05-Games.png)
 
-![](screenshots/lcos-02-RAM.png)
+![](screenshots/lcos-05-Office.png)
 
-![](screenshots/lcos-02-Desktop.png)
+![](screenshots/lcos-05-Media.png)
+
+![](screenshots/lcos-05-Brave.png)
+
