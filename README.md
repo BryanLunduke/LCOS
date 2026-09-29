@@ -2,7 +2,7 @@
 
 A Linux system built by Lunduke, for Lunduke.
 
-![](screenshots/lcos-05-Notes.png)
+![](screenshots/LCOS-07-Desktop.png)
 
 The latest release can be found [on the Releases page](https://github.com/BryanLunduke/LCOS/releases).
 
@@ -10,7 +10,7 @@ The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
 
 - No Age or ID Verification.
 - No Online Accounts Needed.
-- No AI Features.
+- No Built-in AI Features.
 - No Weird Politics.
 - No Systemd.
 - No Forced Rust Clones.
@@ -55,11 +55,11 @@ This means that, while LCOS is considered "Feature Complete" for the 1.0 release
 
 ## Screenshots
 
-![](screenshots/lcos-05-Games.png)
+![](screenshots/LCOS-07-Games.png)
 
-![](screenshots/lcos-05-Office.png)
+![](screenshots/LCOS-07-About.png)
 
-![](screenshots/lcos-05-Media.png)
+![](screenshots/LCOS-07-Brave.png)
 
-![](screenshots/lcos-05-Brave.png)
+![](screenshots/LCOS-07-Office.png)
 
