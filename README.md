@@ -51,7 +51,7 @@ LCOS is in the Beta stage of development.
 
 This means that, while LCOS is considered "Feature Complete" for the 1.0 release, it is likely to still contain (potentially significant) bugs.
 
-[The Lunduke Journal Forum](https://forum.lunduke.com/) is the exclusive place to ask questions, provide suggestions, report issues, or talk with other LCOS users.  To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Lunduke Journal subscribers](https://lunduke.com/).
+[The Lunduke Journal Forum](https://forum.lunduke.com/) is the best place to ask questions, provide suggestions, report issues, or talk with other LCOS users.  To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Lunduke Journal subscribers](https://lunduke.com/).
 
 ## Screenshots
 
