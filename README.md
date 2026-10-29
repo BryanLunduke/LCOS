@@ -2,9 +2,9 @@
 
 A Linux system built by Lunduke, for Lunduke.
 
-![](screenshots/LCOS-07-Desktop.png)
+![](screenshots/lcos-100-Desktop.png)
 
-The latest release can be found [on the Releases page](https://github.com/BryanLunduke/LCOS/releases).
+The latest release can be found [on the Releases page](https://github.com/BryanLunduke/LCOS/releases) or on [Lunduke.com](https://lunduke.com/lcos.html).
 
 The Lunduke Computer Operating System (LCOS) adheres to a core set of ideas:
 
@@ -45,21 +45,17 @@ If a user of LCOS wants to install AI tools (or any other tools), LCOS will not 
 
 LCOS has no policy for (or against) the usage of AI in the development of LCOS.  Being as LCOS already uses the Linux Kernel, and the Linux Kernel is heavily developed by AI nowadays, it would be silly (and more than a little hypocritical) to ban AI usage in the development of LCOS.
 
-## LCOS is in Beta
-
-LCOS is in the Beta stage of development.
-
-This means that, while LCOS is considered "Feature Complete" for the 1.0 release, it is likely to still contain (potentially significant) bugs.
+## FAQ & Support
 
 [The Lunduke Journal Forum](https://forum.lunduke.com/) is the best place to ask questions, provide suggestions, report issues, or talk with other LCOS users.  To keep trolls away, [this forum](https://forum.lunduke.com/) is only available to [Lunduke Journal subscribers](https://lunduke.com/).
 
 ## Screenshots
 
-![](screenshots/LCOS-07-Games.png)
+![](screenshots/lcos-100-Games.png)
 
-![](screenshots/LCOS-07-About.png)
+![](screenshots/lcos-100-OfficeFiles.png)
 
-![](screenshots/LCOS-07-Brave.png)
+![](screenshots/lcos-100-PaintEdit.png)
 
-![](screenshots/LCOS-07-Office.png)
+![](screenshots/lcos-100-Brave.png)
 
