@@ -4,8 +4,6 @@ These are all of the packages shipped with The Lunduke Computer Operating System
 
 From this list, and the official ISO, it is possible to rebuild the entire LCOS 1.0.0 release from source.
 
-ISO: `lcos-live-100-05.iso` (1,534,459,904 bytes), SHA256 `6be0bec6f967642e4e0cfd51ded577b43c29f9ce58b31abfd1d83b245902fd15`, built from [lcos-live `6363b8c`](https://github.com/BryanLunduke/lcos-live/tree/6363b8cba12fbfd8404af40c7fd562653e289580). Package list taken from the ISO's `live/filesystem.packages` and installed package database (1,237 packages).
-
 | Package | Version | Source | This version |
 |---------|---------|--------|--------------|
 | 7zip | 25.01+dfsg-1~deb13u2 | [7-zip](https://www.7-zip.org/) | [25.01+dfsg-1~deb13u2](https://sources.debian.org/src/7zip/25.01+dfsg-1~deb13u2/) |
