@@ -33,7 +33,7 @@ LCOS is built on top of Devuan (a high quality fork of Debian, which removes Sys
 
 ### Is there a dark theme?
 
-No.  Yo may install any theme you wish, including dark themes, but LCOS does not ship with one.
+No.  You may install any theme you wish, including dark themes, but LCOS does not ship with one.
 
 ---
 
